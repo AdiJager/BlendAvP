@@ -39,6 +39,25 @@ def uv_to_rif_pixels(u: float, v: float,
     return (u * pixels, (1.0 - v) * pixels)
 
 
+def blender_to_rif_axis(x: float, y: float, z: float):
+    """Map Blender world coords to RIF world coords (inverse of importer).
+
+    Community importer (shape_processor.py::xform) does:
+        apply_axis(x, y, z) = (x, z, -y)
+    after applying the object transform. To make our writer a lossless
+    inverse, we apply the inverse rotation here:
+        blender (x, y, z) → RIF (x, -z, y)
+    The function is linear and has det = +1 (it is a rotation), so it is
+    also valid for direction vectors such as vertex/face normals.
+    """
+    return (x, -z, y)
+
+
+def rif_to_blender_axis(x: float, y: float, z: float):
+    """Map RIF world coords to Blender (mirrors community importer)."""
+    return (x, z, -y)
+
+
 def float_to_fixed(value: float, scale: float = 1.0) -> int:
     """Legacy 16.16 fixed-point packer; kept for callers outside the builder."""
     return int(round(value * FIXED_POINT_ONE / scale))
