@@ -4,9 +4,10 @@ Run inside Blender:
     blender --background --python tests/blender_roundtrip.py
 Or from the Text Editor: Run Script.
 
-32 tests covering S1-S6: single mesh, calibration, UV, bitmap indices,
+57 tests covering S1-S6 F13: single mesh, calibration, UV, bitmap indices,
 axis conversion, quaternion, multi-object, hierarchy, level skeleton,
-LIGHTSET, AVPENVIR.
+LIGHTSET, AVPENVIR, prelight flags/SHPVTINT, point-light and spot baking,
+the World-to-ambient mapping, and the absence of a fabricated fallback light.
 """
 import os
 import struct
@@ -107,6 +108,7 @@ from rif.types import (
     meters_to_rif, uv_to_rif_pixels,
     RIF_UNITS_PER_METER, DEFAULT_UV_PIXELS,
 )
+from rif import lighting as rif_lighting
 
 
 # ------------------------------------------------------------------ framework
@@ -702,6 +704,441 @@ def test_avpenvir_present():
     g = _read_i32(data, idx + 20)
     b = _read_i32(data, idx + 24)
     assert (r, g, b) == (64, 96, 128), f"RGB = {(r, g, b)}"
+
+
+# ------------------------------------------------------ tests S6 F8 (prelight)
+
+def _shphead1_of(data, shape_index=0):
+    """Return the (index, size) of the Nth SHPHEAD1 in the buffer."""
+    hits = _find_all_chunks(data, "SHPHEAD1")
+    assert len(hits) > shape_index, "SHPHEAD1 not found"
+    return hits[shape_index]
+
+
+@test
+def test_prelight_on_keeps_shape_flags_clear():
+    """SHPHEAD1.flags must be 0 when prelight is on.
+
+    ShapeFlag_PreLit (shape.h:421) and SHAPE_FLAG_EXTERNALFILE
+    (SHPCHUNK.HPP:15) are both 0x00001000. Writing the bit made
+    Projload.cpp:1974 treat our level shapes as imported shapes, so no
+    module was registered and the level rendered empty. Prelight is
+    activated by the SHPVTINT chunk instead (Projload.cpp:1455).
+    """
+    obj = _make_cube()
+    data = build_rif_level([obj], "lvl", include_prelight=True)
+    idx, _size = _shphead1_of(data)
+    flags = _read_i32(data, idx + 12)
+    assert not (flags & 0x00001000), \
+        f"SHAPE_FLAG_EXTERNALFILE / ShapeFlag_PreLit must stay clear, " \
+        f"flags = 0x{flags:08X}"
+    assert not (flags & 0x01), "ShapeFlag_3DS_AxisFlip must not be set"
+    assert _find_chunk(data, "SHPVTINT")[0] > 0, \
+        "prelight must still travel in a SHPVTINT chunk"
+
+
+@test
+def test_prelight_off_clears_shape_flags():
+    """With prelight disabled the shape flags must be exactly 0 (retail)."""
+    obj = _make_cube()
+    data = build_rif_level([obj], "lvl", include_prelight=False)
+    idx, _size = _shphead1_of(data)
+    flags = _read_i32(data, idx + 12)
+    assert flags == 0, f"flags = 0x{flags:08X}"
+    assert _find_chunk(data, "SHPVTINT")[0] < 0, "SHPVTINT must be absent"
+
+
+@test
+def test_exported_flags_never_set_the_external_file_bit():
+    """No export path may raise SHAPE_FLAG_EXTERNALFILE (0x1000).
+
+    This is the regression test for the S6 F9 root cause: bit 0x1000 sends
+    level shapes down Projload.cpp:1974 (imported shape), where the loader
+    uses a stale object pointer and never calls copy_to_module().
+    """
+    obj = _make_cube()
+    for kwargs in ({"include_prelight": True}, {"include_prelight": False}):
+        data = build_rif_level([obj], "lvl", **kwargs)
+        idx, _size = _shphead1_of(data)
+        flags = _read_i32(data, idx + 12)
+        assert flags & 0x00001000 == 0, \
+            f"flags 0x{flags:08X} raises SHAPE_FLAG_EXTERNALFILE ({kwargs})"
+    data = build_rif_bytes(obj.data, object_name=obj.name)
+    idx, _size = _find_chunk(data, "SHPHEAD1")
+    flags = _read_i32(data, idx + 12)
+    assert flags & 0x00001000 == 0, f"single-mesh flags 0x{flags:08X}"
+
+
+@test
+def test_shape_flags_override_zero_is_honoured():
+    """shape_flags_override=0 must win over include_prelight.
+
+    This is diagnostic step D1 from HANDOFF_S6_F7. The operator used to
+    collapse a 0 override to None (`value or None`), so D1 was untestable.
+    """
+    obj = _make_cube()
+    data = build_rif_level([obj], "lvl", include_prelight=True,
+                           shape_flags_override=0)
+    idx, _size = _shphead1_of(data)
+    flags = _read_i32(data, idx + 12)
+    assert flags == 0, f"flags = 0x{flags:08X}"
+
+
+@test
+def test_shpvtint_emitted_by_default():
+    """Level mode emits exactly one SHPVTINT per RBOBJECT."""
+    objs = _make_cubes(2)
+    data = build_rif_level(objs, "lvl", include_prelight=True)
+    svic = _find_all_chunks(data, "SHPVTINT")
+    robj = _find_all_chunks(data, "RBOBJECT")
+    assert len(robj) == 2, f"expected 2 RBOBJECT, got {len(robj)}"
+    assert len(svic) == 2, f"expected 2 SHPVTINT, got {len(svic)}"
+
+
+@test
+def test_shpvtint_absent_when_prelight_off():
+    """No SHPVTINT is written when prelight is disabled."""
+    obj = _make_cube()
+    data = build_rif_level([obj], "lvl", include_prelight=False)
+    assert _find_chunk(data, "SHPVTINT")[0] < 0, "SHPVTINT must be absent"
+
+
+@test
+def test_shpvtint_num_vertices_matches_shphead1():
+    """SHPVTINT.num_vertices equals the linked SHPHEAD1.num_verts.
+
+    VertexIntensity_Standard_Opt indexes Global_EID_IPtr[] by vertex number
+    without a bounds check, so a mismatch reads past the array.
+    """
+    obj = _make_cube()
+    data = build_rif_level([obj], "lvl", include_prelight=True)
+    hdr_idx, hdr_size = _shphead1_of(data)
+    num_verts = _read_i32(data, hdr_idx + 12 + 24)
+    svic_idx, svic_size = _find_chunk(data, "SHPVTINT")
+    assert svic_idx > 0, "SHPVTINT missing"
+    light_set = data[svic_idx + 12:svic_idx + 20]
+    assert light_set == b"NORMALLT", f"light set = {light_set!r}"
+    count = _read_i32(data, svic_idx + 12 + 12)
+    assert count == num_verts, f"count {count} != num_verts {num_verts}"
+    body = (svic_size - 12) - 16
+    assert body == 4 * num_verts, f"intensity body = {body}"
+
+
+@test
+def test_prelight_colour_packs_rgb_correctly():
+    """prelight_colour is written as packed 0x00RRGGBB per vertex."""
+    obj = _make_cube()
+    data = build_rif_level([obj], "lvl", include_prelight=True,
+                           prelight_colour=0x00804020)
+    svic_idx, _size = _find_chunk(data, "SHPVTINT")
+    first = _read_u32(data, svic_idx + 12 + 16)
+    assert first == 0x00804020, f"intensity[0] = 0x{first:08X}"
+
+
+@test
+def test_lightscale_payload_is_40_bytes():
+    """LITSCALE payload is 40 bytes — the 44-byte form shifted the subtree."""
+    obj = _make_cube()
+    data = build_rif_level([obj], "lvl", include_litscale=True)
+    idx, size = _find_chunk(data, "LITSCALE")
+    assert idx > 0, "LITSCALE missing"
+    assert size - 12 == 40, f"payload = {size - 12}"
+    assert _read_i32(data, idx + 12) == 0, "LightMode should be 0"
+    assert abs(_read_f32(data, idx + 16) - 1.0) < 1e-6, "prelight_multiply"
+
+
+@test
+def test_build_rif_bytes_orientation_is_identity():
+    """The single-mesh path writes an identity quaternion, not (0,0,0,0)."""
+    obj = _make_cube()
+    data = build_rif_bytes(obj.data, object_name=obj.name)
+    idx, _size = _find_chunk(data, "OBJHEAD1")
+    assert idx > 0, "OBJHEAD1 missing"
+    quat = struct.unpack_from("<4f", data, idx + 12 + 32)
+    assert quat == (0.0, 0.0, 0.0, 1.0), f"quat = {quat}"
+
+
+# ------------------------------------------------- tests S6 F11 (point lights)
+
+def _reference_vertex_intensity(vertex, normal, lights, base_colour,
+                                light_scale=rif_lighting.ONE_FIXED):
+    """Independent port of Kshape.c::VertexIntensity_Standard_Opt.
+
+    Written straight from the C so a typo in rif/lighting.py cannot hide
+    behind the same typo here. ``shrd`` is ``(a*b) // 65536`` — floor
+    division — and ``DIV_FIXED`` keeps the full 32-bit ``a << 16``.
+    """
+    def shrd(a, b):
+        return (a * b) // 65536
+
+    def trunc_div(a, b):
+        q = abs(a) // abs(b)
+        return q if (a < 0) == (b < 0) else -q
+
+    def wrap32(value):
+        value &= 0xFFFFFFFF
+        return value - 0x100000000 if value >= 0x80000000 else value
+
+    blue_i = (base_colour & 255) * 257
+    green_i = ((base_colour >> 8) & 255) * 257
+    red_i = ((base_colour >> 16) & 255) * 257
+
+    vx, vy, vz = vertex
+    nx, ny, nz = normal
+    for light in lights:
+        lx, ly, lz = light["location"]
+        rng = light.get("range", 20000)
+        bright = light.get("brightness", rif_lighting.ONE_FIXED)
+        colour = light.get("colour", 0xFFFFFF)
+
+        tlx, tly, tlz = lx - vx, ly - vy, lz - vz
+        dx, dy, dz = abs(tlx), abs(tly), abs(tlz)
+        if dx > dy:
+            dist = dx + ((dy + dz) >> 2) if dx > dz else dz + ((dy + dx) >> 2)
+        else:
+            dist = dy + ((dx + dz) >> 2) if dy > dz else dz + ((dx + dy) >> 2)
+        if dist >= rng:
+            continue
+
+        bor = trunc_div(bright << 16, rng)
+        idot = shrd(rng - dist, bor)
+        if dist > 0:
+            dot = (shrd(int(round(nx * rif_lighting.ONE_FIXED)), tlx)
+                   + shrd(int(round(ny * rif_lighting.ONE_FIXED)), tly)
+                   + shrd(int(round(nz * rif_lighting.ONE_FIXED)), tlz))
+            if dot > 0:
+                idot = (trunc_div(wrap32(idot * dot), dist) + idot // 4) // 2
+            else:
+                idot //= 8
+
+        red_i += shrd(idot, ((colour >> 16) & 255) * 257)
+        green_i += shrd(idot, ((colour >> 8) & 255) * 257)
+        blue_i += shrd(idot, (colour & 255) * 257)
+
+    return ((min(red_i >> 8, 255) << 16)
+            | (min(green_i >> 8, 255) << 8)
+            | min(blue_i >> 8, 255))
+
+
+@test
+def test_bake_matches_engine_formula():
+    """Baked values equal an independent port of the engine's C code."""
+    lights = [{"location": (1200, -3400, 500), "colour": 0xFFB060,
+               "brightness": rif_lighting.ONE_FIXED * 2, "range": 12000}]
+    cases = [
+        ((0, 0, 0), (0.0, 0.0, 1.0), 0x00202020),
+        ((4000, 0, 0), (-1.0, 0.0, 0.0), 0x00000000),
+        ((-2500, 1500, 800), (0.577, 0.577, 0.577), 0x00404040),
+        ((9000, 0, 0), (1.0, 0.0, 0.0), 0x00101010),
+    ]
+    for vertex, normal, base in cases:
+        got = rif_lighting.bake_vertex_intensities(
+            [vertex], [normal], lights, base_colour=base)[0]
+        want = _reference_vertex_intensity(vertex, normal, lights, base)
+        assert got == want, f"{vertex}: {hex(got)} != {hex(want)}"
+
+
+@test
+def test_bake_no_lights_passes_base_through():
+    """With no lights the base colour is returned unchanged."""
+    for base in (0x00000000, 0x00FFFFFF, 0x00204060):
+        out = rif_lighting.bake_vertex_intensities(
+            [(100, -200, 300)], [(0.0, 0.0, 1.0)], [], base_colour=base)
+        assert out == [base], hex(out[0])
+
+
+@test
+def test_bake_falloff_is_monotonic():
+    """A vertex further from the light is never brighter."""
+    lights = [{"location": (0, 0, 0), "colour": 0xFFFFFF,
+               "brightness": rif_lighting.ONE_FIXED, "range": 20000}]
+    values = [
+        rif_lighting.bake_vertex_intensities(
+            [(d, 0, 0)], [(-1.0, 0.0, 0.0)], lights, base_colour=0)[0]
+        for d in (500, 2000, 5000, 10000, 19000)
+    ]
+    assert all(values[i] >= values[i + 1] for i in range(len(values) - 1)), \
+        [hex(v) for v in values]
+
+
+@test
+def test_bake_out_of_range_contributes_nothing():
+    """A light beyond its own range leaves only the base colour."""
+    lights = [{"location": (100000, 0, 0), "range": 1000,
+               "brightness": rif_lighting.ONE_FIXED, "colour": 0xFFFFFF}]
+    out = rif_lighting.bake_vertex_intensities(
+        [(0, 0, 0)], [(1.0, 0.0, 0.0)], lights, base_colour=0x00000000)
+    assert out == [0], hex(out[0])
+
+
+@test
+def test_bake_facing_vertex_beats_facing_away():
+    """Normals pointing at the light receive more light than those away."""
+    lights = [{"location": (0, 0, 0), "range": 20000,
+               "brightness": rif_lighting.ONE_FIXED, "colour": 0xFFFFFF}]
+    facing = rif_lighting.bake_vertex_intensities(
+        [(5000, 0, 0)], [(-1.0, 0.0, 0.0)], lights, base_colour=0)[0]
+    away = rif_lighting.bake_vertex_intensities(
+        [(5000, 0, 0)], [(1.0, 0.0, 0.0)], lights, base_colour=0)[0]
+    assert facing > away, (hex(facing), hex(away))
+
+
+@test
+def test_bake_for_object_translates_lights():
+    """bake_for_object must express lights relative to the object origin."""
+    light = [{"location": (10000, 0, 0), "range": 20000,
+              "brightness": rif_lighting.ONE_FIXED, "colour": 0xFFFFFF}]
+    local = rif_lighting.bake_for_object(
+        (5000, 0, 0), [(5000, 0, 0)], [(1.0, 0.0, 0.0)], light,
+        base_colour=0)[0]
+    direct = rif_lighting.bake_vertex_intensities(
+        [(5000, 0, 0)], [(1.0, 0.0, 0.0)], [{"location": (5000, 0, 0),
+                                            "range": 20000,
+                                            "brightness":
+                                            rif_lighting.ONE_FIXED,
+                                            "colour": 0xFFFFFF}],
+        base_colour=0)[0]
+    assert local == direct, (hex(local), hex(direct))
+
+
+@test
+def test_level_writes_baked_intensities_verbatim():
+    """object_intensities reach SHPVTINT byte-for-byte."""
+    obj = _make_cube()
+    num_verts = len(obj.data.vertices)
+    baked = [0x00112233 + i for i in range(num_verts)]
+    data = build_rif_level([obj], "lvl", include_prelight=True,
+                           object_intensities=[baked])
+    idx, size = _find_chunk(data, "SHPVTINT")
+    assert idx > 0, "SHPVTINT missing"
+    count = _read_i32(data, idx + 12 + 12)
+    assert count == num_verts, f"count {count} != {num_verts}"
+    written = [_read_u32(data, idx + 12 + 16 + 4 * i) for i in range(count)]
+    assert written == baked, (written[:4], baked[:4])
+
+
+@test
+def test_stdlight_runtime_flag_is_opt_in():
+    """LOFlag_Runtime (0x10) is only set when emit_runtime_lights is on."""
+    obj = _make_cube()
+    lights = [{"location": (0.0, 0.0, 1.0), "colour": 0x00FFFFFF,
+               "brightness": rif_lighting.ONE_FIXED, "range": 15000}]
+
+    plain = build_rif_level([obj], "lvl", lights=lights,
+                            emit_runtime_lights=False)
+    idx, _size = _find_chunk(plain, "STDLIGHT")
+    assert idx > 0, "STDLIGHT missing"
+    local_flags = _read_i32(plain, idx + 12 + 72)
+    assert not (local_flags & 0x10), f"flags 0x{local_flags:08X}"
+
+    runtime = build_rif_level([obj], "lvl", lights=lights,
+                              emit_runtime_lights=True)
+    idx, _size = _find_chunk(runtime, "STDLIGHT")
+    local_flags = _read_i32(runtime, idx + 12 + 72)
+    assert local_flags & 0x10, f"flags 0x{local_flags:08X}"
+
+
+@test
+def test_stdlight_written_fields_match_spec():
+    """STDLIGHT carries the light's converted position, range and colour."""
+    obj = _make_cube()
+    lights = [{"location": (1.0, 2.0, 3.0), "colour": 0x00123456,
+               "brightness": rif_lighting.ONE_FIXED, "range": 12345}]
+    data = build_rif_level([obj], "lvl", lights=lights)
+    idx, size = _find_chunk(data, "STDLIGHT")
+    assert idx > 0, "STDLIGHT missing"
+    assert size == 96, f"STDLIGHT size {size}"
+    # blender_to_rif_axis(1, 2, 3) = (1, -3, 2); x1000 -> (1000, -3000, 2000).
+    x, y, z = _read_i32x3(data, idx + 12 + 4)
+    assert (x, y, z) == (1000, -3000, 2000), f"location {(x, y, z)}"
+    # brightness/spread/range at payload offsets 52/56/60.
+    assert _read_i32(data, idx + 12 + 52) == rif_lighting.ONE_FIXED
+    assert _read_i32(data, idx + 12 + 60) == 12345
+    assert _read_u32(data, idx + 12 + 64) == 0x00123456
+
+
+@test
+def test_bake_spot_cone_limits_the_light():
+    """A spot lights only inside its cone; the engine has no cone code."""
+    half = 0.5236 / 2                      # 30 degrees full angle
+    cos_inner, cos_outer = rif_lighting.spot_cosines(half, 0.0)
+    spot = {
+        "location": (0, 0, 0), "colour": 0xFFFFFF,
+        "brightness": rif_lighting.power_to_brightness(1000.0),
+        "range": 25000, "direction": (0.0, 0.0, 1.0),
+        "spot_cos_inner": cos_inner, "spot_cos_outer": cos_outer,
+    }
+    # Directly ahead (inside the cone) versus straight behind (outside it).
+    inside = rif_lighting.bake_vertex_intensities(
+        [(0, 0, 1000)], [(0.0, 0.0, -1.0)], [spot], base_colour=0)[0]
+    outside = rif_lighting.bake_vertex_intensities(
+        [(0, 0, -1000)], [(0.0, 0.0, 1.0)], [spot], base_colour=0)[0]
+    assert inside > 0, "the cone centre must be lit"
+    assert outside == 0, f"outside the cone got {hex(outside)}"
+
+    # An omni light at the same spot does reach the point behind it.
+    omni = {k: v for k, v in spot.items()
+            if k not in ("direction", "spot_cos_inner", "spot_cos_outer")}
+    behind_omni = rif_lighting.bake_vertex_intensities(
+        [(0, 0, -1000)], [(0.0, 0.0, 1.0)], [omni], base_colour=0)[0]
+    assert behind_omni > 0, "an omni light should still reach behind itself"
+
+
+@test
+def test_spot_cosines_shrink_with_blend():
+    """A larger spot_blend widens the soft edge of the cone."""
+    hard = rif_lighting.spot_cosines(0.5, 0.0)
+    soft = rif_lighting.spot_cosines(0.5, 0.5)
+    assert hard[0] == hard[1], "no blend means no soft edge"
+    assert soft[0] < soft[1], "blend must shrink the inner cone"
+    assert soft[1] == hard[1], "the outer angle must not move"
+
+
+@test
+def test_power_to_brightness_scales_linearly():
+    """Doubling Blender's Power doubles the engine brightness."""
+    one = rif_lighting.power_to_brightness(1000.0)
+    two = rif_lighting.power_to_brightness(2000.0)
+    assert two == 2 * one, (one, two)
+    assert rif_lighting.power_to_brightness(0.0) == 0
+    assert rif_lighting.power_to_brightness(1000.0, 2.0) == two
+
+
+@test
+def test_world_ambient_uses_colour_and_strength():
+    """World colour is scaled by World strength and packed as 0x00RRGGBB."""
+    assert rif_lighting.world_ambient_colour((1.0, 1.0, 1.0), 1.0) == 0xFFFFFF
+    assert rif_lighting.world_ambient_colour((1.0, 1.0, 1.0), 0.0) == 0x000000
+    packed = rif_lighting.world_ambient_colour((0.0, 0.0, 1.0), 1.0)
+    assert packed == 0x0000FF, hex(packed)
+    grey = rif_lighting.world_ambient_colour((0.5, 0.5, 0.5), 1.0)
+    assert (grey >> 16) == ((grey >> 8) & 255) == (grey & 255)
+    assert rif_lighting.world_ambient_level((1.0, 1.0, 1.0), 0.5) == 128
+
+
+@test
+def test_level_without_lights_writes_no_stdlight():
+    """No lights passed means no STDLIGHT at all.
+
+    A fabricated fallback light used to be written here. It lit the player and
+    NPCs by itself (they read exactly these chunks) and silently invalidated
+    lighting tests, so the LIGHTSET must stay empty instead.
+    """
+    obj = _make_cube()
+    data = build_rif_level([obj], "lvl", include_prelight=True)
+    assert b"LIGHTSET" in data, "LIGHTSET itself is still required"
+    assert _find_chunk(data, "STDLIGHT")[0] < 0, \
+        "a level with no lights must not gain one"
+    assert b"AMBIENCE" in data, "AMBIENCE still has to reach the engine"
+
+
+@test
+def test_direction_to_rif_preserves_length():
+    """A direction is rotated like a position but stays unit length."""
+    for direction in ((0.0, 0.0, -1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)):
+        out = rif_lighting.direction_to_rif(direction)
+        length = sum(c * c for c in out) ** 0.5
+        assert abs(length - 1.0) < 1e-9, (direction, out, length)
 
 
 # ------------------------------------------------------------------ runner

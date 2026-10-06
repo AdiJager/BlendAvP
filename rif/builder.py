@@ -11,15 +11,45 @@ RIF's world (X right, Y up, Z forward) via blender_to_rif_axis. Vertices,
 normals and object transforms all go through the same rotation so the
 round-trip through the community importer is lossless.
 
-S6 Faza 3 (OBJ_FLAGS milestone):
-    - OBJ_FLAGS corrected from 0x300 (BASE_OBJECT | MODULE_OBJECT) to
-      0x200 (MODULE_OBJECT only). Verified byte-for-byte against
-      battle.rif: every renderable module in the retail level uses
-      0x200; the BASE_OBJECT bit is never set on modules. See
-      OBCHUNK.HPP for flag definitions.
-    - All other OBJ_FLAGS bits (AVPGAMEMODE*, PCLOAD, PLATFORMLOADSET,
-      NOTDIFFICULTY*) are only relevant for placed objects and generators,
-      not for static modules, so we intentionally do not set them.
+S6 F3 (OBJ_FLAGS milestone):
+    - OBJ_FLAGS corrected to 0x200 (MODULE_OBJECT only), verified against
+      battle.rif.
+
+S6 F6 (H45 + H53):
+    - Safe Spawn places AVPSTART at AABB centre so AllNewModuleHandler
+      creates DISPLAYBLOCKs for our modules.
+    - texture_override forces bitmap_idx 0 pointing at a real .RIM.
+
+S6 F7 (prelight path):
+    - Prelight via SHPVTINT is the ONLY way to light static geometry in
+      AvP without a full placed-light-object system (see bh_light.c).
+      VertexIntensity_Standard_Opt in Kshape.c reads SHPVTINT only when the
+      runtime shape has ShapeFlag_PreLit — without prelight and without
+      runtime lights every vertex colour is 0 and the geometry renders black.
+    - build_rif_level emits SHPVTINT (all-white prelight by default).
+    - LightScaleChunk fixed: 40-byte payload, not 44.
+    - StandardLightChunk defaults fixed: brightness = ONE_FIXED (65536),
+      spread = 4096 (full circle).
+
+S6 F8 (re-diagnosis of the S6 F7 regression):
+    - The S6 F7 claim that 0x00000001 made the loader treat the shape as a
+      .3DS import and swap geometry axes is wrong: `ShapeFlag_3DS_AxisFlip`
+      is only defined in shape.h and no compiled source reads it.
+    - `build_rif_bytes` no longer writes a zero quaternion in OBJHEAD1.
+
+S6 F9 (ROOT CAUSE — "empty level with Include Prelight on"):
+    - shape.h:421 defines ShapeFlag_PreLit = 0x00001000 and
+      SHPCHUNK.HPP:15 defines SHAPE_FLAG_EXTERNALFILE = 0x0001000: the SAME
+      bit. Writing ShapeFlag_PreLit into SHPHEAD1.flags therefore made
+      Projload.cpp:1974 take the "imported shape" branch, which calls
+      copy_to_mainshapelist() with a stale object pointer (line 1986) and
+      routes every linked object to deal_with_placed_object() instead of
+      copy_to_module(). No MODULE is registered, AllNewModuleHandler
+      (MODULE.C:123) creates no DISPLAYBLOCK, and the level renders empty.
+      The file still validated: it is a loader-side semantic collision.
+    - Fix: never write bit 0x1000 into SHPHEAD1.flags. Prelight is activated
+      by the SHPVTINT chunk alone — Projload.cpp:1455/2067 OR the bit into
+      the runtime shape on its own.
 """
 from math import sqrt
 
@@ -54,7 +84,7 @@ from .chunks.environment import (
 from .chunks.lighting import (
     LightSetChunk, LightSetHeaderChunk, AmbienceChunk, LightScaleChunk,
     StandardLightChunk, ShapeVertexIntensitiesChunk,
-    IDENTITY_MATRIX_16_16, DEFAULT_LIGHT_SPECS,
+    IDENTITY_MATRIX_16_16, ONE_FIXED,
 )
 from .chunks.module import (
     ObjectModuleDataChunk, AdjacentModuleEntryPointsChunk,
@@ -62,7 +92,62 @@ from .chunks.module import (
 )
 
 
-SHAPE_FLAGS = 0
+# ------------------------------------------------------------------ constants
+
+# Shape_Header_Chunk.flags. Bit layout verified against shape.h:
+#
+#     0x00000001  ShapeFlag_3DS_AxisFlip        (defined only, never read)
+#     0x00000002  ShapeFlag_RSP
+#     0x00000004  ShapeFlag_Detail
+#     0x00000010  ShapeFlag_AugZ
+#     0x00000020  ShapeFlag_AugZ_Lite
+#     0x00000040  ShapeFlag_Free1
+#     0x00000080  ShapeFlag_SizeSortItems
+#     0x00000100  ShapeFlag_VSC_tx3d
+#     0x00000200  ShapeFlag_ZSP
+#     0x00000400  ShapeFlag_Sprite
+#     0x00000800  ShapeFlag_SpriteR
+#     0x00001000  ShapeFlag_PreLit / SHAPE_FLAG_EXTERNALFILE  <<< COLLISION
+#     0x00002000  ShapeFlag_Cylinder
+#     0x00008000  ShapeFlag_SpriteResizing
+#     0x00010000  ShapeFlag_MultiViewSprite
+#     0x00020000  ShapeFlag_UnrotatedPoints
+#     0x00040000  ShapeFlag_HasTextureAnimation
+#
+# S6 F9 — ROOT CAUSE of the "empty level with prelight on" bug:
+#
+#   shape.h:421       #define ShapeFlag_PreLit        0x00001000
+#   SHPCHUNK.HPP:15   #define SHAPE_FLAG_EXTERNALFILE 0x0001000
+#
+# The two constants share bit 0x1000. Writing ShapeFlag_PreLit into
+# SHPHEAD1.flags therefore also raises SHAPE_FLAG_EXTERNALFILE, and
+# Projload.cpp:1974 sends the shape down the "imported shape" branch:
+#
+#   * copy_to_mainshapelist() is called with the stale `ob` of the previous
+#     object loop (Projload.cpp:1986) instead of the object being processed,
+#     so the shape's vertices are transformed by a dangling pointer;
+#   * every linked object is pushed to deal_with_placed_object() and never to
+#     copy_to_module(), so no MODULE is registered and AllNewModuleHandler
+#     (MODULE.C:123) can never create a DISPLAYBLOCK — the level renders as
+#     empty even though collisions and loading report no error.
+#
+# The bit is NOT needed in the file: Projload.cpp:1455/2067 OR it into the
+# runtime shape as soon as the RBOBJECT carries a matching SHPVTINT.
+# So prelight is driven purely by SHPVTINT, and the file-side flag stays 0.
+SHAPE_FLAG_PRELIT = 0x00001000   # ShapeFlag_PreLit — do NOT write to a file
+
+# Alias for the loader-side meaning of the same bit (SHPCHUNK.HPP:15).
+SHAPE_FLAG_EXTERNALFILE = 0x00001000   # makes Projload.cpp:1974 misfire
+
+# Flags actually written into SHPHEAD1. Always 0 for our exports: prelight is
+# activated by the SHPVTINT chunk, and 0x1000 must stay clear to avoid the
+# SHAPE_FLAG_EXTERNALFILE collision above.
+SHAPE_FLAGS_DEFAULT = 0
+
+# Prelight path: full white per vertex (packed 0x00RRGGBB).
+PRELIGHT_WHITE = 0x00FFFFFF
+
+
 SHAPE_VERSION_NO = 1
 POLY_FLAGS = 0x00C00000
 POLY_ENGINE_TYPE = 7
@@ -76,8 +161,6 @@ POLY_ENGINE_TYPE = 7
 #   (AVPGAMEMODE* bits only apply to generators/placed pickups)
 #
 # Every static renderable module in battle.rif uses exactly 0x200.
-# The previous 0x300 (BASE_OBJECT | MODULE_OBJECT) was never observed
-# in retail data and is now corrected.
 OBJ_FLAGS = 0x00000200
 OBJ_VERSION_NO = 1
 
@@ -87,24 +170,45 @@ BITMAP_IDX_PROP = "rif_bitmap_idx"
 
 DEFAULT_LIGHT_SET = "NORMALLT"
 
+# LTCHUNK.HPP:15 — marks a STDLIGHT as one SetUpRunTimeLights should adopt.
+LIGHT_LOCAL_FLAG_RUNTIME = 0x00000010
+
 
 # ------------------------------------------------------------------ public API
 
-def build_rif_bytes(mesh, object_name: str = None) -> bytes:
-    """Serialise a single Blender mesh to a REBINFF2 byte buffer."""
+def build_rif_bytes(mesh, object_name: str = None,
+                    include_prelight: bool = True) -> bytes:
+    """Serialise a single Blender mesh to a REBINFF2 byte buffer.
+
+    include_prelight : when True (default), emit an all-white SHPVTINT
+        and set ShapeFlag_PreLit on the shape so the engine reads it.
+        Without prelight, VertexIntensity_Standard_Opt in Kshape.c
+        returns a zero vertex colour and the mesh renders black.
+    """
     if object_name is None:
         object_name = mesh.name or "Mesh"
 
     slot_bitmaps = _resolve_bitmap_indices(mesh)
-    shape = _build_shape_chunk(mesh, object_name, 1, slot_bitmaps)
+    shape_flags = SHAPE_FLAGS_DEFAULT
+
+    shape = _build_shape_chunk(
+        mesh, object_name, 1, slot_bitmaps, shape_flags=shape_flags,
+    )
+
+    num_vertices = len(mesh.vertices)
+    prelight = None
+    if include_prelight and num_vertices > 0:
+        prelight = [PRELIGHT_WHITE] * num_vertices
+
     obj = _build_object_chunk(
         name=object_name,
         location_rif=(0, 0, 0),
-        orientation_rif=(-0.0, -0.0, -0.0, 0.0),
+        orientation_rif=(0.0, 0.0, 0.0, 1.0),
         index_num=0,
         shape_id_no=1,
-        num_vertices=len(mesh.vertices),
-        module_data=None,      # bare shape export: no module, no physics
+        num_vertices=num_vertices,
+        module_data=None,
+        prelight_intensities=prelight,
     )
     root = GodFatherChunk([
         RIFVersionChunk(0),
@@ -114,7 +218,8 @@ def build_rif_bytes(mesh, object_name: str = None) -> bytes:
     return root.serialize()
 
 
-def build_rif_multi(objects, hierarchy=None) -> bytes:
+def build_rif_multi(objects, hierarchy=None,
+                    include_prelight: bool = True) -> bytes:
     """Serialise a list of Blender mesh objects into one REBINFF2 buffer.
 
     No environment envelope, no module data — this is the export path used
@@ -123,6 +228,10 @@ def build_rif_multi(objects, hierarchy=None) -> bytes:
     objects = list(objects)
     if not objects:
         raise ValueError("build_rif_multi requires at least one object")
+
+    # See the SHAPE_FLAG_EXTERNALFILE note above: the file-side flags stay 0
+    # and prelight travels in the SHPVTINT chunk only.
+    shape_flags = SHAPE_FLAGS_DEFAULT
 
     shapes = []
     objs = []
@@ -133,20 +242,28 @@ def build_rif_multi(objects, hierarchy=None) -> bytes:
         slot_bitmaps = _resolve_bitmap_indices(obj.data)
         shapes.append(_build_shape_chunk(
             obj.data, obj.name, file_id, slot_bitmaps,
+            shape_flags=shape_flags,
         ))
 
         loc, rot_q, _scale = obj.matrix_local.decompose()
         bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
         loc_rif = (meters_to_rif(bx), meters_to_rif(by), meters_to_rif(bz))
         orient_rif = _convert_orientation(rot_q)
+
+        num_vertices = len(obj.data.vertices)
+        prelight = None
+        if include_prelight and num_vertices > 0:
+            prelight = [PRELIGHT_WHITE] * num_vertices
+
         objs.append(_build_object_chunk(
             name=obj.name,
             location_rif=loc_rif,
             orientation_rif=orient_rif,
             index_num=i,
             shape_id_no=file_id,
-            num_vertices=len(obj.data.vertices),
+            num_vertices=num_vertices,
             module_data=None,
+            prelight_intensities=prelight,
         ))
 
     children = [RIFVersionChunk(0)] + shapes + objs
@@ -161,10 +278,15 @@ def build_rif_level(objects, level_name, texture_paths=None,
                     hierarchy=None, include_scale=False,
                     lights=None, ambient=255,
                     light_set_name=DEFAULT_LIGHT_SET,
-                    include_litscale=False,
+                    include_litscale=True,
+                    emit_runtime_lights=False,
                     sky_colour=(128, 128, 128),
                     include_avpenvir=True,
-                    include_module_data=True) -> bytes:
+                    include_module_data=True,
+                    include_prelight=True,
+                    prelight_colour=PRELIGHT_WHITE,
+                    object_intensities=None,
+                    shape_flags_override=None) -> bytes:
     """Assemble a level RIF: shapes + objects + MODULEDT + REBENVDT.
 
     Composition:
@@ -183,10 +305,56 @@ def build_rif_level(objects, level_name, texture_paths=None,
         MODULEDT chunk with a full VMDARRAY of peer indices and an empty
         ADJMDLEP. This is what makes the geometry visible to the physics
         engine. Set False only for debugging.
+
+    include_prelight : when True (default), every RBOBJECT gets a SHPVTINT
+        with the given per-vertex intensity, which is the ONLY path to lit
+        static geometry without a full placed-light-object system. The
+        loader then sets ShapeFlag_PreLit on the runtime shape by itself
+        (Projload.cpp:1455/2067); the flag is deliberately NOT written into
+        SHPHEAD1 (see the SHAPE_FLAG_EXTERNALFILE collision note at the top
+        of this module). Set False to reproduce the pre-S6-F7 unlit export.
+
+    lights : optional list of light spec dicts written as STDLIGHT chunks.
+        Position is in Blender metres; brightness is 16.16 fixed point; range
+        is RIF millimetres; colour is packed 0x00BBGGRR. There is no fallback
+        light: pass an empty list for an empty LIGHTSET. A fabricated light
+        would light the player and NPCs, which read exactly these chunks.
+
+    emit_runtime_lights : when True, every written STDLIGHT also gets
+        LOFlag_Runtime so the engine's SetUpRunTimeLights adopts it as a real
+        light for whichever module contains it. That is what lights dynamic
+        objects — players, NPCs, dropped items — because only module objects
+        carry ObFlag3_PreLit (comp_map.c:457) and are skipped by Avpview.c:170.
+        Leave True for playable levels.
+
+    prelight_colour : packed 0x00RRGGBB per-vertex intensity used when
+        `object_intensities` has no entry for an object. Use PRELIGHT_WHITE
+        for a fully-lit flat surface.
+
+    object_intensities : optional list aligned with `objects`, each entry
+        either None or a list of packed 0x00RRGGBB values, one per vertex of
+        that mesh. This is where baked point-light results go: compute them
+        with `rif.lighting.bake_for_object` so the values match what the
+        engine would have produced itself.
+
+    shape_flags_override : force a specific SHAPE_FLAGS value instead
+        of the computed one. Kept for diagnostics only — never set bit
+        0x1000 on a module shape (see the SHAPE_FLAG_EXTERNALFILE note at
+        the top of this module).
     """
     objects = list(objects)
     if not objects:
         raise ValueError("build_rif_level requires at least one object")
+
+    # Prelight is carried by SHPVTINT and activated by the loader itself
+    # (Projload.cpp:1455/2067). SHPHEAD1.flags must stay 0: bit 0x1000 is
+    # ALSO SHAPE_FLAG_EXTERNALFILE (SHPCHUNK.HPP:15) and triggers the
+    # imported-shape branch at Projload.cpp:1974, which never registers a
+    # module — the level then renders empty.
+    if shape_flags_override is not None:
+        shape_flags = shape_flags_override
+    else:
+        shape_flags = SHAPE_FLAGS_DEFAULT
 
     n_objects = len(objects)
     all_indices = list(range(n_objects))
@@ -200,6 +368,7 @@ def build_rif_level(objects, level_name, texture_paths=None,
         slot_bitmaps = _resolve_bitmap_indices(obj.data)
         shapes.append(_build_shape_chunk(
             obj.data, obj.name, file_id, slot_bitmaps,
+            shape_flags=shape_flags,
         ))
 
         loc, rot_q, _scale = obj.matrix_local.decompose()
@@ -220,14 +389,26 @@ def build_rif_level(objects, level_name, texture_paths=None,
                 "modacous": (-1, -1.0, 0),
             }
 
+        num_vertices = len(obj.data.vertices)
+        prelight = None
+        if include_prelight and num_vertices > 0:
+            baked = (object_intensities[i]
+                     if object_intensities and i < len(object_intensities)
+                     else None)
+            if baked is not None:
+                prelight = list(baked)
+            else:
+                prelight = [prelight_colour] * num_vertices
+
         objs.append(_build_object_chunk(
             name=obj.name,
             location_rif=loc_rif,
             orientation_rif=orient_rif,
             index_num=i,
             shape_id_no=file_id,
-            num_vertices=len(obj.data.vertices),
+            num_vertices=num_vertices,
             module_data=module_data,
+            prelight_intensities=prelight,
         ))
 
     # ---- environment skeleton (REBENVDT) ----
@@ -245,7 +426,8 @@ def build_rif_level(objects, level_name, texture_paths=None,
         )
     env_children.append(SpecialObjectsChunk(speclobj_children))
     env_children.append(
-        _build_lightset(light_set_name, lights, ambient, include_litscale)
+        _build_lightset(light_set_name, lights, ambient, include_litscale,
+                        runtime_flags=emit_runtime_lights)
     )
     if include_avpenvir:
         env_children.append(AVPEnvironmentSettingsChunk(
@@ -325,8 +507,16 @@ def _build_hierarchy_node(name, children_of):
     return ObjectHierarchyChunk(node_children)
 
 
-def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps):
-    """Return a fully assembled REBSHAPE chunk for one mesh."""
+def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
+                       shape_flags=None):
+    """Return a fully assembled REBSHAPE chunk for one mesh.
+
+    shape_flags : SHPHEAD1.flags value; defaults to SHAPE_FLAGS_DEFAULT.
+        Pass SHAPE_FLAG_PRELIT when the shape should read SHPVTINT.
+    """
+    if shape_flags is None:
+        shape_flags = SHAPE_FLAGS_DEFAULT
+
     verts_int, vert_normals, polys, poly_normals, uv_lists = \
         _extract_geometry(mesh, slot_bitmaps)
     bounds = _compute_bounds(verts_int)
@@ -336,7 +526,7 @@ def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps):
 
     return ShapeChunk([
         ShapeHeaderChunk(
-            flags=SHAPE_FLAGS,
+            flags=shape_flags,
             lock_user=DEFAULT_LOCK_USER,
             file_id_num=file_id_num,
             num_verts=len(verts_int),
@@ -359,7 +549,7 @@ def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps):
 
 def _build_object_chunk(name, location_rif, orientation_rif,
                         index_num, shape_id_no, num_vertices=0,
-                        module_data=None):
+                        module_data=None, prelight_intensities=None):
     """Return a fully assembled RBOBJECT chunk.
 
     Children order matches battle.rif:
@@ -370,6 +560,11 @@ def _build_object_chunk(name, location_rif, orientation_rif,
             vmdarray : list of (object_index, branch_no, flags, spare)
             adjmdlep : list of (object_index, flags, (x, y, z))
             modacous : tuple (env_index, reverb, spare), optional
+
+    prelight_intensities : list[int] or None. When provided (and
+        non-empty), a SHPVTINT child is emitted. Length must match
+        num_vertices. The linked REBSHAPE must have ShapeFlag_PreLit
+        set or the engine ignores this chunk (see Kshape.c).
     """
     obj_header = ObjectHeaderChunk(
         flags=OBJ_FLAGS,
@@ -387,16 +582,12 @@ def _build_object_chunk(name, location_rif, orientation_rif,
     ]
     if module_data is not None:
         children.append(_build_module_data(module_data))
-    # SHPVTINT intentionally disabled: shipping files include it, but the
-    # engine treats missing SHPVTINT as "no prelight" and falls back to
-    # ambient lighting. Emitting all-zero SHPVTINT was tested in S6 F2
-    # and made no visible difference; leaving it off reduces file size
-    # and removes one variable while we chase the render bug.
-    # if num_vertices > 0:
-    #     children.append(ShapeVertexIntensitiesChunk(
-    #         light_set_name=DEFAULT_LIGHT_SET,
-    #         num_vertices=num_vertices,
-    #     ))
+    if prelight_intensities:
+        children.append(ShapeVertexIntensitiesChunk(
+            light_set_name=DEFAULT_LIGHT_SET,
+            num_vertices=len(prelight_intensities),
+            intensities=prelight_intensities,
+        ))
     return ObjectChunk(children)
 
 
@@ -427,34 +618,61 @@ def _build_avpstart(player_start, player_orientation):
     return PlayerStartChunk(location=loc_rif, orientation=orient_ints)
 
 
-def _build_lightset(name, lights, ambient, include_litscale):
-    """Assemble a LIGHTSET chunk; guarantees at least one STDLIGHT."""
+def _build_lightset(name, lights, ambient, include_litscale,
+                    runtime_flags=False):
+    """Assemble a LIGHTSET chunk.
+
+    Emits only the lights actually passed in. There is deliberately no
+    fallback light: an unwanted white light at the origin would light
+    characters (they read exactly these chunks) and silently invalidate any
+    lighting test. An empty LIGHTSET is still written, because AMBIENCE has
+    to reach GlobalAmbience for dynamic objects.
+
+    Note: STDLIGHT entries are not inert. Objsetup.cpp:3425
+    SetUpRunTimeLights() turns every STDLIGHT whose local_light_flags has
+    LOFlag_Runtime (0x10) and whose position falls inside a module into a real
+    LIGHTBLOCK for that module. That is what lights the player and NPCs, since
+    only module objects carry ObFlag3_PreLit (comp_map.c:457) and are skipped
+    by Avpview.c:170.
+    """
     children = [LightSetHeaderChunk(name)]
     if include_litscale:
         children.append(LightScaleChunk())
     children.append(AmbienceChunk(ambient))
-    if not lights:
-        lights = DEFAULT_LIGHT_SPECS
-    for i, spec in enumerate(lights):
-        children.append(_make_stdlight(i, spec))
+    for i, spec in enumerate(lights or ()):
+        children.append(_make_stdlight(i, spec, runtime_flags=runtime_flags))
     return LightSetChunk(children)
 
 
-def _make_stdlight(index, spec):
-    """Build one STDLIGHT record from a light spec dict."""
+def _make_stdlight(index, spec, runtime_flags=False):
+    """Build one STDLIGHT record from a light spec dict.
+
+    The spec values are already expected in engine units:
+        brightness : 16.16 fixed (ONE_FIXED = 65536 = 1.0)
+        spread     : 4096-per-circle (4096 = full 360°)
+        range      : RIF millimetres
+        colour     : packed 0x00BBGGRR
+        location   : Blender metres (converted here)
+
+    runtime_flags : when True, OR LOFlag_Runtime into local_light_flags so
+        SetUpRunTimeLights (Objsetup.cpp:3502) adopts the light.
+    """
     loc = spec.get("location", (0.0, 0.0, 0.0))
     bx, by, bz = blender_to_rif_axis(*loc)
     loc_rif = (meters_to_rif(bx), meters_to_rif(by), meters_to_rif(bz))
+    local_flags = spec.get("local_flags", 0)
+    if runtime_flags:
+        local_flags |= LIGHT_LOCAL_FLAG_RUNTIME
     return StandardLightChunk(
         light_number=index,
         location=loc_rif,
         orientation=spec.get("orientation", IDENTITY_MATRIX_16_16),
-        brightness=spec.get("brightness", 255),
-        spread=spec.get("spread", 360),
-        range=spec.get("range", 2000),
+        brightness=spec.get("brightness", ONE_FIXED),
+        spread=spec.get("spread", 4096),
+        range=spec.get("range", 20000),
         colour=spec.get("colour", 0x00FFFFFF),
         engine_light_flags=spec.get("engine_flags", 0),
-        local_light_flags=spec.get("local_flags", 0),
+        local_light_flags=local_flags,
     )
 
 
