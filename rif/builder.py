@@ -57,6 +57,7 @@ from .types import (
     DEFAULT_LOCK_USER, DEFAULT_NOTES,
     meters_to_rif, uv_to_rif_pixels, blender_to_rif_axis,
 )
+from .texture_library import rim_name_for_material
 from .chunks.root import GodFatherChunk, RIFVersionChunk
 from .chunks.shape import ShapeChunk
 from .chunks.header import ShapeHeaderChunk
@@ -315,10 +316,13 @@ def build_rif_level(objects, level_name, texture_paths=None,
         of this module). Set False to reproduce the pre-S6-F7 unlit export.
 
     lights : optional list of light spec dicts written as STDLIGHT chunks.
-        Position is in Blender metres; brightness is 16.16 fixed point; range
-        is RIF millimetres; colour is packed 0x00BBGGRR. There is no fallback
-        light: pass an empty list for an empty LIGHTSET. A fabricated light
-        would light the player and NPCs, which read exactly these chunks.
+        `location` is in RIF millimetres, ALREADY axis-converted (x, -z, y) --
+        the operator's `_collect_scene_lights` does that once, so the STDLIGHT
+        record and the prelight bake compare positions in the same space as
+        SHPRAWVT. Brightness is 16.16 fixed point, range is RIF millimetres and
+        colour is packed 0x00BBGGRR. There is no fallback light: pass an empty
+        list for an empty LIGHTSET. A fabricated light would light the player
+        and NPCs, which read exactly these chunks.
 
     emit_runtime_lights : when True, every written STDLIGHT also gets
         LOFlag_Runtime so the engine's SetUpRunTimeLights adopts it as a real
@@ -365,7 +369,7 @@ def build_rif_level(objects, level_name, texture_paths=None,
         if obj.type != "MESH":
             raise ValueError(f"Object {obj.name!r} is not a mesh")
         file_id = i + 1
-        slot_bitmaps = _resolve_bitmap_indices(obj.data)
+        slot_bitmaps = _resolve_bitmap_indices(obj.data, texture_paths)
         shapes.append(_build_shape_chunk(
             obj.data, obj.name, file_id, slot_bitmaps,
             shape_flags=shape_flags,
@@ -602,8 +606,17 @@ def _build_module_data(spec):
 
 
 def _build_bmpnames(texture_paths):
-    """Wrap texture paths into a BMPNAMES chunk (never empty)."""
+    """Wrap texture paths into a BMPNAMES chunk (never empty).
+
+    Entry ``index`` is the position in ``texture_paths``, and callers must pass
+    a list whose positions match the `rif_bitmap_idx` they wrote onto the
+    materials. Those two used to be derived independently -- BMPNAMES from a
+    global list, the polygon index from each object's own slot numbering -- so
+    with more than one object the second one pointed at the first one's texture.
+    """
     if not texture_paths:
+        # Never emit an empty BMPNAMES: the loader would then resolve no
+        # texture at all and silently drop every polygon to iflag_nolight.
         texture_paths = ["dummy.RIM"]
     entries = [{"index": i, "name": str(p)} for i, p in enumerate(texture_paths)]
     return BMPNamesChunk(entries)
@@ -647,25 +660,27 @@ def _build_lightset(name, lights, ambient, include_litscale,
 def _make_stdlight(index, spec, runtime_flags=False):
     """Build one STDLIGHT record from a light spec dict.
 
-    The spec values are already expected in engine units:
+    The spec values are all in engine units, produced once by the operator's
+    `_collect_scene_lights` so that the STDLIGHT record and the prelight bake
+    cannot disagree:
         brightness : 16.16 fixed (ONE_FIXED = 65536 = 1.0)
         spread     : 4096-per-circle (4096 = full 360°)
         range      : RIF millimetres
         colour     : packed 0x00BBGGRR
-        location   : Blender metres (converted here)
+        location   : RIF millimetres, already axis-converted
 
     runtime_flags : when True, OR LOFlag_Runtime into local_light_flags so
         SetUpRunTimeLights (Objsetup.cpp:3502) adopts the light.
     """
-    loc = spec.get("location", (0.0, 0.0, 0.0))
-    bx, by, bz = blender_to_rif_axis(*loc)
-    loc_rif = (meters_to_rif(bx), meters_to_rif(by), meters_to_rif(bz))
     local_flags = spec.get("local_flags", 0)
     if runtime_flags:
         local_flags |= LIGHT_LOCAL_FLAG_RUNTIME
+    # The record stores i32, so round rather than trusting a caller that passed
+    # floats; a float would otherwise raise deep inside struct.pack.
+    location = tuple(int(round(v)) for v in spec.get("location", (0, 0, 0)))
     return StandardLightChunk(
         light_number=index,
-        location=loc_rif,
+        location=location,
         orientation=spec.get("orientation", IDENTITY_MATRIX_16_16),
         brightness=spec.get("brightness", ONE_FIXED),
         spread=spec.get("spread", 4096),
@@ -676,8 +691,31 @@ def _make_stdlight(index, spec, runtime_flags=False):
     )
 
 
-def _resolve_bitmap_indices(mesh):
-    """Return per-material-slot RIF bitmap indices (default = slot idx)."""
+def _resolve_bitmap_indices(mesh, texture_paths=None):
+    """Return per-material-slot RIF bitmap indices.
+
+    Two ways to decide a slot's texture index, and only one may win:
+
+    * `texture_paths` given — it IS the BMPNAMES list, so a slot's index is the
+      position of its material's RIM name inside that list. Nothing else may
+      influence it. Reading a leftover `rif_bitmap_idx` here would let unrelated
+      scene state change the exported bytes: a material that once carried 7
+      made polygons reference index 7 while BMPNAMES declared 0..2, which the
+      engine cannot resolve and therefore stops drawing.
+    * `texture_paths` absent — fall back to the per-material property, then to
+      the slot number, which is what `build_rif_bytes`/`build_rif_multi`
+      callers rely on.
+    """
+    if texture_paths:
+        index_of = {}
+        for position, path in enumerate(texture_paths):
+            index_of.setdefault(str(path), position)
+        result = []
+        for slot_idx, mat in enumerate(mesh.materials):
+            name = rim_name_for_material(mat)
+            result.append(index_of.get(name, slot_idx) & POLY_BITMAP_MASK)
+        return result
+
     result = []
     for slot_idx, mat in enumerate(mesh.materials):
         idx = slot_idx

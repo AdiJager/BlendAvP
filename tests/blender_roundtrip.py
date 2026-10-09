@@ -97,25 +97,118 @@ except ImportError:
     Quaternion = None
     HAS_BPY = False
 
-from rif.builder import (
-    build_rif_bytes, build_rif_multi, build_rif_level,
-    _convert_orientation,
-    POLY_BITMAP_MASK, POLY_UV_HI_MASK,
-    BITMAP_IDX_PROP,
-)
-from rif.types import (
-    blender_to_rif_axis, rif_to_blender_axis,
-    meters_to_rif, uv_to_rif_pixels,
-    RIF_UNITS_PER_METER, DEFAULT_UV_PIXELS,
-)
-from rif import lighting as rif_lighting
+# Directory name of the add-on, used to import it as a package. Kept as a
+# literal so this file works whether or not it is executed as part of it.
+PACKAGE_NAME = "avp_rif_exporter"
 
+# This file lives at <parent>/<PACKAGE_NAME>/tests/blender_roundtrip.py, so the
+# parent is the directory that must be on `sys.path` for `PACKAGE_NAME` to be
+# importable as a package. Derived from this file rather than hard-coded, so the
+# suite also works when run from a copy inside Blender's addons folder.
+_TESTS_FILE = os.path.abspath(__file__)
+_PACKAGE_DIR = os.path.dirname(os.path.dirname(_TESTS_FILE))
+_PARENT_DIR = os.path.dirname(_PACKAGE_DIR)
 
-# ------------------------------------------------------------------ framework
 
 class SkipTest(Exception):
     """Raised by tests that cannot run in the current environment."""
 
+
+def load_package_module(relative_name):
+    """Import one of the add-on's modules fresh from disk.
+
+    A long-lived Blender session keeps `rif.builder` and friends in
+    `sys.modules`, so editing them on disk has no effect on the running
+    interpreter — the tests keep exercising the OLD code and report failures
+    that were already fixed.
+
+    The module is loaded as a **top-level** module with the add-on directory on
+    `sys.path`, not as `avp_rif_exporter.rif.builder`. Going through the package
+    does not work: `import a.b.c` consults the parent package's attribute before
+    `sys.modules`, so a stale parent hands back the OLD module, and dropping the
+    parents would re-execute `avp_rif_exporter/__init__.py`, which imports
+    `operators` and registers the add-on a second time. Importing `rif.builder`
+    directly avoids both problems, and `rif` is importable as a top-level
+    package anyway — that is how `_locate_rif_package` sets things up.
+
+    Every fresh `rif.*` module shares one `sys.modules` entry, so the copies the
+    tests hold stay mutually consistent.
+    """
+    import importlib
+
+    for directory in (_PARENT_DIR, _PACKAGE_DIR):
+        if directory not in sys.path:
+            sys.path.insert(0, directory)
+
+    # Drop the whole top-level package so nothing stale survives; importing the
+    # requested module then pulls its dependencies from disk again.
+    for cached in list(sys.modules):
+        if cached == "rif" or cached.startswith("rif."):
+            sys.modules.pop(cached, None)
+    importlib.invalidate_caches()
+    return importlib.import_module(relative_name)
+
+
+def load_operators():
+    """Return this add-on's `operators` module.
+
+    `operators` uses relative imports (`from .rif.types import ...`), so it only
+    imports as a submodule of the add-on package.
+
+    Inside Blender the add-on may already be imported, and then its live module
+    must be reused: importing a second copy would make the tests compare results
+    produced by different module objects. The match has to be on the package
+    name, not just the final component — Blender itself ships `cycles.operators`,
+    and matching on `.operators` alone handed the tests that module, which then
+    failed with "module 'cycles.operators' has no attribute ...".
+    """
+    import importlib
+
+    wanted = f"{PACKAGE_NAME}.operators"
+    if wanted in sys.modules:
+        return sys.modules[wanted]
+    for name, module in list(sys.modules.items()):
+        if name == "operators" and getattr(module, "__package__", None) == PACKAGE_NAME:
+            return module
+        if name.endswith(".operators") and \
+                getattr(module, "__package__", None) == PACKAGE_NAME:
+            return module
+
+    for directory in (_PARENT_DIR, _PACKAGE_DIR):
+        if directory not in sys.path:
+            sys.path.insert(0, directory)
+    for candidate in (wanted, "operators"):
+        try:
+            return importlib.import_module(candidate)
+        except ImportError:
+            continue
+    raise SkipTest("cannot import the add-on's operators module")
+
+
+# Modules are imported fresh from disk so the tests never measure stale code
+# left in `sys.modules` by a long-lived Blender session (see
+# `load_package_module`). This must come after that helper is defined.
+_builder = load_package_module("rif.builder")
+_types = load_package_module("rif.types")
+rif_lighting = load_package_module("rif.lighting")
+
+build_rif_bytes = _builder.build_rif_bytes
+build_rif_multi = _builder.build_rif_multi
+build_rif_level = _builder.build_rif_level
+_convert_orientation = _builder._convert_orientation
+POLY_BITMAP_MASK = _builder.POLY_BITMAP_MASK
+POLY_UV_HI_MASK = _builder.POLY_UV_HI_MASK
+BITMAP_IDX_PROP = _builder.BITMAP_IDX_PROP
+
+blender_to_rif_axis = _types.blender_to_rif_axis
+rif_to_blender_axis = _types.rif_to_blender_axis
+meters_to_rif = _types.meters_to_rif
+uv_to_rif_pixels = _types.uv_to_rif_pixels
+RIF_UNITS_PER_METER = _types.RIF_UNITS_PER_METER
+DEFAULT_UV_PIXELS = _types.DEFAULT_UV_PIXELS
+
+
+# ------------------------------------------------------------------ framework
 
 _TESTS = []
 
@@ -129,15 +222,38 @@ def test(fn):
 # ------------------------------------------------------------------ helpers
 
 def _clear_scene():
-    """Remove all objects and mesh/material data from the current scene."""
+    """Remove all objects and mesh/material data from the current scene.
+
+    Order matters. Objects go first while the depsgraph is coherent: removing a
+    mesh that an object still references, then the object, is what makes Blender
+    tear down render batches for a datablock that is mid-draw, and the symptom is
+    a crash inside `DRW_cache_free_old_batches` / `DEG_iterator_objects_next`
+    with no Python frames — which is a Blender bug, not a test failure.
+    """
     if bpy is None:
         return
     for obj in list(bpy.data.objects):
-        bpy.data.objects.remove(obj, do_unlink=True)
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except (ReferenceError, RuntimeError):
+            pass
     for mesh in list(bpy.data.meshes):
-        bpy.data.meshes.remove(mesh)
+        try:
+            bpy.data.meshes.remove(mesh)
+        except (ReferenceError, RuntimeError):
+            pass
     for mat in list(bpy.data.materials):
-        bpy.data.materials.remove(mat)
+        try:
+            bpy.data.materials.remove(mat)
+        except (ReferenceError, RuntimeError):
+            pass
+
+    # Flush the dependency graph once, after the batch of removals, instead of
+    # once per datablock.
+    try:
+        bpy.context.view_layer.update()
+    except (AttributeError, RuntimeError):
+        pass
 
 
 def _make_cube(name="Cube", size=1.0, location=(0.0, 0.0, 0.0)):
@@ -159,6 +275,21 @@ def _make_cubes(count, prefix="Cube"):
         obj.name = f"{prefix}{i}"
         objs.append(obj)
     return objs
+
+
+def _new_cube_mesh(name="CubeMesh"):
+    """Return a new cube mesh datablock without clearing the scene.
+
+    `_make_cube` clears everything first, so it cannot be used to build several
+    objects in one test. This creates just the mesh, leaving the caller free to
+    make as many objects as it needs.
+    """
+    bpy.ops.mesh.primitive_cube_add(size=1.0)
+    created = bpy.context.active_object
+    mesh = created.data
+    mesh.name = name
+    bpy.data.objects.remove(created, do_unlink=True)
+    return mesh
 
 
 def _make_plate(name="Plate", dims=(2.0, 0.1, 0.3)):
@@ -202,7 +333,25 @@ def _chunk_payload(data, ident):
     idx, size = _find_chunk(data, ident)
     if idx < 0:
         return b""
-    return data[idx + 12:idx + size]
+    return data[idx + CHUNK_HEADER_BYTES:idx + size]
+
+
+# Identifier (8 B) + total size (4 B); the payload starts after this.
+CHUNK_HEADER_BYTES = 12
+
+
+def _all_chunk_payloads(data, ident):
+    """Return the payload bytes of every matching chunk.
+
+    `_find_all_chunks` reports the chunk HEADER offset and its total size, so
+    the payload starts 12 bytes in. Slicing `data[start:start + span]` instead
+    includes the identifier and the size field, which shifts every record by
+    four bytes and turns the following chunk's header into record data — the
+    reader then reports nonsense indices and vertex numbers rather than a
+    structural error.
+    """
+    return [data[start + CHUNK_HEADER_BYTES:start + span]
+            for start, span in _find_all_chunks(data, ident)]
 
 
 def _read_i32(data, off):
@@ -395,6 +544,195 @@ def test_bitmap_idx_custom_property_override():
     for _eng, _n, _f, colour, _vi in _iter_poly_records(payload):
         assert (colour & POLY_BITMAP_MASK) == 7, \
             f"expected bitmap_idx 7, got {colour & POLY_BITMAP_MASK}"
+
+
+@test
+def test_bitmap_idx_matches_bmpnames_index():
+    """Every polygon index must exist in BMPNAMES, across several objects.
+
+    Regression test for a real bug: the polygon texture index defaulted to the
+    material's slot number on its own object, while BMPNAMES is numbered
+    globally. With two objects the second one pointed at the first one's
+    texture. The operator now derives both from one list; this checks the
+    builder writes them consistently.
+    """
+    # Start from an empty scene. Objects left behind by an earlier test carry
+    # their own `rif_bitmap_idx` (test_bitmap_idx_custom_property_override sets
+    # 7), and the builder reads that property in preference to the slot index,
+    # so a leak here shows up as "bitmap_idx 7 is not in BMPNAMES {0,1,2}".
+    _clear_scene()
+
+    # Build both objects BEFORE touching `_make_cube`, because that helper
+    # clears the whole scene: anything created earlier would be destroyed, and
+    # the failure surfaces later as "StructRNA of type Object has been removed".
+    first_mesh = _new_cube_mesh("Mapped1")
+    second_mesh = _new_cube_mesh("Mapped2")
+    first = bpy.data.objects.new("MappedA", first_mesh)
+    second = bpy.data.objects.new("MappedB", second_mesh)
+    for obj in (first, second):
+        bpy.context.collection.objects.link(obj)
+    second.location = (5.0, 0.0, 0.0)
+
+    mat_a = bpy.data.materials.new(name="alpha.RIM")
+    mat_b = bpy.data.materials.new(name="beta.RIM")
+    mat_c = bpy.data.materials.new(name="gamma.RIM")
+
+    # Object one: alpha, beta. Object two: gamma only. Under the old slot-index
+    # default, gamma would have been written as index 0 == alpha.
+    first.data.materials.append(mat_a)
+    first.data.materials.append(mat_b)
+    second.data.materials.append(mat_c)
+    for poly in first.data.polygons:
+        poly.material_index = poly.index % 2
+    for poly in second.data.polygons:
+        poly.material_index = 0
+
+    paths = ["alpha.RIM", "beta.RIM", "gamma.RIM"]
+    data = build_rif_level([first, second], "Mapped", texture_paths=paths)
+
+    # If the index below is wrong, this says WHY in one line: which builder file
+    # is running, what each material resolves to, and whether the builder even
+    # accepted the `texture_paths` argument. Without it the only symptom is
+    # "bitmap_idx 7", which is equally consistent with stale code and with a
+    # name mismatch.
+    print(f"        [diag] build_rif_level z {getattr(build_rif_level, '__module__', '?')}"
+          f" ({getattr(sys.modules.get(getattr(build_rif_level, '__module__', ''), None), '__file__', '?')})")
+    for mark, obj in (("A", first), ("B", second)):
+        names = [_builder.rim_name_for_material(m) for m in obj.data.materials]
+        props = [m.get(BITMAP_IDX_PROP) for m in obj.data.materials]
+        slots = sorted({p.material_index for p in obj.data.polygons})
+        print(f"        [diag] {mark}: nazwy={names} rif_bitmap_idx={props} "
+              f"sloty_w_poligonach={slots}")
+    print(f"        [diag] indeksy z buildera: "
+          f"{[_builder._resolve_bitmap_indices(o.data, paths) for o in (first, second)]}")
+
+    # BMPNAMES must declare exactly those paths, indexed 0..2.
+    idx, size = _find_chunk(data, "BMPNAMES")
+    assert idx > 0, "no BMPNAMES chunk in the exported level"
+    header, = struct.unpack_from("<I", data, idx + 12)
+    count = header & 0xFFFF
+    assert count == 3, f"expected 3 BMPNAMES entries, got {count}"
+
+    declared = set()
+    pos = idx + 16
+    for _ in range(count):
+        _flags, index = struct.unpack_from("<2I", data, pos)
+        declared.add(index)
+        nul = data.index(b"\x00", pos + 20)
+        pos = (nul + 1 + 3) & ~3
+    assert declared == {0, 1, 2}, f"BMPNAMES indices {declared}"
+
+    # Every polygon index in every shape must be one of those.
+    payloads = _all_chunk_payloads(data, "SHPPOLYS")
+    assert len(payloads) == 2, f"expected 2 shapes, got {len(payloads)}"
+
+    # Each payload must be a whole number of 36-byte records; if it is not, the
+    # slice is wrong and every field read below would be shifted by four bytes.
+    for shape_no, payload in enumerate(payloads):
+        assert len(payload) % 36 == 0, (
+            f"shape {shape_no} payload {len(payload)} B is not a multiple of "
+            "36 - the chunk header was probably included in the slice")
+
+    # Report the whole distribution BEFORE asserting, so a failure names the
+    # shape and the record number instead of only "bitmap_idx N".
+    for shape_no, payload in enumerate(payloads):
+        records = list(_iter_poly_records(payload))
+        seen = {}
+        for _eng, _n, _f, colour, _vi in records:
+            seen[colour & POLY_BITMAP_MASK] = \
+                seen.get(colour & POLY_BITMAP_MASK, 0) + 1
+        print(f"        [diag] shape {shape_no}: {len(records)} poligonow, "
+              f"payload={len(payload)} B, rozklad bitmap_idx={seen}")
+
+    for shape_no, payload in enumerate(payloads):
+        for rec_no, (_eng, _n, _f, colour, _vi) in \
+                enumerate(_iter_poly_records(payload)):
+            index = colour & POLY_BITMAP_MASK
+            assert index in declared, (
+                f"shape {shape_no} record {rec_no}: polygon bitmap_idx {index} "
+                f"is not in BMPNAMES {declared} (colour=0x{colour:08X})")
+
+
+@test
+def test_gamma_object_gets_its_own_index():
+    """The second object must point at its own texture, not the first's.
+
+    The concrete failure before the fix: gamma landed on index 0, which is
+    alpha's texture, so object two rendered with object one's art.
+    """
+    # Scene must be empty: a stray `rif_bitmap_idx` on a leftover material
+    # would override the index this test is checking, exactly as it did before.
+    _clear_scene()
+
+    # Meshes first, then objects, then materials: `_new_cube_mesh` appends and
+    # removes a temporary object, so building meshes before objects avoids any
+    # chance of an operator invalidating a reference held here.
+    mesh_one = _new_cube_mesh("Gamma1")
+    mesh_two = _new_cube_mesh("Gamma2")
+    obj_one = bpy.data.objects.new("GammaA", mesh_one)
+    obj_two = bpy.data.objects.new("GammaB", mesh_two)
+    for obj in (obj_one, obj_two):
+        bpy.context.collection.objects.link(obj)
+    obj_two.location = (5.0, 0.0, 0.0)
+
+    mat_a = bpy.data.materials.new(name="alpha.RIM")
+    mat_b = bpy.data.materials.new(name="beta.RIM")
+    mat_c = bpy.data.materials.new(name="gamma.RIM")
+
+    obj_one.data.materials.append(mat_a)
+    obj_one.data.materials.append(mat_b)
+    obj_two.data.materials.append(mat_c)
+
+    for poly in obj_one.data.polygons:
+        poly.material_index = poly.index % 2
+    for poly in obj_two.data.polygons:
+        poly.material_index = 0
+
+    # The operator's mapping is what feeds this; replicate its result here and
+    # assert the builder honours it.
+    paths = ["alpha.RIM", "beta.RIM", "gamma.RIM"]
+    mat_a[BITMAP_IDX_PROP] = 0
+    mat_b[BITMAP_IDX_PROP] = 1
+    mat_c[BITMAP_IDX_PROP] = 2
+
+    data = build_rif_level([obj_one, obj_two], "Mapped", texture_paths=paths)
+    payloads = _all_chunk_payloads(data, "SHPPOLYS")
+    assert len(payloads) == 2, f"expected 2 shapes, got {len(payloads)}"
+
+    second_indices = {colour & POLY_BITMAP_MASK
+                      for _e, _n, _f, colour, _v in _iter_poly_records(payloads[1])}
+    assert second_indices == {2}, (
+        f"second object uses {second_indices}, expected {{2}} (gamma)")
+    first_indices = {colour & POLY_BITMAP_MASK
+                     for _e, _n, _f, colour, _v in _iter_poly_records(payloads[0])}
+    assert first_indices == {0, 1}, first_indices
+
+
+@test
+def test_bmpnames_name_has_no_graphics_prefix():
+    """A BMPNAMES name must not repeat the textures root.
+
+    The loader treats the name as a path relative to the textures root, which
+    is `FirstTex_Directory = "Graphics"` (Projload.cpp:97), so a name beginning
+    with `graphics\\` makes it look for `Graphics\\graphics\\...` and resolve
+    nothing. An unresolved texture rewrites the polygon to I_Polygon with
+    iflag_nolight (chnkload.cpp:3390), so the level renders empty while its
+    collisions still work.
+    """
+    from rif.texture_library import RIM_PATH_PROP
+
+    expected = r"Envrnmts\Battle\Cliff04.RIM"
+    mat = bpy.data.materials.new(name="Prefixed.RIM")
+    mat[RIM_PATH_PROP] = r"graphics\Envrnmts\Battle\Cliff04.RIM"
+    operators = load_operators()
+    got = operators._material_texture_path(mat)
+    assert got == expected, (
+        f"_material_texture_path returned {got!r}; the 'graphics\\' prefix must "
+        "be stripped because the loader supplies it")
+
+    mat[RIM_PATH_PROP] = expected
+    assert operators._material_texture_path(mat) == expected, \
+        "an already-correct name must pass through unchanged"
 
 
 @test
@@ -671,7 +1009,10 @@ def test_litscale_payload_size():
 def test_stdlight_payload_layout():
     """One STDLIGHT per light spec, 96 bytes total (12 + 84)."""
     obj = _make_cube()
-    lights = [{"location": (1.0, 2.0, 3.0), "brightness": 200}]
+    # Light specs carry RIF millimetres, already axis-converted. The operator
+    # does that conversion in `_collect_scene_lights`, so the builder never
+    # rescales and both the record and the prelight bake agree on one space.
+    lights = [{"location": (1000, -3000, 2000), "brightness": 200}]
     data = build_rif_level([obj], "lvl", lights=lights)
     idx, size = _find_chunk(data, "STDLIGHT")
     assert idx > 0, "STDLIGHT missing"
@@ -680,7 +1021,6 @@ def test_stdlight_payload_layout():
     x = _read_i32(data, idx + 12 + 4)
     y = _read_i32(data, idx + 12 + 8)
     z = _read_i32(data, idx + 12 + 12)
-    # blender_to_rif_axis(1, 2, 3) = (1, -3, 2); ×1000 → (1000, -3000, 2000).
     assert (x, y, z) == (1000, -3000, 2000), f"got {(x, y, z)}"
     # brightness at payload offset +52 (4 + 12 + 36)
     brightness = _read_i32(data, idx + 12 + 52)
@@ -1018,10 +1358,68 @@ def test_level_writes_baked_intensities_verbatim():
 
 
 @test
+def test_bake_uses_world_space_not_local():
+    """Geometry away from the origin must be lit where the light actually is.
+
+    Regression test: the baker was handed object-LOCAL vertices while the lights
+    were in world space, so an object standing away from the origin only lit up
+    where it crossed point 0,0,0. In game that read as "the point light only
+    bakes into point 0,0,0", while runtime lighting of the player looked correct.
+    """
+    operators = load_operators()
+
+    obj = _make_cube()
+    # Move the object 10 m along X, then light it where it now stands.
+    obj.location = (10.0, 0.0, 0.0)
+    bpy.context.view_layer.update()
+
+    verts, normals = operators._object_world_geometry(obj)
+    xs = sorted(v[0] for v in verts)
+    assert xs[0] >= 9 * 1000, f"vertices are not in world space: {xs[:3]}"
+
+    # A light beside the object must produce a non-zero intensity.
+    light = {"location": (10_500, 0, 0), "range": 20_000,
+             "brightness": rif_lighting.ONE_FIXED, "colour": 0xFFFFFF}
+    baked = operators._bake_object_lights([obj], [light], 0)
+    assert baked[0], "the baker returned nothing"
+    assert any(v != 0 for v in baked[0]), \
+        "a light standing beside the object lit nothing"
+
+
+@test
+def test_collected_light_positions_are_rif_millimetres():
+    """A collected light spec must be in RIF millimetres, like the vertices.
+
+    Regression test: the spec carried Blender metres, so a lamp 10.5 m away
+    looked 10.5 units from the origin while SHPRAWVT vertices are in
+    millimetres. The baker compares the two directly, so only geometry within a
+    few millimetres of the RIF origin was lit — "the light bakes only into point
+    0,0,0" even after the object transform was handled correctly.
+    """
+    operators = load_operators()
+
+    light_data = bpy.data.lights.new(name="LampData", type="POINT")
+    light_data.energy = 1000.0
+    light_data.color = (1.0, 1.0, 1.0)
+    lamp = bpy.data.objects.new("Lamp", light_data)
+    bpy.context.collection.objects.link(lamp)
+    lamp.location = (2.0, 3.0, 4.0)
+    bpy.context.view_layer.update()
+
+    lights, _skipped, _dark = operators._collect_scene_lights(bpy.context, 25.0)
+    assert lights, "no light collected"
+    location = lights[0]["location"]
+    # blender_to_rif_axis maps (x, y, z) -> (x, -z, y), then metres -> mm.
+    assert location == (2000, -4000, 3000), location
+    assert all(isinstance(v, int) for v in location), \
+        f"locations must be ints for the i32 STDLIGHT record: {location}"
+
+
+@test
 def test_stdlight_runtime_flag_is_opt_in():
     """LOFlag_Runtime (0x10) is only set when emit_runtime_lights is on."""
     obj = _make_cube()
-    lights = [{"location": (0.0, 0.0, 1.0), "colour": 0x00FFFFFF,
+    lights = [{"location": (0, 0, 1000), "colour": 0x00FFFFFF,
                "brightness": rif_lighting.ONE_FIXED, "range": 15000}]
 
     plain = build_rif_level([obj], "lvl", lights=lights,
@@ -1040,15 +1438,15 @@ def test_stdlight_runtime_flag_is_opt_in():
 
 @test
 def test_stdlight_written_fields_match_spec():
-    """STDLIGHT carries the light's converted position, range and colour."""
+    """STDLIGHT carries the light's position, range and colour verbatim."""
     obj = _make_cube()
-    lights = [{"location": (1.0, 2.0, 3.0), "colour": 0x00123456,
+    # Specs are in RIF millimetres already; see test_stdlight_payload_layout.
+    lights = [{"location": (1000, -3000, 2000), "colour": 0x00123456,
                "brightness": rif_lighting.ONE_FIXED, "range": 12345}]
     data = build_rif_level([obj], "lvl", lights=lights)
     idx, size = _find_chunk(data, "STDLIGHT")
     assert idx > 0, "STDLIGHT missing"
     assert size == 96, f"STDLIGHT size {size}"
-    # blender_to_rif_axis(1, 2, 3) = (1, -3, 2); x1000 -> (1000, -3000, 2000).
     x, y, z = _read_i32x3(data, idx + 12 + 4)
     assert (x, y, z) == (1000, -3000, 2000), f"location {(x, y, z)}"
     # brightness/spread/range at payload offsets 52/56/60.
@@ -1086,22 +1484,67 @@ def test_bake_spot_cone_limits_the_light():
 
 @test
 def test_spot_cosines_shrink_with_blend():
-    """A larger spot_blend widens the soft edge of the cone."""
+    """A larger spot_blend widens the soft edge of the cone.
+
+    Widening the soft band means the *inner* cone narrows. A narrower cone has
+    a *larger* cosine, so the inner cosine must rise above the outer one, not
+    fall below it. The original assertion had this backwards, which is why it
+    failed even though spot_cosines was correct.
+    """
     hard = rif_lighting.spot_cosines(0.5, 0.0)
     soft = rif_lighting.spot_cosines(0.5, 0.5)
     assert hard[0] == hard[1], "no blend means no soft edge"
-    assert soft[0] < soft[1], "blend must shrink the inner cone"
+    assert soft[0] > soft[1], "blend must shrink the inner cone"
+    assert soft[0] > hard[0], "the inner angle must narrow as blend grows"
     assert soft[1] == hard[1], "the outer angle must not move"
 
 
 @test
-def test_power_to_brightness_scales_linearly():
-    """Doubling Blender's Power doubles the engine brightness."""
-    one = rif_lighting.power_to_brightness(1000.0)
-    two = rif_lighting.power_to_brightness(2000.0)
+def test_power_to_brightness_scales_linearly_below_the_ceiling():
+    """Below the ceiling, brightness is proportional to Blender's Power.
+
+    `LightBright` is documented as "0->1 Fixed Point" (prototyp.h:772), so the
+    engine cannot represent more than ONE_FIXED; the exporter clamps there.
+    """
+    one = rif_lighting.power_to_brightness(125.0)
+    two = rif_lighting.power_to_brightness(250.0)
     assert two == 2 * one, (one, two)
     assert rif_lighting.power_to_brightness(0.0) == 0
-    assert rif_lighting.power_to_brightness(1000.0, 2.0) == two
+    assert one < rif_lighting.BRIGHTNESS_CEILING
+
+
+@test
+def test_power_to_brightness_clamps_at_one_fixed():
+    """A very bright lamp saturates at ONE_FIXED rather than overflowing."""
+    assert rif_lighting.power_to_brightness(1e9) == rif_lighting.ONE_FIXED
+    assert rif_lighting.BRIGHTNESS_CEILING == rif_lighting.ONE_FIXED
+    raw = rif_lighting.power_to_brightness(100000.0)
+    assert raw == rif_lighting.BRIGHTNESS_CEILING
+
+
+@test
+def test_brightness_anchor_is_mid_grey():
+    """The documented anchor must actually produce mid-grey in a bake.
+
+    This is the regression test for "the room is black in-game": the anchor
+    states that BLENDER_REFERENCE_POWER_W at BLENDER_REFERENCE_DISTANCE_M
+    reads as roughly half scale, and that has to hold through the real bake,
+    not just in the arithmetic.
+    """
+    watts = rif_lighting.BLENDER_REFERENCE_POWER_W
+    metres = rif_lighting.BLENDER_REFERENCE_DISTANCE_M
+    brightness = rif_lighting.effective_brightness(
+        watts, rif_lighting.DEFAULT_LIGHT_RANGE_MM)
+    assert brightness < rif_lighting.BRIGHTNESS_CEILING, \
+        "the anchor must not already be clipped"
+    light = {"location": (0, 0, 0), "colour": 0xFFFFFF,
+             "brightness": brightness,
+             "range": rif_lighting.DEFAULT_LIGHT_RANGE_MM}
+    value = rif_lighting.bake_vertex_intensities(
+        [(int(metres * 1000), 0, 0)], [(-1.0, 0.0, 0.0)], [light],
+        base_colour=0)[0]
+    level = (value >> 8) & 255
+    assert 80 <= level <= 160, f"anchor gave {level}/255, expected mid-grey"
 
 
 @test
@@ -1143,6 +1586,49 @@ def test_direction_to_rif_preserves_length():
 
 # ------------------------------------------------------------------ runner
 
+def _suspend_viewport_shading():
+    """Switch viewports to a shading mode that keeps no render batches.
+
+    Returns a list of (space, previous_type) to hand back to
+    `_restore_viewport_shading`.
+
+    The suite creates and deletes hundreds of objects in a few seconds. In
+    RENDERED or MATERIAL shading each one builds GPU render batches, and tearing
+    those down while the viewport draws crashes Blender inside
+    `DRW_cache_free_old_batches` / `DEG_iterator_objects_next` with no Python
+    frame in the report. WIREFRAME keeps no such cache, so the churn becomes
+    harmless. Blender in background mode has no viewports and this is a no-op.
+    """
+    saved = []
+    try:
+        windows = bpy.context.window_manager.windows
+    except AttributeError:
+        return saved
+    for window in windows:
+        for area in getattr(window.screen, "areas", []):
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if getattr(space, "type", None) != "VIEW_3D":
+                    continue
+                try:
+                    previous = space.shading.type
+                    space.shading.type = "WIREFRAME"
+                    saved.append((space, previous))
+                except (AttributeError, TypeError):
+                    continue
+    return saved
+
+
+def _restore_viewport_shading(saved):
+    """Put each viewport's original shading mode back."""
+    for space, previous in saved:
+        try:
+            space.shading.type = previous
+        except (AttributeError, ReferenceError, TypeError):
+            pass
+
+
 def run_all():
     """Run all registered tests, printing PASS/FAIL/SKIP per test.
 
@@ -1150,10 +1636,15 @@ def run_all():
     Blender objects that may still be referenced by a running operator can
     trigger an access violation in MSVCP140.dll. Each test helper does its
     own scene cleanup at the start instead.
+
+    Viewport shading is suspended for the duration because the object churn
+    otherwise crashes Blender while it draws; see `_suspend_viewport_shading`.
     """
     if not HAS_BPY:
         print("bpy not importable — run this script inside Blender.")
         return False
+
+    saved_shading = _suspend_viewport_shading()
 
     passed = 0
     failed = 0
@@ -1179,6 +1670,7 @@ def run_all():
 
     duration = time.time() - start
     total = len(_TESTS)
+    _restore_viewport_shading(saved_shading)
     print(f"\n{passed}/{total} passed, {failed} failed, "
           f"{skipped} skipped ({duration:.2f}s)")
     return failed == 0

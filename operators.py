@@ -60,9 +60,23 @@ Fix history:
         characters on its own, it also made every lighting test meaningless.
       * the falloff radius was read from Blender's `shadow_soft_size`, whose
         default is 0.25 m — so a default point light got a 250 mm radius and
-        left entire rooms unlit. It is now `rif_range` when set, otherwise
-        25 m.
+        left entire rooms unlit. It is now `Reach` in Object Properties >
+        RIF Light, otherwise 25 m.
+
+  S6 F14 — units and discoverability. Blender's Power is now converted with a
+    measured relation (see `rif/lighting.py`), Temperature is honoured, and
+    the two engine-only settings moved onto the light object as a real panel
+    instead of a hidden custom property.
+
+  S6 F17 — textures. The library of game materials is built by
+    "Load Game Textures" in the add-on preferences, which unpacks `Tex*.FFL`,
+    converts every `.RIM` to a sibling `.png` and creates one material per
+    texture carrying its game-side name in `RIM_PATH`. The export reads those
+    names to build BMPNAMES, so the whole-level texture override is gone.
 """
+from pathlib import Path
+import traceback
+
 import bpy
 from bpy.props import (
     StringProperty, FloatProperty, IntProperty, EnumProperty, BoolProperty,
@@ -72,20 +86,71 @@ from mathutils import Vector
 from .rif.builder import build_rif_bytes, build_rif_multi, build_rif_level
 from .rif import lighting as rif_lighting
 from .rif.types import blender_to_rif_axis, meters_to_rif
+from .rif.texture_library import RIM_LIBRARY_PROP, rim_name_for_material
 
 
 MARKER_PROP = "rif_marker_type"
 PLAYER_START_MARKER = "PLAYER_START"
 BITMAP_IDX_PROP = "rif_bitmap_idx"
 
-# Custom properties an artist can set on a Blender light object to control
-# exactly what reaches the game, overriding the Blender-side values.
-RIF_RANGE_PROP = "rif_range"        # float, RIF millimetres
-RIF_ENERGY_PROP = "rif_energy"      # float, 1.0 == engine ONE_FIXED
+# RIM path used for a material slot that has no material, and as the fallback
+# BMPNAMES entry. A slot with no material still gets an index, and BMPNAMES must
+# never be empty, or every textured polygon would degrade to an unlit one.
+DUMMY_TEXTURE = "dummy.RIM"
 
-# AvP's own level editor shipped lights with ranges around 3.6-13 m and the
-# game's largest reference value is 20000 mm; anything beyond that is wasted.
+# Light reach and brightness live on the light object itself, not in the export
+# dialog: the engine needs an explicit falloff radius and Blender has no field
+# for one, so these are per-light settings shown in Object Properties > RIF Light.
+RIF_RANGE_PROP = "rif_range"        # float, RIF millimetres (legacy scenes)
+
+# AvP's own level editor shipped lights with ranges around 3.6-13 m; the game's
+# largest reference value is 20000 mm, so anything much beyond that is wasted.
 DEFAULT_LIGHT_RANGE_MM = 25000
+
+
+class RIF_LightSettings(bpy.types.PropertyGroup):
+    """Per-light RIF settings, editable in Object Properties > RIF Light.
+
+    Stored on the light object so they travel with the scene file and are
+    visible without reading a script. Both fields treat 0 as "not set", which
+    is what keeps the exporter's defaults working for untouched lights.
+    """
+
+    range_m: FloatProperty(
+        name="Reach (m)",
+        description=(
+            "How far this light reaches, in metres. The engine's falloff is "
+            "linear: full brightness at the light, zero at this distance. "
+            "0 = use the exporter default (25 m).\n"
+            "This is the main lever for how large an area one light covers — "
+            "and it does NOT change brightness, so two lights of equal Power "
+            "look identical up close no matter how their Reach differs."
+        ),
+        default=0.0, min=0.0, soft_max=100.0, unit="LENGTH",
+    )
+
+    brightness_scale: FloatProperty(
+        name="Brightness Scale",
+        description=(
+            "Multiplier on this light's Power when it is converted to the "
+            "engine's brightness. 0 or 1 = use Power as-is (Blender watts, "
+            "with 500 W reading as mid-grey at 5 m).\n"
+            "Useful to lift or dim a single lamp without touching its Power, "
+            "which also affects Blender's own preview."
+        ),
+        default=0.0, min=0.0, soft_max=10.0,
+    )
+
+    show_reach: BoolProperty(
+        name="Show Reach in Viewport",
+        description=(
+            "Draw this light's reach as a wireframe in the viewport. Blender "
+            "cannot shade an inverse-square lamp like the engine's linear "
+            "falloff, so the reach circle is the only honest preview of how "
+            "far the light actually reaches"
+        ),
+        default=True,
+    )
 
 
 class RIF_OT_export(bpy.types.Operator, ExportHelper):
@@ -117,22 +182,11 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         default="untitled",
     )
 
-    # ------------------------------------------------------ texture fix
-
-    texture_override: StringProperty(
-        name="Texture Override",
-        description=(
-            "Optional: path of a .RIM texture that exists in the game's "
-            ".ffl archives. When set, all polygons in the export reference "
-            "bitmap_idx 0 pointing at this single RIM. Without a real RIM "
-            "name, chnkload.cpp::copy_to_shapeheader degrades every "
-            "textured polygon to I_Polyline with iflag_nolight — an "
-            "invisible one-pixel line — which makes the geometry look "
-            "empty even though modules and collisions exist. Example: "
-            "Envrnmts\\Battle\\timegg.RIM"
-        ),
-        default="",
-    )
+    # Textures come from the materials, not from a setting here. Every material
+    # carries the game-side RIM path in its `RIM_PATH` property, filled in by
+    # "Load Game Textures"; the exporter collects those paths to build BMPNAMES.
+    # A single whole-level override used to live here, which could only ever
+    # give every wall the same texture.
 
     # ------------------------------------------------------ player start
 
@@ -247,8 +301,18 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 data = self._export_level(context)
             if data is None:
                 return {"CANCELLED"}
-        except Exception as exc:
-            self.report({"ERROR"}, f"Export failed: {exc}")
+        except Exception as exc:  # noqa: BLE001 - reported to the artist
+            # A one-line message is not enough to act on: the previous wording
+            # ("index 0 out of range, size 0") named neither the object nor the
+            # line. Log the traceback and the selection so a failure can be
+            # diagnosed from the console instead of by guessing.
+            traceback.print_exc()
+            for obj in getattr(context, "selected_objects", []) or []:
+                print(f"[RIF] selected: {obj.name} type={obj.type} "
+                      f"slots={len(getattr(obj.data, 'materials', []) or [])}")
+            self.report({"ERROR"},
+                        f"Export failed: {type(exc).__name__}: {exc} "
+                        "(full traceback in the console)")
             return {"CANCELLED"}
 
         with open(self.filepath, "wb") as handle:
@@ -290,34 +354,15 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
 
         player_start = _resolve_player_start(self, objs)
 
-        # Collect texture path candidates.
-        if self.texture_override.strip():
-            tex_paths = [self.texture_override.strip()]
-            force_bitmap_idx = 0
-        else:
-            tex_paths = []
-            seen = set()
-            for o in objs:
-                for mat in o.data.materials:
-                    if mat and mat.name not in seen:
-                        seen.add(mat.name)
-                        tex_paths.append(mat.name)
-            force_bitmap_idx = None
+        # Every material slot gets one texture index, and BMPNAMES is built from
+        # the same list, so the polygon indices and the chunk can never disagree.
+        tex_paths, bitmap_mapping = _build_bitmap_mapping(objs)
 
         hierarchy = {
             o.name: o.parent.name for o in objs if o.parent is not None
         } or None
 
-        # Temporarily force rif_bitmap_idx on every material so that the
-        # polygon colour field points at entry 0 in BMPNAMES.
-        originals = []
-        if force_bitmap_idx is not None:
-            for o in objs:
-                for mat in o.data.materials:
-                    if mat is None:
-                        continue
-                    originals.append((mat, mat.get(BITMAP_IDX_PROP)))
-                    mat[BITMAP_IDX_PROP] = force_bitmap_idx
+        originals = _apply_bitmap_indices(objs, bitmap_mapping)
 
         # The manual slider packs to 0x00RRGGBB (bits 0..7 blue, 8..15 green,
         flags_override = _resolve_shape_flags_override(self)
@@ -378,12 +423,251 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 shape_flags_override=flags_override,
             )
         finally:
-            for mat, orig in originals:
-                if orig is None:
-                    if BITMAP_IDX_PROP in mat:
-                        del mat[BITMAP_IDX_PROP]
-                else:
-                    mat[BITMAP_IDX_PROP] = orig
+            _restore_bitmap_indices(originals)
+
+
+def _material_texture_path(mat):
+    """Return the game-side RIM name for a material slot.
+
+    Thin wrapper over `texture_library.rim_name_for_material`, which is the one
+    place that decides this name. It must be the same function the chunk builder
+    uses: the builder looks this name up in the BMPNAMES list produced here, so
+    any difference in normalisation would silently repoint a polygon at another
+    texture.
+    """
+    return rim_name_for_material(mat, DUMMY_TEXTURE)
+
+
+def _build_bitmap_mapping(objs):
+    """Return ``(paths, mapping)`` linking materials to BMPNAMES indices.
+
+    ``paths`` is the BMPNAMES name list in index order; ``mapping`` maps each
+    material (and ``None`` for an empty slot) to the index of its name.
+
+    This is the fix for a real bug: the polygon texture index used to default to
+    the material's slot number *on its own object*, while BMPNAMES is numbered
+    globally across the level. With two objects the second one therefore
+    pointed at the first one's texture. Deriving both from one list keeps them
+    consistent by construction.
+    """
+    paths = []
+    index_of = {}
+    for obj in objs:
+        for mat in obj.data.materials:
+            path = _material_texture_path(mat)
+            if path not in index_of:
+                index_of[path] = len(paths)
+                paths.append(path)
+
+    mapping = {}
+    for obj in objs:
+        for mat in obj.data.materials:
+            mapping[mat] = index_of[_material_texture_path(mat)]
+    return paths, mapping
+
+
+def _apply_bitmap_indices(objs, mapping):
+    """Write each material's RIF texture index; return the previous values.
+
+    The values are stored on the materials so the builder's existing
+    `_resolve_bitmap_indices` picks them up, and the caller restores them in a
+    `finally` block. That mirrors how the texture override already worked, and
+    it means an artist's own `rif_bitmap_idx` is never permanently overwritten.
+    """
+    originals = []
+    for obj in objs:
+        for mat in obj.data.materials:
+            if mat is None:
+                continue
+            originals.append((mat, mat.get(BITMAP_IDX_PROP)))
+            mat[BITMAP_IDX_PROP] = mapping.get(mat, 0)
+    return originals
+
+
+def _restore_bitmap_indices(originals):
+    """Put back the `rif_bitmap_idx` values recorded by the apply step."""
+    for mat, original in originals:
+        if original is None:
+            if BITMAP_IDX_PROP in mat:
+                del mat[BITMAP_IDX_PROP]
+        else:
+            mat[BITMAP_IDX_PROP] = original
+
+
+class RIF_AddonPreferences(bpy.types.AddonPreferences):
+    """Where the game lives, plus the texture library controls."""
+
+    bl_idname = __package__
+
+    game_directory: StringProperty(
+        name="Game Directory",
+        description=(
+            "Folder containing the game, e.g. the one holding 'fastfile' and "
+            "'avp_rifs'. The texture archives Tex1.FFL..Tex58.FFL are read "
+            "from its 'fastfile' subfolder and unpacked into "
+            "'fastfile\\_ffl_unpacked'"
+        ),
+        subtype="DIR_PATH",
+        default="",
+    )
+
+    keep_packed: BoolProperty(
+        name="Pack Images Into .blend",
+        description=(
+            "Store the game textures inside the .blend file. On: the file is "
+            "self-contained but larger. Off: the .blend references the PNGs "
+            "under the game directory, so it only opens on a machine that has "
+            "them"
+        ),
+        default=False,
+    )
+
+    def draw(self, context):
+        """Draw the game directory, the load button and the library status."""
+        layout = self.layout
+        layout.use_property_split = True
+
+        layout.prop(self, "game_directory")
+        layout.prop(self, "keep_packed")
+
+        row = layout.row()
+        row.operator(RIF_OT_load_game_textures.bl_idname, icon="FILE_FOLDER")
+
+        if not self.game_directory:
+            layout.label(text="Point this at the game folder first",
+                         icon="INFO")
+
+        row = layout.row()
+        row.operator(RIF_OT_build_texture_gallery.bl_idname, icon="IMAGE_REFERENCE")
+        row.operator(RIF_OT_clear_texture_library.bl_idname, icon="TRASH")
+
+        library = [m for m in bpy.data.materials if m.get(RIM_LIBRARY_PROP)]
+        layout.label(text=f"Materials in library: {len(library)}",
+                     icon="MATERIAL")
+
+
+class RIF_OT_load_game_textures(bpy.types.Operator):
+    """Unpack the game's texture archives and build the material library."""
+
+    bl_idname = "object.rif_load_game_textures"
+    bl_label = "Load Game Textures"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        """Run the whole pipeline: unpack, convert, import, report."""
+        from .rif import fastfile, texture_import, texture_tools
+
+        preferences = context.preferences.addons[__package__].preferences
+        game_directory = preferences.game_directory.strip()
+        if not game_directory:
+            self.report({"ERROR"},
+                        "Set Game Directory in the add-on preferences first")
+            return {"CANCELLED"}
+
+        game_path = Path(game_directory)
+        if not (game_path / "fastfile").is_dir():
+            self.report({"ERROR"},
+                        f"No 'fastfile' folder in {game_path}")
+            return {"CANCELLED"}
+
+        # Unpacking and converting are plain Python and report through the
+        # window manager, which is the only progress channel available without
+        # a modal operator.
+        window_manager = context.window_manager
+
+        def progress(done, total, name):
+            window_manager.progress_update(done * 100 // max(1, total))
+
+        try:
+            window_manager.progress_begin(0, 100)
+            extraction, conversion = texture_tools.load_game_textures(
+                game_path, progress=progress)
+        except fastfile.FastFileError as exc:
+            window_manager.progress_end()
+            self.report({"ERROR"}, f"Texture archives: {exc}")
+            return {"CANCELLED"}
+        except OSError as exc:
+            window_manager.progress_end()
+            self.report({"ERROR"}, f"Cannot write unpacked textures: {exc}")
+            return {"CANCELLED"}
+
+        report, materials = texture_import.import_texture_library(
+            texture_tools.unpacked_root_for(game_path), progress=progress)
+        window_manager.progress_end()
+
+        if preferences.keep_packed:
+            for image in bpy.data.images:
+                if image.source == "FILE" and not image.packed_file:
+                    try:
+                        image.pack()
+                    except RuntimeError:
+                        pass
+
+        self.report({"INFO"},
+                    f"Unpacked {extraction.written} file(s), converted "
+                    f"{conversion.converted} texture(s) to PNG, built "
+                    f"{len(materials)} material(s)")
+        if conversion.failed:
+            # Reported, not fatal: one unusual texture must not stop the rest.
+            names = ", ".join(p.name for p, _why in conversion.failed[:3])
+            self.report({"WARNING"},
+                        f"{len(conversion.failed)} texture(s) skipped: {names}")
+        if extraction.duplicates:
+            self.report({"WARNING"},
+                        f"{len(extraction.duplicates)} duplicate name(s) "
+                        "between archives")
+        return {"FINISHED"}
+
+
+class RIF_OT_build_texture_gallery(bpy.types.Operator):
+    """Create a scene of planes showing every game material."""
+
+    bl_idname = "object.rif_build_texture_gallery"
+    bl_label = "Build Texture Gallery"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        """Make the gallery scene from the imported library."""
+        from .rif import texture_import
+
+        materials = [m for m in bpy.data.materials if m.get(RIM_LIBRARY_PROP)]
+        if not materials:
+            self.report({"WARNING"},
+                        "No game materials yet - run Load Game Textures first")
+            return {"CANCELLED"}
+
+        existing = bpy.data.scenes.get(texture_import.GALLERY_SCENE)
+        if existing is not None:
+            bpy.data.scenes.remove(existing)
+
+        scene = texture_import.build_gallery_scene(materials)
+        context.window.scene = scene
+        self.report({"INFO"},
+                    f"Gallery with {len(materials)} plane(s) in scene "
+                    f"'{scene.name}'; press 0 for the camera view")
+        return {"FINISHED"}
+
+
+class RIF_OT_clear_texture_library(bpy.types.Operator):
+    """Remove every material the texture import created."""
+
+    bl_idname = "object.rif_clear_texture_library"
+    bl_label = "Clear Texture Library"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        """Delete the library materials and any images left unused."""
+        from .rif import texture_import
+
+        count = len([m for m in bpy.data.materials
+                     if m.get(RIM_LIBRARY_PROP)])
+        if not count:
+            self.report({"INFO"}, "Texture library is already empty")
+            return {"CANCELLED"}
+        materials, images = texture_import.delete_library()
+        self.report({"INFO"},
+                    f"Removed {materials} material(s) and {images} image(s)")
+        return {"FINISHED"}
 
 
 class RIF_OT_add_player_start(bpy.types.Operator):
@@ -460,42 +744,61 @@ def _report_bake_quality(operator, baked, base_colour):
             f"World ambient {base}/255")
 
 
-def _light_range_mm(light_object, default_range_m):
+def _rif_light_settings(light_object):
+    """Return the object's RIF Light settings, or None when unavailable."""
+    return getattr(light_object, "rif_light", None)
+
+
+def _light_range_mm(light_object, default_range_m, settings=None):
     """Return the light's falloff radius in RIF millimetres.
 
     The engine needs an explicit falloff radius (it lights linearly from full
-    brightness at the light to zero at `LightRange`), and Blender has no
-    equivalent setting, so:
+    brightness at the light to zero at `LightRange`) and Blender has no
+    equivalent field, so the order is:
 
-      1. the `rif_range` custom property on the light object, in millimetres;
-      2. otherwise the module default (DEFAULT_LIGHT_RANGE_MM).
+      1. `Reach` in Object Properties > RIF Light, in metres;
+      2. the legacy `rif_range` custom property, in millimetres (older scenes);
+      3. the module default, `DEFAULT_LIGHT_RANGE_MM`.
 
     Blender's `shadow_soft_size` is deliberately NOT used: it defaults to
-    0.25 m and describes shadow softness, not reach. Using it produced a
-    250 mm light radius, which left whole rooms unlit.
+    0.25 m and describes shadow softness, not reach. Using it gave every light
+    a 250 mm radius and left whole rooms unlit.
     """
-    explicit = light_object.get(RIF_RANGE_PROP)
-    if explicit:
-        return max(1, int(round(float(explicit))))
+    if settings is None:
+        settings = _rif_light_settings(light_object)
+    if settings is not None and getattr(settings, "range_m", 0.0) > 0.0:
+        return max(1, int(round(settings.range_m * 1000.0)))
+    # Blender objects expose the legacy custom property through .get(); other
+    # callers (tests, the overlay's selection logic) may not have it.
+    getter = getattr(light_object, "get", None)
+    legacy = getter(RIF_RANGE_PROP) if getter is not None else None
+    if legacy:
+        return max(1, int(round(float(legacy))))
     return max(1, int(round(default_range_m * 1000.0)))
 
 
-def _light_power_watts(light_object, light_data):
-    """Return the light's Power in watts, honouring the `rif_energy` override.
+def _light_power_watts(light_object, light_data, settings=None):
+    """Return the light's effective Power in watts.
 
-    Blender's UI exposes this as Power (watts); `energy` is the same quantity
-    and is what older files carry, so it is used only when `power` is absent.
-    The check is `is None`, not truthiness: a light deliberately set to
+    Blender's UI calls it Power (watts); `energy` is the same quantity and is
+    what older files carry, so it is used only when `power` is absent. The
+    comparison is `is None`, not truthiness: a light deliberately set to
     Power 0 would otherwise be resurrected by the fallback.
+
+    `Brightness Scale` multiplies the result, letting one lamp be lifted or
+    dimmed for the game without changing its Blender preview.
     """
-    explicit = light_object.get(RIF_ENERGY_PROP)
-    if explicit:
-        return (float(explicit)
-                * rif_lighting.BLENDER_WATTS_PER_ONE_FIXED)
+    if settings is None:
+        settings = _rif_light_settings(light_object)
     power = getattr(light_data, "power", None)
     if power is None:
         power = getattr(light_data, "energy", 0.0)
-    return float(power or 0.0)
+    watts = float(power or 0.0)
+    if settings is not None:
+        scale = float(getattr(settings, "brightness_scale", 0.0) or 0.0)
+        if scale > 0.0:
+            watts *= scale
+    return watts
 
 
 def _world_color_strength(context):
@@ -525,10 +828,15 @@ def _spot_direction_blender(light_object):
 def _collect_scene_lights(context, default_range_m):
     """Gather every supported light in the scene as RIF light specs.
 
-    Returns (lights, skipped_types, dark_count). Positions stay in Blender
-    metres on purpose: `_make_stdlight` applies the same axis conversion and
-    scaling that object locations go through, so converting here as well
-    would rotate every light twice. The baker does its own conversion.
+    Returns (lights, skipped_types, dark_count).
+
+    `location` is written in **RIF millimetres**, the one space every consumer
+    agrees on: the baker compares it with `SHPRAWVT` vertex positions, and
+    `_make_stdlight` writes it straight into the STDLIGHT record. Emitting
+    Blender metres here made both comparisons meaningless — a lamp 10.5 m away
+    looked 10.5 units from the origin, so only geometry within a few millimetres
+    of the RIF origin was lit. That is the "light bakes only into point 0,0,0"
+    symptom. The axis conversion happens exactly once, here.
 
     Mapping to engine units:
       * Power (watts) -> 16.16 fixed brightness, see
@@ -555,20 +863,28 @@ def _collect_scene_lights(context, default_range_m):
             skipped.add(light_type)
             continue
 
-        brightness = rif_lighting.power_to_brightness(
-            _light_power_watts(obj, data))
+        light_range = _light_range_mm(obj, default_range_m)
+        brightness = rif_lighting.effective_brightness(
+            _light_power_watts(obj, data), light_range)
         if brightness <= 0:
             dark += 1
             continue
 
         location = obj.matrix_world.translation
+        # Convert to RIF millimetres once, so both the STDLIGHT writer and the
+        # prelight baker compare positions in the same space as SHPRAWVT.
+        bx, by, bz = blender_to_rif_axis(location.x, location.y, location.z)
         spec = {
             "name": obj.name,
-            "location": (location.x, location.y, location.z),
+            "location": (meters_to_rif(bx), meters_to_rif(by),
+                         meters_to_rif(bz)),
             "colour": rif_lighting.colour_to_packed(
-                tuple(getattr(data, "color", (1.0, 1.0, 1.0)))),
+                rif_lighting.light_colour(
+                    tuple(getattr(data, "color", (1.0, 1.0, 1.0))),
+                    getattr(data, "temperature", None),
+                    bool(getattr(data, "use_temperature", False)))),
             "brightness": brightness,
-            "range": _light_range_mm(obj, default_range_m),
+            "range": light_range,
         }
 
         if light_type == "SPOT":
@@ -592,40 +908,52 @@ def _object_world_rif(obj):
     return ((meters_to_rif(bx), meters_to_rif(by), meters_to_rif(bz)), rot_q)
 
 
+def _object_world_geometry(obj):
+    """Return (vertices_rif, normals_rif) for one object, in WORLD space.
+
+    The mesh's own coordinates are local to the object, so an object standing
+    away from the origin has vertices nowhere near the lights, which live in
+    world space. Feeding local vertices to a baker holding world-space lights
+    made only the part of the geometry crossing the world origin receive any
+    light — the symptom being "the lamp only bakes into point 0,0,0".
+
+    Both positions and normals are converted exactly the way the writer
+    converts them, so the baked values describe the geometry that ends up in
+    the file.
+    """
+    matrix = obj.matrix_world
+    # A quaternion cannot be multiplied by a vector; its rotation matrix can.
+    rotation = matrix.to_quaternion().to_matrix()
+
+    verts_rif = []
+    normals = []
+    for vert in obj.data.vertices:
+        world = matrix @ vert.co
+        bx, by, bz = blender_to_rif_axis(world.x, world.y, world.z)
+        verts_rif.append((meters_to_rif(bx), meters_to_rif(by),
+                          meters_to_rif(bz)))
+
+        # Rotating the local normal by the object's rotation puts it in world
+        # orientation, the same space as the positions and the lights.
+        vec = rotation @ Vector((vert.normal.x, vert.normal.y, vert.normal.z))
+        normals.append(blender_to_rif_axis(vec.x, vec.y, vec.z))
+    return verts_rif, normals
+
+
 def _bake_object_lights(objs, lights, base_colour):
     """Bake per-vertex prelight values for every object; returns a list.
 
     Each entry is either the per-vertex packed intensity list for that object
-    or None when the mesh has no vertices. Vertices and normals are converted
-    the same way the writer converts them, so the baked values describe the
-    geometry that actually ends up in the file.
+    or None when the mesh has no vertices.
     """
     baked = []
     for obj in objs:
-        mesh = obj.data
-        normals = []
-        # Rotating the local normals by the object's own rotation puts them in
-        # world orientation, which is the space the lights live in.
-        rot = obj.matrix_local.to_quaternion()
-        for vert in mesh.vertices:
-            n = vert.normal
-            vec = rot @ Vector((n.x, n.y, n.z))
-            normals.append(blender_to_rif_axis(vec.x, vec.y, vec.z))
-
-        verts_rif = []
-        for vert in mesh.vertices:
-            co = vert.co
-            bx, by, bz = blender_to_rif_axis(co.x, co.y, co.z)
-            verts_rif.append((meters_to_rif(bx), meters_to_rif(by),
-                              meters_to_rif(bz)))
-
+        verts_rif, normals = _object_world_geometry(obj)
         if not verts_rif:
             baked.append(None)
             continue
-
-        loc_rif, _rot_q = _object_world_rif(obj)
-        baked.append(rif_lighting.bake_for_object(
-            loc_rif, verts_rif, normals, lights, base_colour=base_colour,
+        baked.append(rif_lighting.bake_vertex_intensities(
+            verts_rif, normals, lights, base_colour=base_colour,
         ))
     return baked
 
@@ -665,6 +993,108 @@ def _resolve_player_start(operator, mesh_objects):
     return None
 
 
+class RIF_PT_light(bpy.types.Panel):
+    """RIF Light settings, shown in Object Properties for light objects.
+
+    Exists so the engine-only settings are discoverable: the exporter needs a
+    falloff radius that Blender has no field for, and a hidden custom property
+    is not a usable answer. Deliberately open by default for the same reason —
+    a collapsed panel is a panel nobody finds.
+    """
+
+    bl_idname = "RIF_PT_light"
+    bl_label = "RIF Light"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_order = 0
+
+    @classmethod
+    def poll(cls, context):
+        """Only offer the panel for supported light objects."""
+        obj = context.object
+        return (obj is not None and obj.type == "LIGHT"
+                and getattr(obj.data, "type", "") in ("POINT", "SPOT"))
+
+    def draw(self, context):
+        """Draw the reach and brightness controls for the active light."""
+        obj = context.object
+        layout = self.layout
+        settings = obj.rif_light
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        layout.prop(settings, "range_m")
+        layout.prop(settings, "brightness_scale")
+
+        # Show what the exporter will actually write, so the numbers are never
+        # a mystery. Imported lazily to keep the panel cheap to draw.
+        from .rif import lighting as rif_lighting
+        watts = _light_power_watts(obj, obj.data)
+        brightness = rif_lighting.effective_brightness(
+            watts, _light_range_mm(obj, DEFAULT_LIGHT_RANGE_MM / 1000.0,
+                                   settings))
+        layout.separator()
+        column = layout.column(align=True)
+        column.label(text=f"Power: {watts:.0f} W", icon="LIGHT")
+        column.label(text=f"Engine brightness: {brightness}")
+        if brightness >= rif_lighting.BRIGHTNESS_CEILING:
+            column.label(text="At the ceiling - raise Reach or lower Power",
+                         icon="ERROR")
+
+        layout.separator()
+        layout.prop(settings, "show_reach")
+
+
+class RIF_OT_diagnose_lights(bpy.types.Operator):
+    """Print why the reach overlay is or is not drawing anything."""
+
+    bl_idname = "object.rif_diagnose_lights"
+    bl_label = "Diagnose RIF Reach Overlay"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        """Report handler state, light settings and the last draw error."""
+        from . import gizmos
+        report = gizmos.describe_state(context)
+        for line in report.splitlines():
+            print(f"[RIF] {line}")
+        # Also surface it in the UI: the console is easy to miss.
+        failed = gizmos.LAST_ERROR is not None
+        self.report({"ERROR" if failed else "INFO"},
+                    report.replace("\n", " | ")[:500])
+        return {"FINISHED"}
+
+
+class RIF_OT_select_lights(bpy.types.Operator):
+    """Select every supported light in the scene, so the panel is reachable."""
+
+    bl_idname = "object.rif_select_lights"
+    bl_label = "Select RIF Lights"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        """Select all POINT and SPOT lights and report how many were found."""
+        count = 0
+        for obj in context.scene.objects:
+            if obj.type != "LIGHT":
+                continue
+            if getattr(obj.data, "type", "") not in ("POINT", "SPOT"):
+                continue
+            obj.select_set(True)
+            count += 1
+        if not count:
+            self.report({"WARNING"},
+                        "No POINT or SPOT lights in this scene — RIF Light "
+                        "settings live on those objects")
+            return {"CANCELLED"}
+        self.report({"INFO"},
+                    f"Selected {count} light(s); RIF Light is in Object "
+                    "Properties")
+        return {"FINISHED"}
+
+
 class RIF_MT_add_avp(bpy.types.Menu):
     """AvP submenu inside Object > Add."""
 
@@ -672,9 +1102,13 @@ class RIF_MT_add_avp(bpy.types.Menu):
     bl_label = "AvP"
 
     def draw(self, context):
-        """List AvP-specific objects the user can drop into the scene."""
+        """List AvP-specific objects and helpers the user can reach."""
         self.layout.operator(RIF_OT_add_player_start.bl_idname,
                              icon="EMPTY_ARROWS")
+        self.layout.operator(RIF_OT_select_lights.bl_idname,
+                             icon="LIGHT")
+        self.layout.operator(RIF_OT_diagnose_lights.bl_idname,
+                             icon="QUESTION")
 
 
 def _menu_func_add(self, context):
@@ -690,23 +1124,38 @@ def _menu_func_export(self, context):
 
 
 _CLASSES = (
+    RIF_LightSettings,
+    RIF_AddonPreferences,
+    RIF_PT_light,
     RIF_OT_export,
+    RIF_OT_load_game_textures,
+    RIF_OT_build_texture_gallery,
+    RIF_OT_clear_texture_library,
     RIF_OT_add_player_start,
+    RIF_OT_select_lights,
+    RIF_OT_diagnose_lights,
     RIF_MT_add_avp,
 )
 
 
 def register():
-    """Register operators, menus and menu hooks."""
+    """Register operators, panels, menus and menu hooks."""
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
+    bpy.types.Object.rif_light = bpy.props.PointerProperty(
+        type=RIF_LightSettings)
     bpy.types.TOPBAR_MT_file_export.append(_menu_func_export)
     bpy.types.VIEW3D_MT_add.append(_menu_func_add)
+    from . import gizmos
+    gizmos.register_overlay()
 
 
 def unregister():
     """Unregister everything registered by register()."""
+    from . import gizmos
+    gizmos.unregister_overlay()
     bpy.types.VIEW3D_MT_add.remove(_menu_func_add)
     bpy.types.TOPBAR_MT_file_export.remove(_menu_func_export)
+    del bpy.types.Object.rif_light
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)

@@ -95,6 +95,106 @@ ONE_FIXED = 65536
 PRELIGHT_BLACK = 0x00000000
 PRELIGHT_WHITE = 0x00FFFFFF
 
+# --- Blender <-> engine light calibration ---------------------------------
+#
+# The two renderers disagree about both falloff and units, so the mapping has
+# to be derived rather than guessed.
+#
+# Blender, for a surface facing a lamp of P watts at distance d:
+#
+#     irradiance = P / (4*pi*d^2)          (linear, 1.0 == white)
+#
+# The engine, from Kshape.c:2205-2243 with the vertex normal pointing at the
+# light so the dot-product term is 1:
+#
+#     accumulation += MUL_FIXED(idot, colour_scale)      where
+#     idot          = MUL_FIXED(brightness * (R - d) / R, ONE_FIXED)
+#     colour_scale  = 255 * 257 = 65535
+#     pixel         = accumulation >> 8
+#
+# With a white light at full colour that collapses to
+#
+#     pixel = brightness * (R - d) / R / 256
+#
+# so a pixel value of 255 needs `brightness * (R - d) / R = 65536`: the
+# engine's brightness is the surface irradiance expressed as 65536 per unit.
+# Setting that against Blender's irradiance gives the conversion, and the
+# linear `(R - d) / R` term is left to the engine — forcing it to follow an
+# inverse square as well would apply the falloff twice.
+#
+#     brightness = 65536 * P / (4*pi*r0^2)
+#
+# r0 is the distance at which the two scales are compared. It is THE exposure
+# knob for the whole exporter, and it has to sit where Blender's wattages and
+# the engine's 16-bit range overlap: `brightness` is clamped to 32767 because
+# the engine shifts it left 16 and divides by the range, so a lamp whose
+# (P / r0^2) is too large simply clips and stops responding to Power.
+#
+# `LightBright` is documented as "0->1 Fixed Point" (prototyp.h:772), so the
+# engine's brightness is 16.16 fixed point where ONE_FIXED == 1.0 — the same
+# scale as ONE_FIXED everywhere else. Retail Battle.RIF ships brightness 65536
+# on its lights, confirming it. The earlier belief that the field is clamped
+# to 32767 was wrong and made every exported light half as bright as it should
+# be.
+#
+# The mapping from Blender watts was MEASURED rather than derived, because the
+# engine's 16.16 shifts truncate at every step and hand-derivation is easy to
+# get wrong. `scratch/probe_brightness.py` runs the real bake and gives, for a
+# vertex whose normal faces the light:
+#
+#     pixel = brightness * (R - d) / R / one_unit
+#
+# where one unit of brightness (ONE_FIXED) is a whole 0-255 pixel step per
+# unit of the linear ramp. Anchoring the intent the artist can reason about
+#
+#     500 W at 5 m  ->  128/255 (mid-grey)
+#
+# fixes the watts-to-brightness constant, and everything else follows
+# proportionally:
+#
+#      125 W -> brightness  8192  -> ~32/255 at 5 m, dim but visible
+#      250 W -> brightness 16384  -> ~64/255
+#      500 W -> brightness 32768  -> ~128/255
+#     1000 W -> brightness 65536  -> ONE_FIXED, the engine's own ceiling
+#     2000 W -> clamped; lower Power or brighten via rif_range
+#
+# Power stays proportional up to ONE_FIXED. A darker level should lower
+# BLENDER_REFERENCE_POWER_W rather than push Power up.
+BLENDER_REFERENCE_POWER_W = 500.0
+BLENDER_REFERENCE_DISTANCE_M = 5.0
+
+# Brightness per watt per metre^2, derived from the MEASURED relation
+# (`scratch/probe_brightness.py`):
+#
+#     pixel = brightness * (R - d) / R / PIXEL_DIVISOR,  PIXEL_DIVISOR ~= 364
+#
+# So mid-grey at the anchor needs brightness ~46600 there (46600 / 364 = 128):
+#   brightness = K * P / d^2   =>   K = 46600 * 5^2 / 500
+_PIXEL_DIVISOR = 364.0
+_ANCHOR_PIXEL = 128.0
+
+_WATTS_DISTANCE_TO_BRIGHTNESS = (
+    (_ANCHOR_PIXEL * _PIXEL_DIVISOR) * (BLENDER_REFERENCE_DISTANCE_M ** 2)
+    / BLENDER_REFERENCE_POWER_W)
+
+# The engine cannot represent brightness above ONE_FIXED (1.0), so that is
+# the real ceiling rather than a 16-bit limit.
+BRIGHTNESS_CEILING = ONE_FIXED
+
+
+# Exponent re-shaping the engine's linear ramp towards Blender's curve.
+# 1.0 reproduces the engine's own maths bit-for-bit, which is the default:
+# the falloff is the engine's job, and shaping it here as well would apply it
+# twice. Raise it only when a level looks too flat compared with Blender, at
+# the cost of no longer matching the runtime-lit objects around it.
+DEFAULT_FALLOFF_RESPONSE = 1.0
+
+# Falloff radius used when a light does not carry `rif_range`. The engine needs
+# an explicit range because its falloff is linear and reaches zero there.
+# Blender's own `shadow_soft_size` is NOT used for this: it defaults to 0.25 m
+# and describes shadow softness, not reach — using it left rooms unlit.
+DEFAULT_LIGHT_RANGE_MM = 25000
+
 
 def mul_fixed(a: int, b: int) -> int:
     """Port of the engine's MUL_FIXED: (a * b) >> 16.
@@ -250,6 +350,7 @@ def bake_vertex_intensities(
     lights,
     base_colour: int = PRELIGHT_WHITE,
     light_scale: int = ONE_FIXED,
+    falloff_exponent: float = DEFAULT_FALLOFF_RESPONSE,
 ):
     """Bake per-vertex packed prelight values for one object.
 
@@ -270,6 +371,10 @@ def bake_vertex_intensities(
     base_colour : packed 0x00RRGGBB ambient term every vertex starts from,
         i.e. the value the engine would have read from SHPVTINT.
     light_scale : engine LightScale (LITSCALE), normally ONE_FIXED.
+    falloff_exponent : exponent applied to the engine's linear falloff to make
+        it look like Blender's inverse-square response. 1.0 reproduces the
+        shipped engine bit-for-bit; `DEFAULT_FALLOFF_RESPONSE` is the shape
+        that visually matches Blender.
 
     Returns a list of packed 0x00RRGGBB ints, one per vertex.
 
@@ -294,6 +399,7 @@ def bake_vertex_intensities(
         prepared.append((
             int(loc[0]), int(loc[1]), int(loc[2]),
             scale_from_colour(colour),
+            brightness,
             brightness_over_range(brightness, light_range, light_scale),
             light_range,
             light.get("direction"),
@@ -309,14 +415,21 @@ def bake_vertex_intensities(
 
         nx, ny, nz = normals[i] if i < len(normals) else (0.0, 0.0, 0.0)
 
-        for (lx, ly, lz, scales, bor, light_range,
+        for (lx, ly, lz, scales, brightness, bor, light_range,
              direction, cos_inner, cos_outer) in prepared:
             tlx, tly, tlz = lx - vx, ly - vy, lz - vz
             distance = octagonal_distance(tlx, tly, tlz)
             if distance >= light_range:
                 continue
 
-            idot = mul_fixed(light_range - distance, bor)
+            if falloff_exponent == 1.0:
+                # Fast path: exactly the engine's own arithmetic.
+                idot = mul_fixed(light_range - distance, bor)
+            else:
+                fraction = falloff_response(
+                    (light_range - distance) / light_range, falloff_exponent)
+                idot = mul_fixed(int(round(fraction * light_range)), bor)
+
             if distance > 0:
                 # MUL_FIXED of a float normal by an int vector: the engine's
                 # normals are 16.16 (Objsetup stores *ONE_FIXED), so scaling
@@ -355,14 +468,23 @@ def bake_for_object(
     lights,
     base_colour=PRELIGHT_WHITE,
     light_scale=ONE_FIXED,
+    falloff_exponent=DEFAULT_FALLOFF_RESPONSE,
 ):
-    """Bake one object, translating world-space lights into its local space.
+    """Bake one object from vertices given in OBJECT-LOCAL space.
 
     object_location_rif : the OBJHEAD1.location of the object, in RIF
         millimetres. Lights are stored in world space by the level, but the
         engine gives each module a LIGHTBLOCK whose `LocalLP` is relative to
         the module's world origin (Avpview.c:779-800), so the same shift is
         applied here before calling `bake_vertex_intensities`.
+
+    IMPORTANT: `vertices` must be local to the object, i.e. straight from
+    `mesh.vertices[i].co` without the object matrix applied. Passing
+    world-space vertices while the lights are also shifted here applies the
+    offset twice and in two different frames, and the symptom is that only the
+    part of the geometry crossing the world origin receives any light. If the
+    vertices are already in world space, call `bake_vertex_intensities`
+    directly instead - that is what the operator does.
     """
     ox, oy, oz = object_location_rif
     local_lights = []
@@ -374,6 +496,7 @@ def bake_for_object(
     return bake_vertex_intensities(
         vertices, normals, local_lights,
         base_colour=base_colour, light_scale=light_scale,
+        falloff_exponent=falloff_exponent,
     )
 
 
@@ -423,26 +546,62 @@ def energy_to_brightness(energy: float) -> int:
     return max(0, int(round(float(energy) * ONE_FIXED)))
 
 
-# Blender's point-light "Power" is in watts and its default is 1000 W. The
-# engine's brightness is a 16.16 fixed-point 0..1 multiplier, so a mapping is
-# needed. Anchoring 1000 W at ONE_FIXED/2 keeps a default Blender light just
-# inside full brightness at the centre of its range (the bake caps at 255 per
-# channel anyway) while leaving headroom for brighter setups.
-# Calibration, not physics: tune with `Light Energy Scale` in the panel or
-# with the `rif_energy` custom property, and check the result with
-# scratch/calibrate_lights.py.
-BLENDER_WATTS_PER_ONE_FIXED = 2000.0
-
-
-def power_to_brightness(watts: float, scale: float = 1.0) -> int:
+def power_to_brightness(watts: float, light_range_mm: int = None) -> int:
     """Convert a Blender light's Power (watts) to engine 16.16 brightness.
 
-    `scale` is the operator's Light Energy Scale, an artist-facing trim.
+    Brightness is 16.16 fixed point where ONE_FIXED is 1.0 (`prototyp.h:772`),
+    and it behaves as `watts / distance^2` scaled by a constant chosen so that
+    `BLENDER_REFERENCE_POWER_W` at `BLENDER_REFERENCE_DISTANCE_M` reads as
+    mid-grey (see the calibration note above). The engine's own linear ramp
+    supplies the distance falloff, so `light_range_mm` is accepted for
+    signature stability but does not enter the value.
+
+    The result is clamped to `BRIGHTNESS_CEILING` (ONE_FIXED, i.e. 1.0), which
+    is the strongest light the engine can represent.
     """
-    watts = float(watts) * float(scale)
+    watts = float(watts or 0.0)
     if watts <= 0.0:
         return 0
-    return max(0, int(round(watts / BLENDER_WATTS_PER_ONE_FIXED * ONE_FIXED)))
+    distance = float(BLENDER_REFERENCE_DISTANCE_M or 1.0)
+    value = _WATTS_DISTANCE_TO_BRIGHTNESS * watts / (distance * distance)
+    return max(0, min(int(round(value)), BRIGHTNESS_CEILING))
+
+
+def effective_brightness(watts: float, light_range_mm: int) -> int:
+    """Return the brightness stored in STDLIGHT, clamped to the engine ceiling.
+
+    Kept separate from `power_to_brightness` so callers (and the calibration
+    tool) can tell a light that is merely bright from one that had to be
+    clamped.
+    """
+    return power_to_brightness(watts, light_range_mm)
+
+
+def falloff_response(linear_fraction: float,
+                     exponent: float = DEFAULT_FALLOFF_RESPONSE) -> float:
+    """Re-shape the engine's linear falloff towards Blender's response.
+
+    `linear_fraction` is the engine's own value for one vertex,
+    ``(range - distance) / range``, in [0, 1]. The result is mapped through a
+    power curve so that:
+
+      * ``exponent == 1.0`` returns the input unchanged, reproducing the
+        shipped engine's maths exactly;
+      * larger exponents darken the mid-range, which is what an inverse-square
+        falloff does in comparison with a linear ramp.
+
+    The curve is anchored at 1.0 (full brightness at the light) and 0.0 (zero
+    at `range`), so the light still contributes nothing beyond its range —
+    unlike a naive ``1/d^2`` term, which never reaches zero and would leak
+    light across the whole level.
+    """
+    if linear_fraction <= 0.0:
+        return 0.0
+    if linear_fraction >= 1.0:
+        return 1.0
+    if exponent == 1.0:
+        return linear_fraction
+    return linear_fraction ** exponent
 
 
 def world_ambient_colour(world_colour, world_strength) -> int:
@@ -498,3 +657,64 @@ def colour_to_packed(rgb) -> int:
         channel = max(0, min(255, int(round(channel))))
         out = (out << 8) | channel
     return out
+
+
+# Blender's "Temperature" is a blackbody colour in Kelvin; 6500 K is the
+# neutral default. This is the standard Tanner Helland approximation, which
+# agrees with Blender's own blackbody table to within a couple of percent
+# over 1000-40000 K — close enough for a 1999 renderer with 8-bit colour.
+_NEUTRAL_KELVIN = 6500.0
+
+
+def kelvin_rgb(kelvin: float) -> tuple:
+    """Return a normalised (r, g, b) blackbody colour for a temperature."""
+    temperature = max(1000.0, min(40000.0, float(kelvin))) / 100.0
+    if temperature <= 66.0:
+        red = 255.0
+        green = 99.4708025861 * math.log(temperature) - 161.1195681661
+    else:
+        red = 329.698727446 * ((temperature - 60.0) ** -0.1332047592)
+        green = 288.1221695283 * ((temperature - 60.0) ** -0.0755148492)
+    if temperature >= 66.0:
+        blue = 255.0
+    elif temperature <= 19.0:
+        blue = 0.0
+    else:
+        blue = 138.5177312231 * math.log(temperature - 10.0) - 305.0447927307
+    return (max(0.0, min(1.0, red / 255.0)),
+            max(0.0, min(1.0, green / 255.0)),
+            max(0.0, min(1.0, blue / 255.0)))
+
+
+def temperature_tint(kelvin: float) -> tuple:
+    """Return the colour multiplier for a temperature, 1.0 at 6500 K.
+
+    Normalising by the neutral temperature keeps a light at the default
+    setting unchanged, so enabling Temperature only adds a cast — it never
+    silently rescales brightness.
+    """
+    r, g, b = kelvin_rgb(kelvin)
+    nr, ng, nb = kelvin_rgb(_NEUTRAL_KELVIN)
+    return (r / nr if nr else 1.0,
+            g / ng if ng else 1.0,
+            b / nb if nb else 1.0)
+
+
+def light_colour(rgb, temperature=None, use_temperature=False) -> tuple:
+    """Return the final (r, g, b) for a Blender light, in 0..1.
+
+    Blender's viewport tints a lamp by its Temperature when Use Temperature is
+    on, and 6500 K is neutral. The output has to stay in 0..1 because
+    `colour_to_packed` expands anything up to 1.0 into 0..255, so the product
+    is normalised by its own maximum instead of clipping — otherwise a warm
+    tint would dim the light rather than colour it.
+    """
+    colour = tuple(float(v) for v in rgb)
+    if use_temperature and temperature:
+        tint = temperature_tint(temperature)
+        colour = tuple(c * t for c, t in zip(colour, tint))
+    peak = max(colour) if colour else 0.0
+    if peak > 1.0:
+        colour = tuple(c / peak for c in colour)
+    return tuple(max(0.0, min(1.0, c)) for c in colour)
+
