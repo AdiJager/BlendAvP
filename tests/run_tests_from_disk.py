@@ -22,18 +22,22 @@ import traceback
 
 TESTS_DIR = r"G:\RIF Exporter\avp_rif_exporter"
 MODULE = "tests.blender_roundtrip"
-# Where logs are written: the tests folder, beside blender_roundtrip.py.
+# Where logs are written: the project's own logs folder, NOT the tests folder.
+#
+# Writing beside `blender_roundtrip.py` put a new log inside the package on
+# every run, and the build then shipped all of them — eleven machine-specific
+# files in one build, growing without bound. Keeping them outside the package
+# fixes that at the source rather than filtering it later.
 #
 # This CANNOT be derived from `__file__`. When Blender runs this from a Text
 # datablock, `__file__` is a virtual path inside the .blend
 # ("...\blends\AvP.blend\run_tests_from_disk.py.003"), so the directory does not
-# exist and opening a log there raises FileNotFoundError. `TESTS_DIR` above is
-# already the authoritative location — keep both consistent.
-LOG_DIR = TESTS_DIR + r"\tests"
+# exist and opening a log there raises FileNotFoundError.
+LOG_DIR = r"G:\RIF Exporter\logs"
 
 
 def log_path():
-    """Return (timestamped log path, latest-log path) in the tests folder."""
+    """Return (timestamped log path, latest-log path) in the logs folder."""
     stamp = time.strftime("%Y-%m-%d_%H%M%S")
     return (os.path.join(LOG_DIR, f"run_tests_{stamp}.log"),
             os.path.join(LOG_DIR, "run_tests_latest.log"))
@@ -174,6 +178,19 @@ def open_log(path=None, latest=None):
     return None, None, None
 
 
+def _succeeded(result):
+    """Return True when the runner's result means the suite passed.
+
+    `run_all()` returns a bool while `run_tests()` can return an exit code, and
+    the two must not be compared with `in (0, True)`: because `False == 0` in
+    Python, that expression is True for a bool `False` as well, so a failing run
+    reported "wynik: OK". The verdict has to be read by type.
+    """
+    if isinstance(result, bool):
+        return result
+    return result == 0
+
+
 def main():
     """Run the suite with stdout/stderr mirrored into a timestamped log."""
     path, latest, handle = open_log()
@@ -185,7 +202,7 @@ def main():
             sys.stderr = Tee(original_err, handle)
         print(f"# start: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         result = run_tests()
-        print("# wynik: " + ("OK" if result in (0, True) else "BLAD"))
+        print("# wynik: " + ("OK" if _succeeded(result) else "BLAD"))
     except BaseException:
         # A crash or a manual stop must still leave a usable log.
         traceback.print_exc()
@@ -206,4 +223,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _result = main()
+    # Report failure through the process exit code so a CI job or a build script
+    # can gate on the suite. sys.exit() crashes Blender when the script is run
+    # from the Text Editor — the operator context receives SystemExit and tears
+    # the interpreter down mid-frame — so only exit when running headless.
+    try:
+        import bpy
+        _headless = bpy.app.background
+    except Exception:  # noqa: BLE001
+        _headless = True
+    if _headless:
+        sys.exit(0 if _succeeded(_result) else 1)

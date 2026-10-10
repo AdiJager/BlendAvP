@@ -53,6 +53,7 @@ S6 F9 (ROOT CAUSE — "empty level with Include Prelight on"):
 """
 from math import sqrt
 
+from . import modules
 from .types import (
     DEFAULT_LOCK_USER, DEFAULT_NOTES,
     meters_to_rif, uv_to_rif_pixels, blender_to_rif_axis,
@@ -79,6 +80,8 @@ from .chunks.environment import (
     EnvironmentDataChunk, EnvironmentHeaderChunk, RIFNameChunk,
     BMPNamesChunk, BMPNamesVersionChunk, BMPNamesExtraDataChunk,
     EnvironmentScaleChunk, SpecialObjectsChunk, PlayerStartChunk,
+    AVPGeneratorChunk, generator_flags, GlobalGeneratorDataChunk,
+    GEN_MULTIPLAYERSTART, AVPGeneratorExtraChunk, GeneratorExSettingsChunk,
     AVPEnvironmentSettingsChunk,
     MATRIX_ONE,
 )
@@ -276,7 +279,7 @@ def build_rif_multi(objects, hierarchy=None,
 
 def build_rif_level(objects, level_name, texture_paths=None,
                     player_start=None, player_orientation=None,
-                    hierarchy=None, include_scale=False,
+                    hierarchy=None, global_scale=None,
                     lights=None, ambient=255,
                     light_set_name=DEFAULT_LIGHT_SET,
                     include_litscale=True,
@@ -287,7 +290,9 @@ def build_rif_level(objects, level_name, texture_paths=None,
                     include_prelight=True,
                     prelight_colour=PRELIGHT_WHITE,
                     object_intensities=None,
-                    shape_flags_override=None) -> bytes:
+                    shape_flags_override=None,
+                    spawns=None,
+                    global_generator=None) -> bytes:
     """Assemble a level RIF: shapes + objects + MODULEDT + REBENVDT.
 
     Composition:
@@ -363,6 +368,39 @@ def build_rif_level(objects, level_name, texture_paths=None,
     n_objects = len(objects)
     all_indices = list(range(n_objects))
 
+    # Module bounding boxes in RIF millimetres, in the same frame the object
+    # locations use. Computed up front because the linking step needs every
+    # module's box before it can write any module's chunk.
+    module_bounds = []
+    module_origins = []
+    for obj in objects:
+        if obj.type != "MESH":
+            raise ValueError(f"Object {obj.name!r} is not a mesh")
+        loc, _rot, _scale = obj.matrix_local.decompose()
+        bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
+        module_origins.append((meters_to_rif(bx), meters_to_rif(by),
+                               meters_to_rif(bz)))
+        points = []
+        matrix = obj.matrix_world
+        for vertex in obj.data.vertices:
+            world = matrix @ vertex.co
+            vx, vy, vz = blender_to_rif_axis(world.x, world.y, world.z)
+            points.append((meters_to_rif(vx), meters_to_rif(vy),
+                           meters_to_rif(vz)))
+        module_bounds.append(modules.box_of(points))
+
+    module_neighbours = modules.neighbours(module_bounds, module_origins)
+
+    # The outliner hierarchy doubles as the visibility graph: a module sees its
+    # parent and its children (see `modules.linked_modules`). `hierarchy` maps
+    # object NAME to parent NAME because that is what the writer needs for
+    # OBJHIERD; indices are what the module graph needs.
+    name_to_index = {obj.name: i for i, obj in enumerate(objects)}
+    parents = []
+    for obj in objects:
+        parent_name = (hierarchy or {}).get(obj.name)
+        parents.append(name_to_index.get(parent_name))
+
     shapes = []
     objs = []
     for i, obj in enumerate(objects):
@@ -382,14 +420,19 @@ def build_rif_level(objects, level_name, texture_paths=None,
 
         module_data = None
         if include_module_data:
-            # Every object links to every other object (self included).
-            # For our test levels this forms a fully-connected module
-            # graph. Large levels would prune this with spatial reasoning.
+            # VMDARRAY is a VISIBILITY SCRIPT, not a graph (MODULE.C:190): the
+            # engine walks it and marks every module it reaches as visible.
+            # It comes from the outliner hierarchy — parent and children — and
+            # not from the geometry, because a box test cannot tell a doorway
+            # from a wall and treats a hollow room as a solid block.
+            #
+            # ADJMDLEP is the separate AI graph, built from which module boxes
+            # actually meet. Without it NPCs have no path anywhere.
             module_data = {
-                "vmdarray": [
-                    (peer_idx, 0, 0, 0) for peer_idx in all_indices
-                ],
-                "adjmdlep": [],   # no inter-module portals in a single blob
+                "vmdarray": modules.build_vmdarray(
+                    i, modules.linked_modules(i, parents)),
+                "adjmdlep": modules.build_adjmdlep(
+                    module_neighbours.get(i, []), module_origins),
                 "modacous": (-1, -1.0, 0),
             }
 
@@ -428,7 +471,12 @@ def build_rif_level(objects, level_name, texture_paths=None,
         speclobj_children.append(
             _build_avpstart(player_start, player_orientation)
         )
+    speclobj_children.extend(_build_generators(spawns))
+    speclobj_children.extend(_build_generator_extras(spawns))
     env_children.append(SpecialObjectsChunk(speclobj_children))
+    data_chunk = _build_global_generator(global_generator, spawns)
+    if data_chunk is not None:
+        env_children.append(data_chunk)
     env_children.append(
         _build_lightset(light_set_name, lights, ambient, include_litscale,
                         runtime_flags=emit_runtime_lights)
@@ -439,8 +487,12 @@ def build_rif_level(objects, level_name, texture_paths=None,
             sky_g=sky_colour[1],
             sky_b=sky_colour[2],
         ))
-    if include_scale:
-        env_children.append(EnvironmentScaleChunk(1.0))
+    if global_scale is not None:
+        # A level-wide multiplier applied to every position on load
+        # (`Projload.cpp:336`). Omitted rather than written as 1.0: 58 of the 63
+        # retail levels have no ENVSDSCL at all, and multiplying by one is what
+        # its absence already means.
+        env_children.append(EnvironmentScaleChunk(global_scale))
 
     env = EnvironmentDataChunk(env_children)
 
@@ -629,6 +681,129 @@ def _build_avpstart(player_start, player_orientation):
     orient_ints = (_convert_orientation_matrix(player_orientation)
                    if player_orientation is not None else None)
     return PlayerStartChunk(location=loc_rif, orientation=orient_ints)
+
+
+def _needs_global_generator(spawns):
+    """Return True when the level has any generator that is not a player spawn.
+
+    A multiplayer spawn needs no spawning budget: the engine places players
+    itself. Anything else — a fixed NPC, a weighted generator, or a
+    default-enemy generator — is fed by GLOGENDC, and with no budget the level
+    stays empty however correct the generator is.
+    """
+    for spec in spawns or ():
+        flags = spec.get("flags")
+        if flags is None or not int(flags) & GEN_MULTIPLAYERSTART:
+            return True
+    return False
+
+
+def _build_global_generator(global_generator, spawns):
+    """Return the GLOGENDC chunk for this level, or None to omit it.
+
+    `global_generator` decides:
+        None   auto - write one when the level has any non-player generator
+        False  never write one
+        dict   write one, using the given fields over the retail defaults
+    """
+    if global_generator is False:
+        return None
+    if global_generator is None:
+        if not _needs_global_generator(spawns):
+            return None
+        return GlobalGeneratorDataChunk.from_defaults()
+    if isinstance(global_generator, GlobalGeneratorDataChunk):
+        return global_generator
+    return GlobalGeneratorDataChunk.from_defaults(**global_generator)
+
+
+def _build_generator_extras(specs):
+    """Return one AVPGeneratorExtraChunk per generator that carries settings.
+
+    `AVPGENEX` is a SIBLING of `AVPGENER` inside `SPECLOBJ`, not its child, and
+    the engine links the two by comparing names. Writing it anywhere else — or
+    under a name that does not match — leaves the generator without settings.
+
+    The settings chunk is written even when every weight is zero. That is not a
+    degenerate case: with `ADVANCEDGENERATOR` set and `WeightingTotal == 0` the
+    engine falls back to the level's default creature (`Objsetup.cpp:3105`),
+    and it can only find the extended settings if the chunk exists. Omitting it
+    is what made the mixed generator inert in game.
+    """
+    extras = []
+    for index, spec in enumerate(specs or (), start=1):
+        weights = spec.get("weights")
+        if weights is None:
+            continue
+        # The generator name must match the spec's exactly, including the
+        # counter `_build_generators` may have appended, so it is resolved the
+        # same way here rather than assumed.
+        extras.append(AVPGeneratorExtraChunk(
+            name=spec.get("_resolved_name") or spec.get("name")
+            or f"gen{index}",
+            settings=GeneratorExSettingsChunk(
+                generation_rate=int(spec.get("generation_rate", 0)),
+                gen_rate_increase=int(spec.get("gen_rate_increase", 0)),
+                gen_limit=int(spec.get("gen_limit", 0)),
+                weights=weights),
+        ))
+    return extras
+
+
+def _build_generators(spawns):
+    """Return one AVPGeneratorChunk per spawn spec, names made unique.
+
+    A spec is a dict with:
+        location      (x, y, z) in RIF millimetres, already axis-converted
+        orientation   rotation about Y, 4096 units per turn (optional)
+        type          0 for a player spawn, 1..9 for a fixed NPC (optional)
+        flags         the AVPGENER flag word (optional; defaults to a spawn)
+        name          generator name (optional; generated when absent)
+        texture_id, sub_type, extra1, extra2   (optional)
+
+    Names must be unique within a level: the engine matches an `AVPGENEX`
+    extra-data chunk to its generator by comparing this string, so a duplicate
+    would attach the wrong data — or none. Missing names get `gen1`, `gen2`…
+    and any collision is resolved by appending a counter, because silently
+    writing a duplicate would be worse than a slightly different name.
+    """
+    if not spawns:
+        return []
+
+    chunks = []
+    used = set()
+    for index, spec in enumerate(spawns, start=1):
+        # Distinguish "no name given" from "explicitly empty": one generator in
+        # Compound.RIF has an empty name, and rewriting it would change data the
+        # engine is happy with. Only a missing name is generated.
+        raw_name = spec.get("name")
+        name = f"gen{index}" if raw_name is None else str(raw_name)
+        if name in used:
+            suffix = 2
+            while f"{name}_{suffix}" in used:
+                suffix += 1
+            name = f"{name}_{suffix}"
+        used.add(name)
+        # Record what was actually written: `_build_generator_extras` links the
+        # extra data to this exact string, so a deduplicated name has to travel
+        # with the spec or the two halves would disagree.
+        spec["_resolved_name"] = name
+
+        flags = spec.get("flags")
+        if flags is None:
+            flags = generator_flags(multiplayer_start=True)
+        chunks.append(AVPGeneratorChunk(
+            name=name,
+            location=tuple(spec.get("location", (0, 0, 0))),
+            orientation=int(spec.get("orientation", 0)),
+            npc_type=int(spec.get("type", 0)),
+            flags=int(flags),
+            texture_id=int(spec.get("texture_id", 0)),
+            sub_type=int(spec.get("sub_type", 0)),
+            extra1=int(spec.get("extra1", 0)),
+            extra2=int(spec.get("extra2", 0)),
+        ))
+    return chunks
 
 
 def _build_lightset(name, lights, ambient, include_litscale,

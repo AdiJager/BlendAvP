@@ -75,6 +75,7 @@ Fix history:
     names to build BMPNAMES, so the whole-level texture override is gone.
 """
 from pathlib import Path
+import math
 import traceback
 
 import bpy
@@ -84,6 +85,10 @@ from bpy.props import (
 from bpy_extras.io_utils import ExportHelper
 from mathutils import Vector
 from .rif.builder import build_rif_bytes, build_rif_multi, build_rif_level
+from .rif.chunks.environment import (
+    ORIENTATION_UNITS_PER_TURN, generator_flags, GENERATE_ALIENS,
+    GENERATE_MARINES,
+)
 from .rif import lighting as rif_lighting
 from .rif.types import blender_to_rif_axis, meters_to_rif
 from .rif.texture_library import RIM_LIBRARY_PROP, rim_name_for_material
@@ -106,6 +111,12 @@ RIF_RANGE_PROP = "rif_range"        # float, RIF millimetres (legacy scenes)
 # AvP's own level editor shipped lights with ranges around 3.6-13 m; the game's
 # largest reference value is 20000 mm, so anything much beyond that is wasted.
 DEFAULT_LIGHT_RANGE_MM = 25000
+
+# Ambient written when the scene has no World at all. There is no longer a
+# field for it: a World is the supported way to set the ambient, and a manual
+# value only ever hid the fact that a scene had no World. This is dim on
+# purpose, so an unlit level looks like one and the warning makes sense.
+AMBIENT_WITHOUT_WORLD = 32
 
 
 class RIF_LightSettings(bpy.types.PropertyGroup):
@@ -153,6 +164,44 @@ class RIF_LightSettings(bpy.types.PropertyGroup):
     )
 
 
+def _draw_export_settings(layout, settings):
+    """Lay the export settings out in sections.
+
+    Module-level and taking `settings` rather than being a method, because a
+    Blender operator cannot be instantiated from Python — `RIF_OT_export()`
+    raises "bpy_struct.__new__(struct): expected a single argument" — so a
+    method could not be exercised by a test at all. This can.
+
+    Without sections Blender lists every property in declaration order with no
+    grouping, so an advanced override sits next to the mode selector. The
+    sections also hide what a mode does not use: `Level Name` is written only in
+    Level mode, so showing it in the others invites filling in a dead field.
+    """
+    layout.use_property_split = True
+    layout.use_property_decorate = False
+
+    layout.label(text="Level", icon="SCENE_DATA")
+    box = layout.box()
+    box.prop(settings, "export_mode")
+    if settings.export_mode == "LEVEL":
+        box.prop(settings, "level_name")
+    else:
+        note = box.row()
+        note.label(text="No environment is written in this mode",
+                   icon="INFO")
+
+    layout.separator()
+    layout.label(text="Advanced", icon="PREFERENCES")
+    box = layout.box()
+    box.prop(settings, "global_scale")
+    box.prop(settings, "override_shape_flags")
+    # The override only matters when enabled, so grey it out rather than hiding
+    # it: a field that disappears looks like a bug.
+    flag_row = box.row()
+    flag_row.enabled = settings.override_shape_flags
+    flag_row.prop(settings, "shape_flags_override")
+
+
 class RIF_OT_export(bpy.types.Operator, ExportHelper):
     """Export selected meshes as a REBINFF2 .rif file."""
 
@@ -173,13 +222,16 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
             ("LEVEL", "Level Skeleton",
              "Selected meshes + REBENVDT environment skeleton"),
         ],
-        default="SHAPE",
+        default="LEVEL",
     )
 
     level_name: StringProperty(
         name="Level Name",
-        description="Value written into RIFFNAME (LEVEL mode only)",
-        default="untitled",
+        description=(
+            "Value written into RIFFNAME. The engine shows this name in its "
+            "level list, so it is worth matching the exported file"
+        ),
+        default="custom",
     )
 
     # Textures come from the materials, not from a setting here. Every material
@@ -187,65 +239,14 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
     # "Load Game Textures"; the exporter collects those paths to build BMPNAMES.
     # A single whole-level override used to live here, which could only ever
     # give every wall the same texture.
-
-    # ------------------------------------------------------ player start
-
-    safe_spawn: BoolProperty(
-        name="Safe Spawn (inside geometry AABB)",
-        description=(
-            "Place AVPSTART at the centre of the selected geometry's "
-            "bounding box. In AvP the renderer only creates DISPLAYBLOCKs "
-            "for modules reachable from the player's module via VMDARRAY "
-            "flood-fill (AllNewModuleHandler in Module.c). Spawning outside "
-            "all modules means NO geometry renders. AABB centre guarantees "
-            "the player is inside at least one module."
-        ),
-        default=True,
-    )
-
-    include_player_start: BoolProperty(
-        name="Include Player Start (UI fallback)",
-        description=(
-            "Emit SPECLOBJ > AVPSTART using the X/Y/Z fields below. "
-            "Ignored when Safe Spawn is on or a Player Start marker exists."
-        ),
-        default=True,
-    )
-
-    player_start_x: FloatProperty(name="Player X", default=0.0)
-    player_start_y: FloatProperty(name="Player Y", default=0.0)
-    player_start_z: FloatProperty(name="Player Z", default=0.0)
+    #
+    # The player start has no fields either. It comes from a Player Start object
+    # placed through `Add > AvP`, and the exporter warns when there is none.
+    # Three settings used to describe the same position — an AABB centre toggle,
+    # a fallback position and X/Y/Z fields — and the AABB toggle was on by
+    # default, so typing coordinates did nothing at all.
 
     # -------------------------------------------------------- prelight
-
-    include_prelight: BoolProperty(
-        name="Include Prelight (SHPVTINT)",
-        description=(
-            "Emit a SHPVTINT chunk per object with the per-vertex prelight "
-            "data. The loader then sets ShapeFlag_PreLit on the runtime "
-            "shape by itself (Projload.cpp:1455), which is what makes "
-            "VertexIntensity_Standard_Opt (Kshape.c) read it. Without "
-            "prelight and without runtime lights (they need a full "
-            "placed-light object system — see bh_light.c) every vertex "
-            "renders black. SHPHEAD1.flags stays 0 on purpose: bit 0x1000 "
-            "is also SHAPE_FLAG_EXTERNALFILE (SHPCHUNK.HPP:15) and makes "
-            "the loader skip module registration — the level would then "
-            "render empty."
-        ),
-        default=True,
-    )
-
-    prelight_grey: IntProperty(
-        name="Prelight Ambient (no World)",
-        description=(
-            "Flat per-vertex value used as the ambient term when the scene "
-            "has no World assigned: 0 = black, 255 = full white. With a World "
-            "present the ambient comes from World > Color x World > Strength "
-            "instead and this value is ignored. Point and spot lights are "
-            "always taken from the scene's light objects."
-        ),
-        default=32, min=0, max=255,
-    )
 
     shape_flags_override: IntProperty(
         name="ShapeFlag_PreLit Override",
@@ -270,25 +271,28 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
-    # ------------------------------------------------ environment toggles
+    # ------------------------------------------------ environment settings
 
-    include_litscale: BoolProperty(
-        name="Include LITSCALE",
+    global_scale: FloatProperty(
+        name="Global Scale",
         description=(
-            "Emit a LITSCALE chunk inside LIGHTSET. Not used by the loader at "
-            "all (ApplyPrelightScale is never called), so this only matters "
-            "for byte-level comparisons with retail files."
+            "Multiplies every position in the level when the game loads it: "
+            "the loader does `local_scale = GlobalScale * ENVSDSCL.scale` "
+            "(Projload.cpp:336), so this scales the whole map — geometry "
+            "placement, generators, waypoints, lights.\n"
+            "1.0 means unscaled and writes no ENVSDSCL chunk at all, which is "
+            "what 58 of the 63 retail levels do. Retail uses 0.8 and 0.9 in "
+            "the five that do scale. Useful for fitting a level built at the "
+            "wrong size onto the game's expectations without rebuilding it"
         ),
-        default=True,
-    )
-
-    include_scale: BoolProperty(
-        name="Include ENVSDSCL",
-        description="Emit an ENVSDSCL chunk (scale = 1.0)",
-        default=False,
+        default=1.0, min=0.05, max=20.0, precision=3,
     )
 
     # -------------------------------------------------------- execution
+
+    def draw(self, context):
+        """Draw the settings; see `_draw_export_settings` for the layout."""
+        _draw_export_settings(self.layout, self)
 
     def execute(self, context):
         """Run export based on export_mode; write result to self.filepath."""
@@ -331,7 +335,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         return build_rif_bytes(
             obj.data,
             object_name=obj.name,
-            include_prelight=self.include_prelight,
+            include_prelight=True,
         )
 
     def _export_collection(self, context):
@@ -342,7 +346,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
             return None
         return build_rif_multi(
             objs,
-            include_prelight=self.include_prelight,
+            include_prelight=True,
         )
 
     def _export_level(self, context):
@@ -352,7 +356,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, "No mesh objects selected")
             return None
 
-        player_start = _resolve_player_start(self, objs)
+        player_start = _resolve_player_start(context)
 
         # Every material slot gets one texture index, and BMPNAMES is built from
         # the same list, so the polygon indices and the chunk can never disagree.
@@ -361,6 +365,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         hierarchy = {
             o.name: o.parent.name for o in objs if o.parent is not None
         } or None
+        _report_module_links(self, objs, hierarchy)
 
         originals = _apply_bitmap_indices(objs, bitmap_mapping)
 
@@ -371,56 +376,71 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         lights = []
         object_intensities = None
         world_colour, world_strength = _world_color_strength(context)
-        world = getattr(context, "world", None)
+        world = _scene_world(context)
         if world is not None:
             prelight_colour = rif_lighting.world_ambient_colour(
                 world_colour, world_strength)
             ambient_level = rif_lighting.world_ambient_level(
                 world_colour, world_strength)
         else:
-            # No World assigned: fall back to the manual flat value so a scene
-            # without one still exports something sane.
-            ambient_level = int(self.prelight_grey)
+            # No World assigned. There is no field for a manual value any more,
+            # so the level gets a dim constant and the user is told why: with no
+            # ambient every surface that no lamp reaches renders black, which
+            # reads as a broken export rather than a missing World.
+            ambient_level = AMBIENT_WITHOUT_WORLD
             prelight_colour = ((ambient_level << 16)
                                | (ambient_level << 8) | ambient_level)
+            self.report(
+                {"WARNING"},
+                "No World in the scene, so the level has no ambient light "
+                f"(using {AMBIENT_WITHOUT_WORLD}/255). Add a World with "
+                "Color and Strength, or every unlit surface renders black")
 
-        if self.include_prelight:
-            lights, skipped, dark = _collect_scene_lights(
-                context, DEFAULT_LIGHT_RANGE_MM / 1000.0)
-            if skipped:
-                self.report({"WARNING"},
-                            "Skipped unsupported light types: "
-                            + ", ".join(sorted(skipped)))
-            if dark:
-                self.report({"WARNING"},
-                            f"{dark} light(s) had zero Power and were ignored")
-            if not lights:
-                self.report({"INFO"},
-                            "No point/spot lights found; World ambient only")
+        lights, skipped, dark = _collect_scene_lights(
+            context, DEFAULT_LIGHT_RANGE_MM / 1000.0)
+        if skipped:
+            self.report({"WARNING"},
+                        "Skipped unsupported light types: "
+                        + ", ".join(sorted(skipped)))
+        if dark:
+            self.report({"WARNING"},
+                        f"{dark} light(s) had zero Power and were ignored")
+        if not lights:
+            self.report({"INFO"},
+                        "No point/spot lights found; World ambient only")
 
-            # Bake whenever prelight is on: with no lights this still writes
-            # the World ambient into every vertex, which is what the engine
-            # reads as the starting colour.
-            object_intensities = _bake_object_lights(
-                objs, lights, prelight_colour)
+        # Prelight is always baked. It used to be a toggle, but the "off" state
+        # only ever produced a black level: with no prelight and no placed-light
+        # object system (bh_light.c), every vertex renders black.
+        object_intensities = _bake_object_lights(
+            objs, lights, prelight_colour)
 
-            _report_bake_quality(self, object_intensities, prelight_colour)
+        _report_bake_quality(self, object_intensities, prelight_colour)
 
         try:
+            spawns, skipped = _collect_spawns(context)
+            _report_spawns(self, spawns, skipped)
+            _report_player_start(self, player_start, spawns)
             return build_rif_level(
                 objs, self.level_name,
                 texture_paths=tex_paths,
                 player_start=player_start,
                 hierarchy=hierarchy,
-                include_scale=self.include_scale,
+                # 1.0 means "unscaled", which is the absence of the chunk.
+                global_scale=(self.global_scale
+                              if abs(self.global_scale - 1.0) > 1e-9 else None),
                 ambient=ambient_level,
-                include_litscale=self.include_litscale,
-                include_prelight=self.include_prelight,
+                # LITSCALE is never written: the loader does not read it and
+                # none of the 63 retail levels contain the chunk at all.
+                include_litscale=False,
+                include_prelight=True,
                 prelight_colour=prelight_colour,
                 object_intensities=object_intensities,
                 lights=lights,
                 emit_runtime_lights=True,
                 shape_flags_override=flags_override,
+                spawns=spawns,
+                global_generator=_collect_global_generator(context),
             )
         finally:
             _restore_bitmap_indices(originals)
@@ -670,26 +690,184 @@ class RIF_OT_clear_texture_library(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class RIF_OT_add_player_start(bpy.types.Operator):
-    """Add an AvP Player Start marker (Empty tagged with rif_marker_type)."""
+def _object_yaw_to_rif(obj):
+    """Return the object's yaw as AVPGENER orientation units.
 
-    bl_idname = "object.rif_add_player_start"
-    bl_label = "Player Start"
-    bl_options = {"REGISTER", "UNDO"}
+    An `AVPGENER` stores only a rotation about its Y axis, 4096 units per full
+    turn (`Objsetup.cpp:3229`), and zeroes the other two. Blender's Z axis maps
+    to RIF Y, so the object's Z rotation is the one that matters. The result is
+    masked to 12 bits exactly as the engine does on load.
+    """
+    yaw = float(getattr(obj.rotation_euler, "z", 0.0))
+    units = int(round(yaw / (2.0 * math.pi) * ORIENTATION_UNITS_PER_TURN))
+    return units & (ORIENTATION_UNITS_PER_TURN - 1)
 
-    def execute(self, context):
-        """Create the marker Empty, link it, and make it active."""
-        empty = bpy.data.objects.new("PlayerStart", None)
-        empty.empty_display_type = "ARROWS"
-        empty.empty_display_size = 0.5
-        empty[MARKER_PROP] = PLAYER_START_MARKER
-        context.collection.objects.link(empty)
 
-        for o in context.selected_objects:
-            o.select_set(False)
-        empty.select_set(True)
-        context.view_layer.objects.active = empty
-        return {"FINISHED"}
+def _collect_spawns(context):
+    """Return (generator_specs, skipped) gathered from the scene.
+
+    Handles the generator kinds whose chunk is a plain `AVPGENER`:
+
+      * `PLAYER_START_MP`  type 0 with MULTIPLAYERSTART, one per player slot
+      * `KIND_NPC`         a fixed creature, types 1..9, flags 0x00003801
+      * `DEFAULT_ENEMY`    type 0, the level's default creature from GLOGENDC
+      * `WEIGHTED`         type 0 with ADVANCEDGENERATOR, weights to follow
+
+    The fixed-NPC form needs no weight table: retail writes it as a bare
+    `AVPGENER` with flags `0x00003801` (614 of 1064 use exactly that), so an
+    Alien Drone generator works with nothing but this chunk and GLOGENDC.
+
+    The two type-0 forms are written with ADVANCEDGENERATOR because that flag
+    is what makes the engine look for their extended settings at all
+    (`AVPCHUNK.CPP:201`). Their `GENEXSET` weight table is the next piece of
+    work; until it exists the engine finds no settings and falls back.
+
+    Everything else is reported as `skipped` rather than dropped in silence:
+    placing a waypoint and exporting without a word looked like success.
+
+    `AVPSTART` is deliberately untouched: 20 of the 28 retail levels with
+    multiplayer spawns have no single-player start at all.
+    """
+    from . import placeables
+
+    specs = []
+    skipped = []
+    for obj in bpy.data.objects:
+        kind = obj.get(placeables.PLACEABLE_PROP)
+        if kind is None:
+            continue
+        settings = obj.rif_placeable
+        loc = obj.matrix_world.translation
+        bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
+        location = (meters_to_rif(bx), meters_to_rif(by), meters_to_rif(bz))
+
+        if kind == placeables.KIND_PLAYER_START_MP:
+            races = [race for race, on in (("marine", settings.race_marine),
+                                           ("alien", settings.race_alien),
+                                           ("predator",
+                                            settings.race_predator)) if on]
+            if not races:
+                # No race could use this spawn, so it could never place anyone.
+                skipped.append((obj.name, "no race allowed"))
+                continue
+            flags = generator_flags(races, multiplayer_start=True,
+                                    inactive=settings.inactive)
+            npc_type = 0
+        elif kind == placeables.KIND_NPC:
+            flags = generator_flags(inactive=settings.inactive)
+            npc_type = settings.npc_type
+        elif kind in (placeables.KIND_DEFAULT_ENEMY,
+                      placeables.KIND_WEIGHTED):
+            flags = generator_flags(advanced=True, inactive=settings.inactive)
+            npc_type = 0
+        elif kind == placeables.KIND_GLOBAL_GENERATOR:
+            # Not a generator itself: it is the marker that asks for a
+            # GLOGENDC, which `_collect_global_generator` handles. Counting it
+            # as skipped would report a working feature as unsupported.
+            continue
+        else:
+            skipped.append((obj.name, kind))
+            continue
+
+        spec = {
+            "location": location,
+            "orientation": _object_yaw_to_rif(obj),
+            "type": npc_type,
+            "flags": flags,
+            "name": obj.name,
+            "sub_type": settings.sub_type if kind == placeables.KIND_NPC
+            else 0,
+            "texture_id": settings.texture_id,
+        }
+        if kind in (placeables.KIND_DEFAULT_ENEMY,
+                    placeables.KIND_WEIGHTED):
+            # The weight table is written even when every value is zero, which
+            # is how the default-enemy fallback is reached: with no weights the
+            # engine uses the creature named by GLOGENDC, but only if it can
+            # find the extended settings at all.
+            spec["weights"] = {
+                "Alien_Wt": settings.mix_drone,
+                "PredAlien_Wt": settings.mix_predalien,
+                "Praetorian_Wt": settings.mix_praetorian,
+            }
+        specs.append(spec)
+    return specs, skipped
+
+
+def _collect_global_generator(context):
+    """Return the GLOGENDC overrides, or None to let the builder decide.
+
+    The placed marker carries the level's spawning budget: the NPC cap, the
+    rate, and which creature generators without weights fall back to. Two
+    markers would be a mistake the engine cannot report, so the first is used
+    and the count is recorded for the report.
+
+    Returning `{}` when a marker exists but has no overrides would be wrong —
+    it would silently replace the builder's defaults with nothing — so the
+    fields are always read from the marker.
+    """
+    from . import placeables
+
+    found = [obj for obj in bpy.data.objects
+             if obj.get(placeables.PLACEABLE_PROP)
+             == placeables.KIND_GLOBAL_GENERATOR]
+    if not found:
+        return None
+    settings = found[0].rif_placeable
+    if len(found) > 1:
+        context.scene["rif_duplicate_glogendc"] = [o.name for o in found]
+    return {
+        "enemy_generated": (
+            GENERATE_MARINES if settings.enemy_kind == "marines"
+            else GENERATE_ALIENS),
+        "max_npcs": settings.max_npcs,
+        "npcs_per_minute": settings.npcs_per_minute,
+        "npc_acceleration": settings.npc_acceleration,
+        "hive_state_change_time": settings.hive_state_change_time,
+    }
+
+
+def _report_module_links(operator, objs, hierarchy):
+    """Warn when the level has several modules but no visibility links.
+
+    Parenting in the Outliner IS the visibility graph, and a module with no
+    parent and no children renders alone. That is deliberate — it is how a
+    generator space is marked — but a level nobody linked would silently turn
+    into single-room rendering, so it is worth saying out loud.
+    """
+    count = len(objs)
+    if count < 2:
+        return
+    if hierarchy:
+        return
+    operator.report(
+        {'WARNING'},
+        f"Level has {count} modules but nothing is linked in the Outliner, so "
+        f"each one will render on its own and you will see only the room you "
+        f"stand in. Parent modules to each other to link visibility (see the "
+        f"README section on modules). Leave a generator's module unlinked to "
+        f"keep it out of sight so its generator runs")
+
+
+def _report_spawns(operator, specs, skipped):
+    """Report what was exported, and name what was left out."""
+    if specs:
+        operator.report({"INFO"}, f"Exported {len(specs)} AvP generator(s)")
+    # Skirmish sets maxAlien to 0, so an alien-only spawn can never be used.
+    alien_only = [s for s in specs
+                  if s["flags"] & 0x1000
+                  and not s["flags"] & (0x800 | 0x2000)]
+    if alien_only:
+        operator.report(
+            {"WARNING"},
+            f"{len(alien_only)} spawn(s) allow only the alien, which skirmish "
+            "forbids - tick Marine or Predator as well")
+    if skipped:
+        names = ", ".join(name for name, _kind in skipped[:4])
+        more = "" if len(skipped) <= 4 else f" (+{len(skipped) - 4} more)"
+        operator.report(
+            {"WARNING"},
+            f"{len(skipped)} AvP object(s) not exported yet: {names}{more}")
 
 
 def _resolve_shape_flags_override(operator):
@@ -801,6 +979,23 @@ def _light_power_watts(light_object, light_data, settings=None):
     return watts
 
 
+def _scene_world(context):
+    """Return the scene's World, or None when it has none.
+
+    Reads `context.scene.world`, NOT the bare `context.world`. The bare member
+    is resolved from whichever editor owns the context, and the export runs from
+    the file browser, where it comes back None even though the scene has a World
+    assigned — which made the exporter warn about a missing World on a scene
+    that plainly had one. `context.world` is kept only as a fallback for
+    contexts that carry it and no scene.
+    """
+    scene = getattr(context, "scene", None)
+    world = getattr(scene, "world", None) if scene is not None else None
+    if world is not None:
+        return world
+    return getattr(context, "world", None)
+
+
 def _world_color_strength(context):
     """Return (colour, strength) from Blender's World settings.
 
@@ -808,7 +1003,7 @@ def _world_color_strength(context):
     multiplier; together they are the flat term an unlit surface receives.
     Falls back to mid grey at strength 1.0 when the scene has no world.
     """
-    world = getattr(context, "world", None)
+    world = _scene_world(context)
     if world is None:
         return (0.5, 0.5, 0.5), 1.0
     colour = tuple(getattr(world, "color", (0.5, 0.5, 0.5)))
@@ -958,39 +1153,51 @@ def _bake_object_lights(objs, lights, base_colour):
     return baked
 
 
-def _resolve_player_start(operator, mesh_objects):
+def _resolve_player_start(context):
     """Return the player start position for build_rif_level, or None.
 
-    Resolution order:
-        1. Safe Spawn — AABB centre of the selected meshes (inside geometry).
-        2. Marker     — any object with rif_marker_type == PLAYER_START.
-        3. UI fields  — when include_player_start is enabled.
-        4. None       — AVPSTART omitted; engine defaults to world origin.
-    """
-    if operator.safe_spawn and mesh_objects:
-        world_coords = [
-            obj.matrix_world @ v.co
-            for obj in mesh_objects for v in obj.data.vertices
-        ]
-        if world_coords:
-            xs = [c.x for c in world_coords]
-            ys = [c.y for c in world_coords]
-            zs = [c.z for c in world_coords]
-            cx = (min(xs) + max(xs)) * 0.5
-            cy = (min(ys) + max(ys)) * 0.5
-            cz = (min(zs) + max(zs)) * 0.5   # centre, NOT above
-            return (cx, cy, cz)
+    The position comes from a **Player Start** object placed through
+    `Add > AvP`, and from nowhere else.
 
+    Three settings used to describe the same point — an "AABB centre" toggle, a
+    fallback position and X/Y/Z fields — resolved in that order. The toggle was
+    on by default, so the coordinate fields were dead unless it was switched
+    off, and a user who typed a position saw it ignored. One source is easier to
+    explain and impossible to shadow.
+
+    Returning None is not fatal: `AVPSTART` is optional, and 20 of the 28 retail
+    levels with multiplayer spawns have none. `_export_level` warns instead,
+    because a single-player level without it starts at the world origin, which
+    is usually inside a wall.
+    """
     for obj in bpy.data.objects:
         if obj.get(MARKER_PROP) == PLAYER_START_MARKER:
             return (obj.location.x, obj.location.y, obj.location.z)
-
-    if operator.include_player_start:
-        return (operator.player_start_x,
-                operator.player_start_y,
-                operator.player_start_z)
-
     return None
+
+
+def _report_player_start(operator, player_start, spawns):
+    """Warn when a level has no player start, unless it needs none.
+
+    A level whose only way in is a multiplayer spawn legitimately has no
+    `AVPSTART` — the engine places players from those. A level with neither
+    falls back to the world origin, which is worth saying out loud.
+    """
+    if player_start is not None:
+        return
+    multiplayer = [s for s in spawns or () if s.get("flags", 0) & 0x40000000]
+    if multiplayer:
+        operator.report(
+            {"INFO"},
+            f"No Player Start (single player); {len(multiplayer)} multiplayer "
+            "spawn(s) will place players instead")
+        return
+    operator.report(
+        {"WARNING"},
+        "No Player Start and no multiplayer spawn: the level has no AVPSTART, "
+        "so the game starts the player at the world origin. Place a "
+        "'Player Start' from Add > AvP for single player, or a "
+        "'Multiplayer Spawn' for a network map")
 
 
 class RIF_PT_light(bpy.types.Panel):
@@ -1102,13 +1309,37 @@ class RIF_MT_add_avp(bpy.types.Menu):
     bl_label = "AvP"
 
     def draw(self, context):
-        """List AvP-specific objects and helpers the user can reach."""
-        self.layout.operator(RIF_OT_add_player_start.bl_idname,
-                             icon="EMPTY_ARROWS")
-        self.layout.operator(RIF_OT_select_lights.bl_idname,
-                             icon="LIGHT")
-        self.layout.operator(RIF_OT_diagnose_lights.bl_idname,
-                             icon="QUESTION")
+        """List the AvP categories of placeable objects.
+
+        Categories come first so the menu answers "where does this work"
+        before "which chunk is it" - the alien generator types are split from
+        the single-player-only ones because a skirmish map can never spawn the
+        latter. See `placeables.py`.
+
+        Diagnostics deliberately live elsewhere (`RIF_MT_debug_avp`, in the
+        Object menu): they are tooling, not something a level designer places.
+        """
+        from . import placeables
+
+        placeables.menu_draw(self, context)
+
+
+class RIF_MT_debug_avp(bpy.types.Menu):
+    """AvP diagnostics submenu, kept out of Object > Add."""
+
+    bl_idname = "RIF_MT_debug_avp"
+    bl_label = "Debug"
+
+    def draw(self, context):
+        """List the diagnostic helpers for inspecting a scene before export."""
+        self.layout.operator(RIF_OT_select_lights.bl_idname, icon="LIGHT")
+        self.layout.operator(RIF_OT_diagnose_lights.bl_idname, icon="QUESTION")
+
+
+def _menu_func_debug(self, context):
+    """Hook the Debug submenu into the Object menu."""
+    self.layout.separator()
+    self.layout.menu(RIF_MT_debug_avp.bl_idname, text="Debug")
 
 
 def _menu_func_add(self, context):
@@ -1131,21 +1362,24 @@ _CLASSES = (
     RIF_OT_load_game_textures,
     RIF_OT_build_texture_gallery,
     RIF_OT_clear_texture_library,
-    RIF_OT_add_player_start,
     RIF_OT_select_lights,
     RIF_OT_diagnose_lights,
     RIF_MT_add_avp,
+    RIF_MT_debug_avp,
 )
 
 
 def register():
     """Register operators, panels, menus and menu hooks."""
+    from . import placeables
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
+    placeables.register_placeables()
     bpy.types.Object.rif_light = bpy.props.PointerProperty(
         type=RIF_LightSettings)
     bpy.types.TOPBAR_MT_file_export.append(_menu_func_export)
     bpy.types.VIEW3D_MT_add.append(_menu_func_add)
+    bpy.types.VIEW3D_MT_object.append(_menu_func_debug)
     from . import gizmos
     gizmos.register_overlay()
 
@@ -1153,9 +1387,12 @@ def register():
 def unregister():
     """Unregister everything registered by register()."""
     from . import gizmos
+    from . import placeables
     gizmos.unregister_overlay()
     bpy.types.VIEW3D_MT_add.remove(_menu_func_add)
+    bpy.types.VIEW3D_MT_object.remove(_menu_func_debug)
     bpy.types.TOPBAR_MT_file_export.remove(_menu_func_export)
     del bpy.types.Object.rif_light
+    placeables.unregister_placeables()
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)

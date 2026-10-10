@@ -14,6 +14,7 @@ import struct
 import sys
 import time
 import traceback
+from pathlib import Path
 
 
 def _locate_rif_package():
@@ -1582,6 +1583,955 @@ def test_direction_to_rif_preserves_length():
         out = rif_lighting.direction_to_rif(direction)
         length = sum(c * c for c in out) ** 0.5
         assert abs(length - 1.0) < 1e-9, (direction, out, length)
+
+
+# ------------------------------------------- multiplayer spawns and generators
+#
+# These cover the Beta work. They run here, not only in the offline harness,
+# because that harness uses a `bpy` stub which repeatedly turned out to be both
+# poorer and more tolerant than Blender — a test that passes against the stub is
+# not evidence that the add-on works.
+
+MP_SPAWN_FLAGS = 0x48002801        # MULTIPLAYERSTART | ADVANCED | marine | predator
+NPC_FLAGS = 0x00003801             # the commonest fixed-NPC flag word in retail
+
+
+@test
+def test_player_spawn_reaches_the_file():
+    """A spawn spec becomes an AVPGENER inside REBENVDT > SPECLOBJ."""
+    obj = _make_cube()
+    spawn = {"location": (1000, 2000, 3000), "name": "gen1",
+             "orientation": 0, "type": 0, "flags": MP_SPAWN_FLAGS}
+    data = build_rif_level([obj], "lvl", spawns=[spawn])
+    idx, size = _find_chunk(data, "AVPGENER")
+    assert idx > 0, "AVPGENER missing when a spawn is given"
+    # Location is already in RIF millimetres and must be written verbatim:
+    # converting it again here is the bug that once put every light at 0,0,0.
+    assert _read_i32(data, idx + 12) == 1000, "x not written verbatim"
+    assert _read_i32(data, idx + 16) == 2000, "y not written verbatim"
+    assert _read_i32(data, idx + 20) == 3000, "z not written verbatim"
+    # Payload layout: 0 location, 12 orientation, 16 type, 20 flags, 24 the four
+    # bytes, 28 name. The chunk header adds 12, so flags sit at idx + 32.
+    assert _read_i32(data, idx + 28) == 0, "type should be 0 for a spawn"
+    assert _read_i32(data, idx + 32) == MP_SPAWN_FLAGS, "flags changed"
+    # Payload is round_up_to_4(29 + len(name)): 36 for a four-character name,
+    # plus the 12-byte header. The name is padded, not truncated.
+    assert size == 48, f"chunk size should be 48, got {size}"
+
+
+@test
+def test_spawn_orientation_is_masked_to_twelve_bits():
+    """Only 12 bits of orientation survive, as the engine loads them."""
+    obj = _make_cube()
+    data = build_rif_level(
+        [obj], "lvl",
+        spawns=[{"location": (0, 0, 0), "name": "g", "orientation": 4096 + 17,
+                 "type": 0, "flags": MP_SPAWN_FLAGS}])
+    idx, _size = _find_chunk(data, "AVPGENER")
+    assert _read_i32(data, idx + 24) == 17, "orientation was not masked"
+
+
+@test
+def test_generator_names_are_made_unique():
+    """Duplicate names would cross-link AVPGENEX, so they must be fixed.
+
+    The engine matches a generator's extra data by comparing this string, so two
+    identical names would attach the wrong settings — or none.
+    """
+    obj = _make_cube()
+    spawns = [{"location": (0, 0, 0), "name": "same", "orientation": 0,
+               "type": 1, "flags": NPC_FLAGS},
+              {"location": (0, 0, 0), "name": "same", "orientation": 0,
+               "type": 1, "flags": NPC_FLAGS}]
+    data = build_rif_level([obj], "lvl", spawns=spawns)
+    names = []
+    for payload in _all_chunk_payloads(data, "AVPGENER"):
+        names.append(payload[28:].split(b"\x00")[0])
+    assert len(names) == 2, names
+    assert len(set(names)) == 2, f"names are not unique: {names}"
+
+
+@test
+def test_global_generator_written_for_npc_generators():
+    """GLOGENDC appears, directly under REBENVDT, whenever NPCs can spawn.
+
+    It is not decoration: every retail level with non-zero alien weights also
+    carries this chunk, and without a budget the engine has nothing to spawn.
+    """
+    obj = _make_cube()
+    npc = {"location": (0, 0, 0), "name": "gen1", "orientation": 0,
+           "type": 1, "flags": NPC_FLAGS}
+    data = build_rif_level([obj], "lvl", spawns=[npc])
+    idx, size = _find_chunk(data, "GLOGENDC")
+    assert idx > 0, "GLOGENDC missing for a level with an NPC generator"
+    assert size == 40, f"GLOGENDC size should be 40 (12+28), got {size}"
+
+
+@test
+def test_player_spawns_alone_need_no_global_generator():
+    """A level of nothing but player spawns must not gain a GLOGENDC.
+
+    The engine places players itself, so a budget would be dead weight — and
+    adding one silently would make the exporter's own test files differ from
+    what the user placed.
+    """
+    obj = _make_cube()
+    spawn = {"location": (0, 0, 0), "name": "gen1", "orientation": 0,
+             "type": 0, "flags": MP_SPAWN_FLAGS}
+    data = build_rif_level([obj], "lvl", spawns=[spawn])
+    assert _find_chunk(data, "AVPGENER")[0] > 0, "the spawn itself is missing"
+    assert _find_chunk(data, "GLOGENDC")[0] < 0, \
+        "player spawns must not force a GLOGENDC"
+
+
+@test
+def test_global_generator_defaults_match_retail():
+    """The default budget is the commonest retail combination."""
+    obj = _make_cube()
+    npc = {"location": (0, 0, 0), "name": "gen1", "orientation": 0,
+           "type": 1, "flags": NPC_FLAGS}
+    data = build_rif_level([obj], "lvl", spawns=[npc])
+    idx, _size = _find_chunk(data, "GLOGENDC")
+    fields = [_read_i32(data, idx + 12 + 4 * i) for i in range(7)]
+    enemy, max_npcs, per_minute, accel, hive, spare1, spare2 = fields
+    assert enemy == 0, f"default should be aliens, got {enemy}"
+    assert max_npcs == 25, f"MaxNPCSOnLevel default is {max_npcs}"
+    assert per_minute == 4, f"NPCSPerMinute default is {per_minute}"
+    assert accel == 2, f"NPCAcceleration default is {accel}"
+    assert hive == 32000, f"HiveStateChangeTime default is {hive}"
+    assert (spare1, spare2) == (0, 0), "spares must stay zero"
+
+
+@test
+def test_global_generator_can_be_suppressed_and_overridden():
+    """`False` omits the chunk; a dict overrides individual fields."""
+    obj = _make_cube()
+    npc = {"location": (0, 0, 0), "name": "gen1", "orientation": 0,
+           "type": 1, "flags": NPC_FLAGS}
+
+    data = build_rif_level([obj], "lvl", spawns=[npc],
+                           global_generator=False)
+    assert _find_chunk(data, "GLOGENDC")[0] < 0, \
+        "an explicit False must suppress the chunk"
+
+    data = build_rif_level([obj], "lvl", spawns=[npc],
+                           global_generator={"max_npcs": 40,
+                                             "enemy_generated": 1})
+    idx, _size = _find_chunk(data, "GLOGENDC")
+    assert _read_i32(data, idx + 12) == 1, "enemy_generated override ignored"
+    assert _read_i32(data, idx + 16) == 40, "max_npcs override ignored"
+
+
+@test
+def test_placeables_module_builds_the_menu():
+    """Every placeable entry has its own operator description.
+
+    Blender takes a menu item's tooltip from its operator class, so a shared
+    operator would show one text everywhere. The table exists to avoid that, and
+    this checks it in Blender rather than only against the stub.
+    """
+    placeables = load_package_module("placeables")
+    assert len(placeables.PLACEABLES) == len(placeables.PLACEABLE_OPERATORS), \
+        "one operator per menu entry expected"
+    descriptions = {}
+    for spec in placeables.PLACEABLES:
+        cls = placeables.PLACEABLE_OPERATORS[spec.key]
+        assert cls.bl_description == spec.description, spec.key
+        assert len(spec.description) > 40, \
+            f"{spec.label}: tooltip too short to be descriptive"
+        assert spec.description not in descriptions.values(), \
+            f"{spec.label} shares its tooltip with another entry"
+        descriptions[spec.key] = spec.description
+    # Categories must come first in the menu, and each must hold something.
+    for category, label in placeables.CATEGORY_LABELS:
+        entries = [s for s in placeables.PLACEABLES if s.category == category]
+        assert entries, f"category {label} is empty"
+
+
+@test
+def test_placeable_properties_register_in_blender():
+    """The property group really exposes its fields once registered.
+
+    This is the check that a `from __future__ import annotations` mistake would
+    break: that makes the annotations strings, Blender then registers nothing,
+    and the panel silently comes up empty.
+
+    A PropertyGroup cannot be constructed directly — Blender hands out one
+    instance per ID through the pointer property — so the group is registered
+    and read back off an object, which is also how the panel reaches it.
+    """
+    placeables = load_package_module("placeables")
+    group = placeables.RIF_PlaceableSettings
+    annotations = getattr(group, "__annotations__", {})
+    assert annotations, "the property group declares no fields"
+    for field in ("race_marine", "race_alien", "race_predator", "npc_type",
+                  "sub_type", "can_crawl", "mix_drone"):
+        assert field in annotations, f"missing declared field {field}"
+        # A string annotation means Blender cannot build the property from it.
+        assert not isinstance(annotations[field], str), (
+            f"{field} is declared as a string annotation, so Blender would "
+            "skip it — remove `from __future__ import annotations`")
+
+    bpy.utils.register_class(group)
+    bpy.types.Object.rif_placeable = bpy.props.PointerProperty(type=group)
+    holder = None
+    try:
+        holder = bpy.data.objects.new("PropTest", None)
+        bpy.context.collection.objects.link(holder)
+        settings = holder.rif_placeable
+        assert settings.race_marine is True, "race_marine default is wrong"
+        assert settings.race_alien is True, "race_alien default is wrong"
+        assert settings.race_predator is True, "race_predator default is wrong"
+        assert settings.npc_type == 1, "npc_type default is wrong"
+        assert settings.mix_drone == 1, "mix_drone default is wrong"
+        # The fields must be writable, not read-only placeholders.
+        settings.npc_type = 8
+        assert holder.rif_placeable.npc_type == 8, "npc_type is not writable"
+    finally:
+        if holder is not None:
+            bpy.data.objects.remove(holder, do_unlink=True)
+        del bpy.types.Object.rif_placeable
+        bpy.utils.unregister_class(group)
+
+
+@test
+def test_every_icon_name_exists_in_blender():
+    """No `icon=` string may name an icon Blender does not have.
+
+    An invented icon does not fail at import: it raises inside `draw()` on every
+    redraw, so the panel never appears and the console fills with the same
+    traceback. `icon="LOGIC"` shipped exactly that way.
+
+    The scan walks the AST rather than matching text, because a regular
+    expression also matches the `icon="LOGIC"` quoted inside this very
+    docstring — which is how a guard ends up reporting itself.
+    """
+    import ast
+    function = bpy.types.UILayout.bl_rna.functions["label"]
+    valid = {item.identifier
+             for item in function.parameters["icon"].enum_items}
+    assert valid, "could not read Blender's icon enum"
+
+    bad = []
+    for path in _sources_under_package():
+        text = path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as exc:
+            bad.append(f"{path.name} does not parse: {exc}")
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "icon":
+                    continue
+                value = keyword.value
+                if isinstance(value, ast.Constant) and \
+                        isinstance(value.value, str):
+                    if value.value not in valid:
+                        bad.append(f"{path.name}:{value.lineno} uses "
+                                   f"{value.value!r}")
+    assert not bad, "invalid icon names: " + "; ".join(bad)
+
+    # The scan above only sees literal `icon="..."` keywords. A menu drawn as
+    # `layout.operator(..., icon=spec.icon)` takes its icon from the table, and
+    # that is where `EMPTY_CIRCLE` hid: valid to the AST scan, fatal at draw
+    # time. The values have to be read from the table too.
+    placeables = load_package_module("placeables")
+    table_bad = [f"PLACEABLES[{s.key}].icon = {s.icon!r}"
+                 for s in placeables.PLACEABLES if s.icon not in valid]
+    assert not table_bad, \
+        "invalid icons in the placeables table: " + "; ".join(table_bad)
+
+
+@test
+def test_category_menus_draw():
+    """Every category menu must draw, exercising each entry's icon.
+
+    A menu is drawn far less often than a panel, so a bad icon here can sit
+    unnoticed until the user happens to open that one category. The recording
+    layout checks the icon passed to every operator call.
+    """
+    placeables = load_package_module("placeables")
+    layout = _RecordingLayout(record_icons=True)
+    for category, label in placeables.CATEGORY_LABELS:
+        menu = placeables.CATEGORY_MENUS[category]
+        layout.reset()
+        menu.draw(_PanelHost(layout), bpy.context)
+        assert layout.calls, f"menu {label} drew nothing"
+        operators = [c for c in layout.calls if c[0] == "operator"]
+        assert operators, f"menu {label} listed no entries"
+    # The top-level AvP menu must also draw, including its separators.
+    layout.reset()
+    placeables.menu_draw(_PanelHost(layout), bpy.context)
+    assert any(c[0] == "menu" for c in layout.calls), \
+        "the AvP menu listed no categories"
+
+
+def _sources_under_package():
+    """Return every .py file in the add-on, for the icon scan."""
+    root = Path(_PACKAGE_DIR)
+    return [p for p in root.rglob("*.py") if "__pycache__" not in p.parts]
+
+
+@test
+def test_placeable_panel_draws_for_every_kind():
+    """The properties panel must draw for each placeable kind.
+
+    Blender swallows exceptions raised while drawing a panel: the panel simply
+    comes up empty and the console repeats the same traceback on every redraw.
+    That is how the invalid `icon="LOGIC"` shipped unnoticed — a syntax-clean
+    module that fails only at draw time.
+
+    A recording layout stands in for the real one. It validates every icon
+    against Blender's enum and resolves every `prop()` target, which is what
+    catches a missing settings field.
+    """
+    placeables = load_package_module("placeables")
+    panel = placeables.RIF_PT_placeable
+    group = placeables.RIF_PlaceableSettings
+
+    bpy.utils.register_class(group)
+    bpy.types.Object.rif_placeable = bpy.props.PointerProperty(type=group)
+    holder = None
+    try:
+        holder = bpy.data.objects.new("PanelTest", None)
+        bpy.context.collection.objects.link(holder)
+        # Blender's panel draw reads the active object off the context.
+        bpy.context.view_layer.objects.active = holder
+        holder.select_set(True)
+
+        layout = _RecordingLayout(record_icons=True)
+        for kind in sorted({
+                placeables.KIND_PLAYER_START_SP,
+                placeables.KIND_PLAYER_START_MP,
+                placeables.KIND_NPC,
+                placeables.KIND_DEFAULT_ENEMY,
+                placeables.KIND_WEIGHTED,
+                placeables.KIND_WAYPOINT,
+                placeables.KIND_WAYPOINT_LINK,
+                placeables.KIND_PATROL_PATH,
+                placeables.KIND_GLOBAL_GENERATOR}):
+            holder.rif_placeable.kind = kind
+            layout.reset()
+            # Unbound call: the panel only needs a `self` carrying `.layout`.
+            panel.draw(_PanelHost(layout), bpy.context)
+            assert layout.calls, f"draw() did nothing for kind {kind}"
+    finally:
+        if holder is not None:
+            bpy.data.objects.remove(holder, do_unlink=True)
+        del bpy.types.Object.rif_placeable
+        bpy.utils.unregister_class(group)
+
+
+class _PanelHost:
+    """Minimal `self` for calling a panel's draw() outside Blender's UI."""
+
+    def __init__(self, layout):
+        self.layout = layout
+
+
+class _RecordingLayout:
+    """Stand-in for a UILayout that records calls and checks icon names."""
+
+    def __init__(self, record_icons=False):
+        self.calls = []
+        self.record_icons = record_icons
+        self._valid_icons = None
+        if record_icons:
+            function = bpy.types.UILayout.bl_rna.functions["label"]
+            self._valid_icons = {item.identifier
+                                 for item in function.parameters["icon"]
+                                 .enum_items}
+
+    def reset(self):
+        """Forget the recorded calls, keeping the icon set."""
+        self.calls = []
+
+    def _check_icon(self, icon):
+        if icon is None or not self._valid_icons:
+            return
+        assert icon in self._valid_icons, \
+            f"draw() used an icon Blender does not have: {icon!r}"
+
+    def label(self, text="", icon=None, **_kwargs):
+        """Record a label, checking its icon."""
+        self._check_icon(icon)
+        self.calls.append(("label", text))
+
+    def prop(self, data, name, **_kwargs):
+        """Record a property, forcing the field to resolve."""
+        if isinstance(name, str):
+            getattr(data, name)   # raises when the field does not exist
+        self.calls.append(("prop", name))
+
+    def box(self):
+        """Return a nested layout that records into the same list."""
+        return self
+
+    def row(self, **_kwargs):
+        """Return a nested layout that records into the same list."""
+        return self
+
+    def column(self, **_kwargs):
+        """Return a nested layout that records into the same list."""
+        return self
+
+    def separator(self, **_kwargs):
+        """Record a separator."""
+        self.calls.append(("separator", None))
+
+    def operator(self, idname="", text="", icon=None, **_kwargs):
+        """Record an operator entry, checking its icon."""
+        self._check_icon(icon)
+        self.calls.append(("operator", idname))
+
+    def menu(self, idname="", text="", icon=None, **_kwargs):
+        """Record a submenu entry, checking its icon."""
+        self._check_icon(icon)
+        self.calls.append(("menu", idname))
+
+
+@test
+def test_generator_weights_reach_the_file():
+    """A weighted generator gains AVPGENEX > AVPGENNM + GENEXSET.
+
+    The mixed generator was inert in game because ADVANCEDGENERATOR was set but
+    the extended settings were never written. This checks the whole chain: the
+    extra chunk exists, it sits beside its generator in SPECLOBJ, its name
+    matches, and the weights land in the right slots.
+    """
+    obj = _make_cube()
+    spec = {"location": (0, 0, 0), "name": "mixed", "orientation": 0,
+            "type": 0, "flags": 0x08003801,
+            "weights": {"Alien_Wt": 3, "PredAlien_Wt": 1,
+                        "Praetorian_Wt": 0}}
+    data = build_rif_level([obj], "lvl", spawns=[spec])
+
+    idx, size = _find_chunk(data, "AVPGENEX")
+    assert idx > 0, "AVPGENEX missing for a generator with weights"
+    # 12 header + [12 + 8 name] + [12 + 84 settings]. `_find_chunk` reports the
+    # whole chunk, so the AVPGENEX header is included; the payload alone is 116.
+    assert size == 128, f"AVPGENEX should be 128 bytes for 'mixed', got {size}"
+
+    payload = _chunk_payload(data, "GENEXSET")
+    assert payload is not None, "GENEXSET missing inside AVPGENEX"
+    # Header: 2x i32, 4x u8, 2x i32 = 20 bytes, then data_size and 15 weights.
+    assert len(payload) == 84, f"GENEXSET must be 84 bytes, got {len(payload)}"
+    rate, increase = struct.unpack_from("<2i", payload, 0)
+    assert (rate, increase) == (0, 0), (rate, increase)
+    limit = payload[8]
+    assert limit == 0, limit
+    data_size = struct.unpack_from("<i", payload, 20)[0]
+    assert data_size == 64, f"weights.data_size must be 64, got {data_size}"
+    weights = struct.unpack_from("<15i", payload, 24)
+    assert weights[11] == 3, f"Alien_Wt should be 3, got {weights[11]}"
+    assert weights[12] == 1, f"PredAlien_Wt should be 1, got {weights[12]}"
+    assert weights[13] == 0, f"Praetorian_Wt should be 0, got {weights[13]}"
+    assert sum(weights) == 4, "the weights must sum to the roll total"
+
+    names = _chunk_payload(data, "AVPGENNM")
+    assert names is not None, "AVPGENNM missing"
+    assert names.split(b"\x00")[0] == b"mixed", \
+        "the name chunk must match the generator, or the engine links nothing"
+
+
+@test
+def test_extra_chunk_follows_a_deduplicated_name():
+    """AVPGENEX must carry the name actually written, not the requested one.
+
+    The engine links extra data by string comparison, so a generator renamed to
+    avoid a collision needs its settings renamed with it. Otherwise the two
+    halves disagree and the weights are silently dropped.
+    """
+    obj = _make_cube()
+    spawns = [{"location": (0, 0, 0), "name": "same", "orientation": 0,
+               "type": 0, "flags": 0x08003801,
+               "weights": {"Alien_Wt": 1}},
+              {"location": (0, 0, 0), "name": "same", "orientation": 0,
+               "type": 0, "flags": 0x08003801,
+               "weights": {"Alien_Wt": 2}}]
+    data = build_rif_level([obj], "lvl", spawns=spawns)
+
+    generator_names = []
+    for payload in _all_chunk_payloads(data, "AVPGENER"):
+        generator_names.append(payload[28:].split(b"\x00")[0])
+    extra_names = []
+    for payload in _all_chunk_payloads(data, "AVPGENNM"):
+        extra_names.append(payload.split(b"\x00")[0])
+    assert len(generator_names) == 2, generator_names
+    assert len(extra_names) == 2, extra_names
+    assert sorted(generator_names) == sorted(extra_names), (
+        f"generators {generator_names} and their extra data {extra_names} "
+        "do not line up")
+
+
+@test
+def test_plain_generator_gets_no_extra_chunk():
+    """A fixed NPC generator must not gain an AVPGENEX.
+
+    Retail writes 614 of its 1064 fixed-NPC generators as a bare AVPGENER, and
+    the drone that worked in game was exactly that. Adding settings would set
+    ADVANCEDGENERATOR and change which code path the engine takes.
+    """
+    obj = _make_cube()
+    npc = {"location": (0, 0, 0), "name": "drone", "orientation": 0,
+           "type": 1, "flags": 0x00003801}
+    data = build_rif_level([obj], "lvl", spawns=[npc])
+    assert _find_chunk(data, "AVPGENER")[0] > 0, "the generator is missing"
+    assert _find_chunk(data, "AVPGENEX")[0] < 0, \
+        "a fixed-NPC generator must stay a bare AVPGENER"
+    assert _find_chunk(data, "GENEXSET")[0] < 0, \
+        "a fixed-NPC generator must carry no weights"
+
+
+@test
+def test_zero_weight_generator_still_writes_settings():
+    """All-zero weights are a real setup, not an omission.
+
+    They mean "use the level's default creature", and the engine can only reach
+    that fallback if the extended settings chunk exists. Dropping it when the
+    total is zero would break the Default Enemy Generator.
+    """
+    obj = _make_cube()
+    spec = {"location": (0, 0, 0), "name": "default", "orientation": 0,
+            "type": 0, "flags": 0x08003801,
+            "weights": {"Alien_Wt": 0, "PredAlien_Wt": 0,
+                        "Praetorian_Wt": 0}}
+    data = build_rif_level([obj], "lvl", spawns=[spec])
+    assert _find_chunk(data, "AVPGENEX")[0] > 0, \
+        "the extra chunk is required even with no weights"
+    payload = _chunk_payload(data, "GENEXSET")
+    assert payload is not None, "GENEXSET missing"
+    weights = struct.unpack_from("<15i", payload, 24)
+    assert sum(weights) == 0, weights
+
+
+@test
+def test_default_enemy_generator_starts_with_no_weights():
+    """Placing a Default Enemy Generator must preset every proportion to zero.
+
+    The property group defaults `mix_drone` to 1 so a Mixed generator does
+    something useful immediately. That default would be wrong here: it turns the
+    fallback into a hard-coded drone generator and ignores GLOGENDC.
+    """
+    placeables = load_package_module("placeables")
+    spec = [s for s in placeables.PLACEABLES
+            if s.kind == placeables.KIND_DEFAULT_ENEMY]
+    assert spec, "no Default Enemy Generator entry in the menu"
+    presets = spec[0].flags
+    for field in ("mix_drone", "mix_predalien", "mix_praetorian"):
+        assert presets.get(field) == 0, \
+            f"{field} must be preset to 0, got {presets.get(field)!r}"
+
+
+@test
+def test_global_generator_panel_fields_reach_the_chunk():
+    """The placed marker's budget fields must be what lands in GLOGENDC.
+
+    The panel used to show a static note with no fields at all, so the level's
+    NPC cap and rate could not be set from Blender even though the chunk
+    supports them.
+    """
+    placeables = load_package_module("placeables")
+    group = placeables.RIF_PlaceableSettings
+    bpy.utils.register_class(group)
+    bpy.types.Object.rif_placeable = bpy.props.PointerProperty(type=group)
+    holder = None
+    try:
+        # The cube comes first: `_make_cube` clears the scene, which would take
+        # the marker with it.
+        cube = _make_cube()
+        holder = bpy.data.objects.new("GlobalGen", None)
+        bpy.context.collection.objects.link(holder)
+        # Both must be set: the marker property is what the collector finds the
+        # object by, the group field is what it reads. The menu operator sets
+        # both together, so a divergence here would be a test artefact.
+        holder[placeables.PLACEABLE_PROP] = placeables.KIND_GLOBAL_GENERATOR
+        holder.rif_placeable.kind = placeables.KIND_GLOBAL_GENERATOR
+        holder.rif_placeable.max_npcs = 7
+        holder.rif_placeable.npcs_per_minute = 30
+        holder.rif_placeable.npc_acceleration = 5
+        holder.rif_placeable.hive_state_change_time = 1000
+        holder.rif_placeable.enemy_kind = "marines"
+
+        # The operator reads the marker off the scene, so it must be the active
+        # object for `_collect_global_generator` to find the settings.
+        bpy.context.view_layer.objects.active = holder
+        operators = load_operators()
+        overrides = operators._collect_global_generator(bpy.context)
+        assert overrides is not None, "the marker was not collected"
+        assert overrides["max_npcs"] == 7, overrides
+        assert overrides["npcs_per_minute"] == 30, overrides
+        assert overrides["enemy_generated"] == 1, \
+            "marines must map to EnemyGenerated = 1"
+
+        cube = _make_cube()
+        data = build_rif_level([cube], "lvl", spawns=[{
+            "location": (0, 0, 0), "name": "gen1", "orientation": 0,
+            "type": 1, "flags": NPC_FLAGS}],
+            global_generator=overrides)
+        idx, _size = _find_chunk(data, "GLOGENDC")
+        assert idx > 0, "GLOGENDC missing"
+        fields = [_read_i32(data, idx + 12 + 4 * i) for i in range(7)]
+        assert fields[0] == 1, f"enemy_generated is {fields[0]}, expected 1"
+        assert fields[1] == 7, f"MaxNPCSOnLevel is {fields[1]}, expected 7"
+        assert fields[2] == 30, f"NPCSPerMinute is {fields[2]}, expected 30"
+        assert fields[4] == 1000, f"HiveStateChangeTime is {fields[4]}"
+    finally:
+        try:
+            if holder is not None:
+                bpy.data.objects.remove(holder, do_unlink=True)
+        except (ReferenceError, RuntimeError):
+            pass
+        del bpy.types.Object.rif_placeable
+        bpy.utils.unregister_class(group)
+
+
+@test
+def test_module_count_matches_objects():
+    """Each mesh becomes its own RBOBJECT module, and that is not incidental.
+
+    The engine refuses to generate an NPC while the generator's module is
+    visible (`BH_GENER.C:227`), so a single-object level can never spawn from a
+    weighted generator: the player is inside the only module there is. Knowing
+    the count is what makes that diagnosable.
+    """
+    _clear_scene()
+    one = _make_cube("Room")
+    data = build_rif_level([one], "one", spawns=[])
+    assert _find_all_chunks(data, "RBOBJECT").__len__() == 1, \
+        "one object should produce one module"
+
+    _clear_scene()
+    two = _make_cubes(2)
+    data = build_rif_level(two, "two", spawns=[])
+    assert len(_find_all_chunks(data, "RBOBJECT")) == 2, \
+        "two objects should produce two modules"
+
+
+class _ReportRecorder:
+    """Minimal operator stand-in that records report() calls."""
+
+    def __init__(self):
+        self.reports = []
+
+    def report(self, levels, message):
+        """Record one report call."""
+        self.reports.append((tuple(levels), message))
+
+    def warnings(self):
+        """Return the messages reported at WARNING level."""
+        return [m for levels, m in self.reports if "WARNING" in levels]
+
+
+@test
+def test_player_start_comes_only_from_a_placed_object():
+    """The spawn must come from a Player Start object, and from nothing else.
+
+    Three settings used to describe this one point, resolved in an order where
+    the default shadowed the coordinate fields. The check that matters is that
+    removing them left exactly one source.
+    """
+    operators = load_operators()
+    placeables = load_package_module("placeables")
+
+    _clear_scene()
+    assert operators._resolve_player_start(bpy.context) is None, \
+        "an empty scene must yield no player start"
+
+    marker = bpy.data.objects.new("PlayerStart", None)
+    bpy.context.collection.objects.link(marker)
+    marker[operators.MARKER_PROP] = operators.PLAYER_START_MARKER
+    marker.location = (1.5, 2.5, 3.5)
+    found = operators._resolve_player_start(bpy.context)
+    assert found == (1.5, 2.5, 3.5), found
+    assert placeables.PLAYER_START_MARKER == operators.PLAYER_START_MARKER, \
+        "the marker string must agree between the menu and the exporter"
+
+
+@test
+def test_missing_player_start_is_reported():
+    """A level with no way in must be reported, not exported in silence.
+
+    The old "Safe Spawn" toggle placed the start automatically and said nothing,
+    so a level whose geometry it mis-measured looked fine until it was played.
+    """
+    operators = load_operators()
+    recorder = _ReportRecorder()
+
+    # No start and no multiplayer spawn: this is the case worth warning about.
+    operators._report_player_start(recorder, None, [])
+    assert recorder.warnings(), "a level with no way in must warn"
+    message = recorder.warnings()[0]
+    assert "world origin" in message, message
+
+    # A start exists: nothing to say.
+    recorder = _ReportRecorder()
+    operators._report_player_start(recorder, (0.0, 0.0, 0.0), [])
+    assert not recorder.reports, recorder.reports
+
+    # Multiplayer spawns are a legitimate way in, so this is information only.
+    recorder = _ReportRecorder()
+    operators._report_player_start(recorder, None,
+                                   [{"flags": 0x48002801}])
+    assert not recorder.warnings(), \
+        "multiplayer spawns must not be reported as a problem"
+    assert recorder.reports, "it should still be mentioned"
+
+
+class _FakeExportSettings:
+    """Stands in for the export operator, which Blender will not let us create.
+
+    `RIF_OT_export()` raises "bpy_struct.__new__(struct): expected a single
+    argument" in real Blender — the offline stub allowed it, so this is another
+    place the stub was more permissive than Blender. The layout lives in a
+    module-level function precisely so it can be exercised with this stand-in.
+    """
+
+    def __init__(self, mode="LEVEL"):
+        self.export_mode = mode
+        self.level_name = "custom"
+        self.global_scale = 1.0
+        self.override_shape_flags = False
+        self.shape_flags_override = 0
+
+
+def _draw_export(module, mode):
+    """Return the property names the export layout draws for one mode."""
+    layout = _RecordingLayout(record_icons=True)
+    module._draw_export_settings(layout, _FakeExportSettings(mode))
+    return [name for kind, name in layout.calls if kind == "prop"]
+
+
+def _export_rna():
+    """Return the export operator's settings, keyed by identifier.
+
+    Two things have to be right, and both cost a round of debugging:
+
+    * the class must be registered, or `bpy.ops.export_scene.rif` does not
+      resolve at all;
+    * the settings are NOT in `cls.bl_rna.properties`. That is the RNA of the
+      operator *type* and lists only base fields (`bl_idname`, `bl_options`, …)
+      even after registration. They live behind the operator itself, via
+      `bpy.ops.export_scene.rif.get_rna_type().properties`.
+    """
+    operators = load_operators()
+    cls = operators.RIF_OT_export
+    if not cls.is_registered:
+        bpy.utils.register_class(cls)
+    rna = bpy.ops.export_scene.rif.get_rna_type()
+    return {prop.identifier: prop for prop in rna.properties}
+
+
+@test
+def test_export_panel_is_sectioned_and_mode_aware():
+    """The export settings must be grouped, and hide what a mode ignores.
+
+    Blender lists an operator's properties flat, in declaration order, unless
+    `draw()` says otherwise. `Level Name` is written only in Level mode, so
+    showing it in Single Shape or Multi-Object invites the user to fill in a
+    field that is silently discarded.
+    """
+    operators = load_operators()
+    for mode in ("SHAPE", "COLLECTION", "LEVEL"):
+        drawn = _draw_export(operators, mode)
+        assert drawn, f"nothing drawn for mode {mode}"
+        assert "export_mode" in drawn, drawn
+        if mode == "LEVEL":
+            assert "level_name" in drawn, f"Level mode must offer the name: {drawn}"
+        else:
+            assert "level_name" not in drawn, (
+                f"{mode} does not write an environment, so Level Name must "
+                f"not be offered: {drawn}")
+
+    # Every name the layout uses has to be a real property of the operator, or
+    # the panel raises on draw and Blender swallows the exception.
+    available = set(_export_rna())
+    used = set(_draw_export(operators, "LEVEL"))
+    missing = sorted(n for n in used if n not in available)
+    assert not missing, f"the layout uses unknown properties: {missing}"
+
+
+@test
+def test_export_defaults_match_the_intended_workflow():
+    """A level export must be the default, and the name must be memorable."""
+    props = _export_rna()
+    assert props["export_mode"].default == "LEVEL", \
+        "exporting a level should not need the mode changed first"
+    assert props["level_name"].default == "custom", \
+        props["level_name"].default
+    assert abs(props["global_scale"].default - 1.0) < 1e-9, \
+        "unscaled must be the default, so no ENVSDSCL is written"
+
+
+@test
+def test_global_scale_is_written_as_a_double_only_when_set():
+    """Global Scale maps to ENVSDSCL, an 8-byte double, and 1.0 writes nothing.
+
+    Retail scales five levels by 0.8 and 0.9 and omits the chunk everywhere
+    else, so "unscaled" is the absence of the chunk rather than a stored 1.0.
+    """
+    obj = _make_cube()
+    data = build_rif_level([obj], "lvl", global_scale=None)
+    assert _find_chunk(data, "ENVSDSCL")[0] < 0, \
+        "no scale given must write no chunk"
+
+    data = build_rif_level([obj], "lvl", global_scale=1.0)
+    idx, size = _find_chunk(data, "ENVSDSCL")
+    assert idx > 0, "an explicit 1.0 is still written when asked for"
+    assert size == 20, f"ENVSDSCL is 12 header + 8 payload, got {size}"
+
+    data = build_rif_level([obj], "lvl", global_scale=0.8)
+    idx, _size = _find_chunk(data, "ENVSDSCL")
+    payload = _chunk_payload(data, "ENVSDSCL")
+    value = struct.unpack("<d", payload)[0]
+    assert abs(value - 0.8) < 1e-12, f"expected 0.8, read {value!r}"
+
+
+def _vmdarray_peers(data):
+    """Return the peer indices listed by each VMDARRAY, in file order."""
+    result = []
+    for payload in _all_chunk_payloads(data, "VMDARRAY"):
+        count = struct.unpack_from("<I", payload, 0)[0]
+        result.append([struct.unpack_from("<4i", payload, 4 + 16 * k)[0]
+                       for k in range(count)])
+    return result
+
+
+def _adjmdlep_entries(data):
+    """Return [(peer, flags, (x, y, z)), ...] for each ADJMDLEP."""
+    result = []
+    for payload in _all_chunk_payloads(data, "ADJMDLEP"):
+        count = struct.unpack_from("<I", payload, 0)[0]
+        entries = []
+        for k in range(count):
+            index, flags = struct.unpack_from("<2i", payload, 4 + 20 * k)
+            point = struct.unpack_from("<3i", payload, 12 + 20 * k)
+            entries.append((index, flags, point))
+        result.append(entries)
+    return result
+
+
+def _cubes_at(locations):
+    """Create one unit cube per location; return them in order.
+
+    _make_cube clears the scene, so building a multi-object level with it
+    destroys each previous cube. Both cubes come from one _make_cubes call,
+    then get moved, and the depsgraph is updated so matrix_world reflects the
+    new positions.
+    """
+    objs = _make_cubes(len(locations))
+    for obj, location in zip(objs, locations):
+        obj.location = location
+    bpy.context.view_layer.update()
+    return objs
+
+
+@test
+def test_adjmdlep_links_modules_that_share_a_wall():
+    """Abutting modules become neighbours, with an entry point on the seam.
+
+    `ADJMDLEP` is the AI graph, separate from visibility. Without it NPCs have
+    no path anywhere, which is the second half of why generators produced
+    nothing: the chunk used to be written empty.
+    """
+    # Unit cubes at 0 and 1 m: their boxes meet at x = 0.5 m.
+    first, second = _cubes_at([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)])
+    data = build_rif_level([first, second], "lvl")
+    entries = _adjmdlep_entries(data)
+    assert len(entries) == 2, entries
+    for index, listed in enumerate(entries):
+        peers = [peer for peer, _flags, _point in listed]
+        other = 1 - index
+        assert other in peers, f"module {index} did not link to {other}: {listed}"
+    # The point is relative to the PEER's origin and must land INSIDE the peer.
+    # Two unit cubes centred 1 m apart abut at x = 500 mm, and a point exactly
+    # on that plane is in the wall: an NPC sent there walks into masonry and
+    # stops, which is what happened before the clamp existed.
+    peer, flags, point = entries[0][0]
+    assert peer == 1, entries[0]
+    assert flags == 0, f"a plain link carries no flags, got {flags}"
+    # Arrival is 50 mm inside cube B, whose origin is at (1000, 0, 0) mm.
+    assert point == (-450, 0, 0), f"arrival should clear the wall: {point}"
+    peer_origin = (1000, 0, 0)
+    absolute = tuple(peer_origin[axis] + point[axis] for axis in range(3))
+    assert absolute == (550, 0, 0), absolute  # cube B spans 500..1500 mm in x
+    print(f"    przybycie do B: {absolute} mm (wewnatrz bryly B)")
+
+
+@test
+def test_adjmdlep_ignores_geometry_that_only_grazes():
+    """Edge and corner contacts are not passages.
+
+    Two modules that touch along a line share no walkable opening, and linking
+    them would let an NPC path through a wall.
+    """
+    # Offset diagonally: the boxes then meet along one axis only.
+    first, corner = _cubes_at([(0.0, 0.0, 0.0), (1.0, 1.0, 0.0)])
+    data = build_rif_level([first, corner], "lvl")
+    for index, listed in enumerate(_adjmdlep_entries(data)):
+        assert not listed, (
+            f"module {index} linked across a corner contact: {listed}")
+
+    # A module far away must not link either.
+    near, far = _cubes_at([(0.0, 0.0, 0.0), (20.0, 0.0, 0.0)])
+    data = build_rif_level([near, far], "lvl")
+    for entries in _adjmdlep_entries(data):
+        assert not entries, entries
+
+
+@test
+def test_vmdarray_follows_the_outliner_hierarchy():
+    """Parenting in the Outliner is the visibility graph.
+
+    A module sees its parent and its children. A corridor of rooms is a tree:
+    the middle room is the parent of the two ends, so each end sees the middle
+    and the middle sees both.
+    """
+    objs = _make_cubes(3)
+    data = build_rif_level(objs, "lvl", hierarchy={"Cube0": "Cube1",
+                                                   "Cube2": "Cube1"})
+    peers = _vmdarray_peers(data)
+    assert len(peers) == 3, peers
+    assert sorted(peers[0]) == [0, 1], f"Cube0: {peers[0]}"
+    assert sorted(peers[1]) == [0, 1, 2], f"Cube1: {peers[1]}"
+    assert sorted(peers[2]) == [1, 2], f"Cube2: {peers[2]}"
+    print(f"    hierarchia -> widocznosc: {peers}")
+
+
+@test
+def test_unlinked_module_sees_only_itself():
+    """A module with no parent and no children is invisible from everywhere.
+
+    That is the natural way to mark a generator space, and it replaces the old
+    Sealed flag: nothing to forget, and no way to hide a room the player can
+    plainly see into.
+    """
+    objs = _make_cubes(3)
+    # Only Cube0 and Cube1 are linked; Cube2 is left out of the tree.
+    data = build_rif_level(objs, "lvl", hierarchy={"Cube0": "Cube1"})
+    peers = _vmdarray_peers(data)
+    assert peers[2] == [2], f"an unlinked module sees only itself: {peers[2]}"
+    for index in (0, 1):
+        assert 2 not in peers[index], (
+            f"module {index} must not list the unlinked module: {peers[index]}")
+    print(f"    modul niepodpiety widzi tylko siebie: {peers}")
+
+
+@test
+def test_no_hierarchy_leaves_every_module_visible_to_itself_only():
+    """Without parenting each module renders alone, which is a loud change.
+
+    Exporting warns about it, because a level that used to draw in full would
+    silently turn into single-room rendering.
+    """
+    objs = _make_cubes(3)
+    data = build_rif_level(objs, "lvl")
+    peers = _vmdarray_peers(data)
+    for index, listed in enumerate(peers):
+        assert listed == [index], (index, listed)
 
 
 # ------------------------------------------------------------------ runner
