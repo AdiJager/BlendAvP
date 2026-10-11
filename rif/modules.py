@@ -220,10 +220,19 @@ def build_vmdarray(self_index, visible_peers, door_branches=None):
     at 0 until doors exist.
 
     `visible_peers` is what the module can see, normally from
-    `linked_modules`. The module always lists itself, so that standing inside it
-    renders it.
+    `linked_modules`. **The module never lists itself**, and that is not a
+    detail: across all 63 retail levels and 12,805 modules, not one lists
+    itself. Listing self marks the module visible without ever giving it a map,
+    which is how a module ends up silently not drawing. The engine handles the
+    module's own presence separately — it marks the player's module directly
+    (`MODULE.C:132`) and supplies self as the sole entry when a module carries no
+    VMDARRAY at all (`Projload.cpp:2389`).
+
+    A module with no visible peers therefore gets an EMPTY list, which is what
+    retail does and what makes an unlinked module render only when the player
+    stands in it.
     """
-    entries = [[self_index, 0, 0, 0]]
+    entries = []
     for peer in visible_peers:
         if peer == self_index:
             continue

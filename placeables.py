@@ -63,7 +63,6 @@ KIND_NPC = "NPC"
 KIND_DEFAULT_ENEMY = "DEFAULT_ENEMY"
 KIND_WEIGHTED = "WEIGHTED"
 KIND_WAYPOINT = "WAYPOINT"
-KIND_WAYPOINT_LINK = "WAYPOINT_LINK"
 KIND_PATROL_PATH = "PATROL_PATH"
 KIND_GLOBAL_GENERATOR = "GLOBAL_GENERATOR"
 
@@ -75,7 +74,6 @@ DISPLAY_BY_KIND = {
     KIND_DEFAULT_ENEMY: "SPHERE",
     KIND_WEIGHTED: "SPHERE",
     KIND_WAYPOINT: "CUBE",
-    KIND_WAYPOINT_LINK: "SINGLE_ARROW",
     KIND_PATROL_PATH: "CIRCLE",
     KIND_GLOBAL_GENERATOR: "PLAIN_AXES",
 }
@@ -415,12 +413,6 @@ PLACEABLES = (
             "ceiling nodes."),
         "MESH_CUBE", CAT_NAVIGATION, KIND_WAYPOINT),
     _PlaceableSpec(
-        "waypoint_link", "Waypoint Link", (
-            "A directed edge between two Alien Waypoints, stored in the "
-            "waypoint's link list. Select the target in the object properties. "
-            "Retail links are all marked alien-only."),
-        "EMPTY_SINGLE_ARROW", CAT_NAVIGATION, KIND_WAYPOINT_LINK),
-    _PlaceableSpec(
         "patrol_path", "Patrol Path  (single player)", (
             "AVPPATH2: an ordered list of points a human NPC walks along, with "
             "an optional closed loop. Points may cross module boundaries. Rare "
@@ -437,6 +429,49 @@ PLACEABLES = (
 )
 
 
+def _make_waypoint_material():
+    """Return a fully transparent material, reused across waypoints.
+
+    A wireframe `display_type` is a viewport-only setting: Render and Material
+    Preview ignore it and shade the mesh with its material, which would put a
+    solid box over the level being built. An alpha of zero keeps the waypoint
+    visible as edges in the viewport and invisible everywhere else.
+
+    The node tree is touched defensively because the alpha socket and the blend
+    mode are spelled differently across Blender versions, and a waypoint that
+    fails to be made transparent must not stop the operator.
+    """
+    name = "RIF Waypoint (transparent)"
+    existing = bpy.data.materials.get(name)
+    if existing is not None:
+        return existing
+    material = bpy.data.materials.new(name)
+    # The viewport colour carries the alpha too, so Solid shading is covered.
+    material.diffuse_color = (1.0, 1.0, 1.0, 0.0)
+    try:
+        material.use_nodes = True
+        tree = getattr(material, "node_tree", None)
+        for node in getattr(tree, "nodes", []) or []:
+            if getattr(node, "type", "") != "BSDF_PRINCIPLED":
+                continue
+            socket = node.inputs.get("Alpha")
+            if socket is not None:
+                socket.default_value = 0.0
+        # Blender 4.2 moved blending into the render method; older versions use
+        # `blend_method`. Set whichever exists and ignore the rest.
+        for attribute, value in (("blend_method", "BLEND"),
+                                 ("shadow_method", "NONE"),
+                                 ("surface_render_method", "BLENDED")):
+            if hasattr(material, attribute):
+                try:
+                    setattr(material, attribute, value)
+                except (TypeError, AttributeError):
+                    pass
+    except Exception:  # noqa: BLE001 - never block creating the waypoint
+        pass
+    return material
+
+
 def _make_operator(spec):
     """Build the operator class for one menu entry.
 
@@ -446,10 +481,32 @@ def _make_operator(spec):
     """
 
     def execute(self, context):
-        """Create the placeable object and select it."""
-        obj = bpy.data.objects.new(spec.label.split("  (")[0], None)
-        obj.empty_display_type = spec.display
-        obj.empty_display_size = 1.0
+        """Create the placeable object and select it.
+
+        A waypoint is a **wireframe cube mesh**. Its volume is functional —
+        neighbouring waypoints are linked by how their boxes meet — so the box
+        has to be seen and adjusted, but a shaded cube would hide the level
+        being built. `display_type = WIRE` draws only the edges, and unlike an
+        empty it still has a real `bound_box`, so the exported size needs no
+        guesswork about how Blender interprets a display size.
+        """
+        if spec.kind == KIND_WAYPOINT:
+            mesh = bpy.data.meshes.new("Waypoint")
+            verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1)
+                     for z in (-1, 1)]
+            faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
+                     (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+            mesh.from_pydata(verts, [], faces)
+            mesh.update()
+            obj = bpy.data.objects.new(spec.label.split("  (")[0], mesh)
+            obj.display_type = "WIRE"
+            mesh.materials.append(_make_waypoint_material())
+            # 2 m across, so a 4 m cube: a usable slab in a normal room.
+            obj.scale = (2.0, 2.0, 2.0)
+        else:
+            obj = bpy.data.objects.new(spec.label.split("  (")[0], None)
+            obj.empty_display_type = spec.display
+            obj.empty_display_size = 1.0
         obj[PLACEABLE_PROP] = spec.kind
         if spec.legacy_marker is not None:
             obj[MARKER_PROP] = spec.legacy_marker
@@ -457,10 +514,6 @@ def _make_operator(spec):
         obj.rif_placeable.npc_type = spec.npc_type
         for key, value in spec.flags.items():
             setattr(obj.rif_placeable, key, value)
-        # A waypoint is a volume, so its box starts at a usable size.
-        if spec.kind == KIND_WAYPOINT:
-            obj.empty_display_size = 2.0
-            obj.scale = (1.0, 1.0, 1.0)
         context.collection.objects.link(obj)
 
         for other in context.selected_objects:
@@ -597,13 +650,6 @@ class RIF_PT_placeable(bpy.types.Panel):
             box = layout.box()
             box.label(text="Volume: use position and scale", icon="CUBE")
             box.prop(settings, "can_crawl")
-
-        if kind == KIND_WAYPOINT_LINK:
-            layout.prop(settings, "link_target")
-            box = layout.box()
-            box.label(text="Direction", icon="ARROW_LEFTRIGHT")
-            box.prop(settings, "link_oneway")
-            box.prop(settings, "link_reversed")
 
         if kind == KIND_PATROL_PATH:
             layout.prop(settings, "patrol_closed")

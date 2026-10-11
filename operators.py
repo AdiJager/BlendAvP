@@ -127,19 +127,6 @@ class RIF_LightSettings(bpy.types.PropertyGroup):
     is what keeps the exporter's defaults working for untouched lights.
     """
 
-    range_m: FloatProperty(
-        name="Reach (m)",
-        description=(
-            "How far this light reaches, in metres. The engine's falloff is "
-            "linear: full brightness at the light, zero at this distance. "
-            "0 = use the exporter default (25 m).\n"
-            "This is the main lever for how large an area one light covers — "
-            "and it does NOT change brightness, so two lights of equal Power "
-            "look identical up close no matter how their Reach differs."
-        ),
-        default=0.0, min=0.0, soft_max=100.0, unit="LENGTH",
-    )
-
     brightness_scale: FloatProperty(
         name="Brightness Scale",
         description=(
@@ -150,17 +137,6 @@ class RIF_LightSettings(bpy.types.PropertyGroup):
             "which also affects Blender's own preview."
         ),
         default=0.0, min=0.0, soft_max=10.0,
-    )
-
-    show_reach: BoolProperty(
-        name="Show Reach in Viewport",
-        description=(
-            "Draw this light's reach as a wireframe in the viewport. Blender "
-            "cannot shade an inverse-square lamp like the engine's linear "
-            "falloff, so the reach circle is the only honest preview of how "
-            "far the light actually reaches"
-        ),
-        default=True,
     )
 
 
@@ -182,6 +158,7 @@ def _draw_export_settings(layout, settings):
 
     layout.label(text="Level", icon="SCENE_DATA")
     box = layout.box()
+    box.prop(settings, "export_selected_only")
     box.prop(settings, "export_mode")
     if settings.export_mode == "LEVEL":
         box.prop(settings, "level_name")
@@ -271,6 +248,17 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
+    export_selected_only: BoolProperty(
+        name="Export Selected Only",
+        description=(
+            "Export just the selected meshes instead of the whole scene.\n"
+            "Off by default: a level is the scene, and a stray selection "
+            "silently dropping rooms from the export is a mistake that is "
+            "invisible until the level is loaded in game"
+        ),
+        default=False,
+    )
+
     # ------------------------------------------------ environment settings
 
     global_scale: FloatProperty(
@@ -314,14 +302,14 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
             for obj in getattr(context, "selected_objects", []) or []:
                 print(f"[RIF] selected: {obj.name} type={obj.type} "
                       f"slots={len(getattr(obj.data, 'materials', []) or [])}")
-            self.report({"ERROR"},
+            _report(self, {"ERROR"},
                         f"Export failed: {type(exc).__name__}: {exc} "
                         "(full traceback in the console)")
             return {"CANCELLED"}
 
         with open(self.filepath, "wb") as handle:
             handle.write(data)
-        self.report({"INFO"},
+        _report(self, {"INFO"},
                     f"Wrote {len(data)} bytes to {self.filepath} "
                     f"({self.export_mode})")
         return {"FINISHED"}
@@ -330,7 +318,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         """Single-mesh export; returns bytes or None on validation failure."""
         obj = context.active_object
         if obj is None or obj.type != "MESH":
-            self.report({"ERROR"}, "Active object must be a mesh")
+            _report(self, {"ERROR"}, "Active object must be a mesh")
             return None
         return build_rif_bytes(
             obj.data,
@@ -340,9 +328,9 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
 
     def _export_collection(self, context):
         """Multi-object export without environment."""
-        objs = [o for o in context.selected_objects if o.type == "MESH"]
+        objs = _gather_meshes(context, self.export_selected_only)
         if not objs:
-            self.report({"ERROR"}, "No mesh objects selected")
+            _report(self, {"ERROR"}, "No mesh objects to export")
             return None
         return build_rif_multi(
             objs,
@@ -351,9 +339,9 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
 
     def _export_level(self, context):
         """Level export: multi-object + REBENVDT skeleton."""
-        objs = [o for o in context.selected_objects if o.type == "MESH"]
+        objs = _gather_meshes(context, self.export_selected_only)
         if not objs:
-            self.report({"ERROR"}, "No mesh objects selected")
+            _report(self, {"ERROR"}, "No mesh objects to export")
             return None
 
         player_start = _resolve_player_start(context)
@@ -390,7 +378,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
             ambient_level = AMBIENT_WITHOUT_WORLD
             prelight_colour = ((ambient_level << 16)
                                | (ambient_level << 8) | ambient_level)
-            self.report(
+            _report(self, 
                 {"WARNING"},
                 "No World in the scene, so the level has no ambient light "
                 f"(using {AMBIENT_WITHOUT_WORLD}/255). Add a World with "
@@ -399,14 +387,14 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         lights, skipped, dark = _collect_scene_lights(
             context, DEFAULT_LIGHT_RANGE_MM / 1000.0)
         if skipped:
-            self.report({"WARNING"},
+            _report(self, {"WARNING"},
                         "Skipped unsupported light types: "
                         + ", ".join(sorted(skipped)))
         if dark:
-            self.report({"WARNING"},
+            _report(self, {"WARNING"},
                         f"{dark} light(s) had zero Power and were ignored")
         if not lights:
-            self.report({"INFO"},
+            _report(self, {"INFO"},
                         "No point/spot lights found; World ambient only")
 
         # Prelight is always baked. It used to be a toggle, but the "off" state
@@ -421,6 +409,22 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
             spawns, skipped = _collect_spawns(context)
             _report_spawns(self, spawns, skipped)
             _report_player_start(self, player_start, spawns)
+            (waypoint_specs, orphaned_waypoints,
+             rotated_waypoints) = _collect_waypoints(context, objs)
+            if orphaned_waypoints:
+                _report(self,
+                    {"WARNING"},
+                    "Waypoint(s) outside every module, so they belong to no AI "
+                    "module and will be ignored by the game: "
+                    + ", ".join(orphaned_waypoints[:4]))
+            if rotated_waypoints:
+                _report(self,
+                    {"WARNING"},
+                    "Waypoint(s) are rotated, and the game's waypoint is an "
+                    "axis-aligned box with no rotation. The exported box uses "
+                    "the object's scale and ignores the rotation, so it will "
+                    "not match the rotated cube on screen: "
+                    + ", ".join(rotated_waypoints[:4]))
             return build_rif_level(
                 objs, self.level_name,
                 texture_paths=tex_paths,
@@ -441,6 +445,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 shape_flags_override=flags_override,
                 spawns=spawns,
                 global_generator=_collect_global_generator(context),
+                waypoints=waypoint_specs,
             )
         finally:
             _restore_bitmap_indices(originals)
@@ -580,13 +585,13 @@ class RIF_OT_load_game_textures(bpy.types.Operator):
         preferences = context.preferences.addons[__package__].preferences
         game_directory = preferences.game_directory.strip()
         if not game_directory:
-            self.report({"ERROR"},
+            _report(self, {"ERROR"},
                         "Set Game Directory in the add-on preferences first")
             return {"CANCELLED"}
 
         game_path = Path(game_directory)
         if not (game_path / "fastfile").is_dir():
-            self.report({"ERROR"},
+            _report(self, {"ERROR"},
                         f"No 'fastfile' folder in {game_path}")
             return {"CANCELLED"}
 
@@ -604,11 +609,11 @@ class RIF_OT_load_game_textures(bpy.types.Operator):
                 game_path, progress=progress)
         except fastfile.FastFileError as exc:
             window_manager.progress_end()
-            self.report({"ERROR"}, f"Texture archives: {exc}")
+            _report(self, {"ERROR"}, f"Texture archives: {exc}")
             return {"CANCELLED"}
         except OSError as exc:
             window_manager.progress_end()
-            self.report({"ERROR"}, f"Cannot write unpacked textures: {exc}")
+            _report(self, {"ERROR"}, f"Cannot write unpacked textures: {exc}")
             return {"CANCELLED"}
 
         report, materials = texture_import.import_texture_library(
@@ -623,17 +628,17 @@ class RIF_OT_load_game_textures(bpy.types.Operator):
                     except RuntimeError:
                         pass
 
-        self.report({"INFO"},
+        _report(self, {"INFO"},
                     f"Unpacked {extraction.written} file(s), converted "
                     f"{conversion.converted} texture(s) to PNG, built "
                     f"{len(materials)} material(s)")
         if conversion.failed:
             # Reported, not fatal: one unusual texture must not stop the rest.
             names = ", ".join(p.name for p, _why in conversion.failed[:3])
-            self.report({"WARNING"},
+            _report(self, {"WARNING"},
                         f"{len(conversion.failed)} texture(s) skipped: {names}")
         if extraction.duplicates:
-            self.report({"WARNING"},
+            _report(self, {"WARNING"},
                         f"{len(extraction.duplicates)} duplicate name(s) "
                         "between archives")
         return {"FINISHED"}
@@ -652,7 +657,7 @@ class RIF_OT_build_texture_gallery(bpy.types.Operator):
 
         materials = [m for m in bpy.data.materials if m.get(RIM_LIBRARY_PROP)]
         if not materials:
-            self.report({"WARNING"},
+            _report(self, {"WARNING"},
                         "No game materials yet - run Load Game Textures first")
             return {"CANCELLED"}
 
@@ -662,7 +667,7 @@ class RIF_OT_build_texture_gallery(bpy.types.Operator):
 
         scene = texture_import.build_gallery_scene(materials)
         context.window.scene = scene
-        self.report({"INFO"},
+        _report(self, {"INFO"},
                     f"Gallery with {len(materials)} plane(s) in scene "
                     f"'{scene.name}'; press 0 for the camera view")
         return {"FINISHED"}
@@ -682,10 +687,10 @@ class RIF_OT_clear_texture_library(bpy.types.Operator):
         count = len([m for m in bpy.data.materials
                      if m.get(RIM_LIBRARY_PROP)])
         if not count:
-            self.report({"INFO"}, "Texture library is already empty")
+            _report(self, {"INFO"}, "Texture library is already empty")
             return {"CANCELLED"}
         materials, images = texture_import.delete_library()
-        self.report({"INFO"},
+        _report(self, {"INFO"},
                     f"Removed {materials} material(s) and {images} image(s)")
         return {"FINISHED"}
 
@@ -765,6 +770,14 @@ def _collect_spawns(context):
             # GLOGENDC, which `_collect_global_generator` handles. Counting it
             # as skipped would report a working feature as unsupported.
             continue
+        elif kind in (placeables.KIND_PLAYER_START_SP,
+                      placeables.KIND_WAYPOINT):
+            # Handled elsewhere, so not skips: a single-player start
+            # becomes AVPSTART, and a waypoint goes into its module
+            # WAYPOINT chunk via _collect_waypoints. Reporting either as
+            # unsupported would be a lie, and this message has to mean what
+            # it says.
+            continue
         else:
             skipped.append((obj.name, kind))
             continue
@@ -827,45 +840,312 @@ def _collect_global_generator(context):
     }
 
 
-def _report_module_links(operator, objs, hierarchy):
-    """Warn when the level has several modules but no visibility links.
+def _report(operator, levels, message):
+    """Send a message to the UI **and** the console.
 
-    Parenting in the Outliner IS the visibility graph, and a module with no
-    parent and no children renders alone. That is deliberate — it is how a
-    generator space is marked — but a level nobody linked would silently turn
-    into single-room rendering, so it is worth saying out loud.
+    The status bar shows one line and it disappears on the next action, so a
+    user who wants to report a problem has nothing to copy. Everything our
+    operators say therefore goes to both, tagged so it can be found in a wall of
+    Blender output.
     """
+    operator.report(levels, message)
+    if "ERROR" in levels:
+        tag = "ERROR"
+    elif "WARNING" in levels:
+        tag = "WARNING"
+    else:
+        tag = "INFO"
+    print(f"[RIF] {tag}: {message}")
+
+
+def _gather_meshes(context, selected_only=False):
+    """Return the meshes to export, in a stable order.
+
+    The whole scene is the default because a level IS the scene: exporting only
+    what happened to be selected drops rooms silently, and the level looks
+    broken in game with nothing in Blender to explain why. Sorting by name
+    keeps the object indices, and therefore the module links, reproducible
+    between runs — a set-ordered export would shuffle them.
+    """
+    if selected_only:
+        candidates = list(getattr(context, "selected_objects", None) or [])
+    else:
+        scene = getattr(context, "scene", None)
+        candidates = list(getattr(scene, "objects", None) or [])
+    from .placeables import PLACEABLE_PROP
+
+    meshes = [obj for obj in candidates
+              if obj.type == "MESH" and PLACEABLE_PROP not in obj]
+    meshes.sort(key=lambda obj: obj.name)
+    return meshes
+
+
+def _waypoint_box(obj):
+    """Return ((min), (max)) for a waypoint in world metres, ignoring rotation.
+
+    The engine's waypoint is an **axis-aligned box**, so a rotated object has no
+    meaning. Taking the AABB of the rotated cube would export a box far larger
+    than the one on screen — a cube turned to its corner measures 73% more — and
+    the artist would have no way to see why the volumes disagree. The half-extent
+    is the object's scale, because the cube mesh spans -1..1.
+    """
+    origin = obj.matrix_world.translation
+    scale = obj.scale
+    half = (abs(scale.x), abs(scale.y), abs(scale.z))
+    return ((origin.x - half[0], origin.y - half[1], origin.z - half[2]),
+            (origin.x + half[0], origin.y + half[1], origin.z + half[2]))
+
+
+def _waypoint_is_rotated(obj):
+    """Return True when a waypoint carries a rotation the file cannot express."""
+    rotation = obj.rotation_euler
+    return any(abs(value) > 1e-6 for value in rotation)
+
+
+def _collect_waypoints(context, objs):
+    """Return {module index: [waypoint record, ...]} for the whole level.
+
+    A waypoint belongs to the module that contains its **origin**. The box may
+    be far larger than the module and may spill into the next room; that is
+    normal, and retail does it often. What matters is which module owns the
+    chunk, because the engine only consults the waypoint list of the AI module
+    an NPC is standing in — so the origin decides where the waypoint takes
+    effect, and the artist controls it by moving the object.
+
+    A waypoint whose origin is outside every module is reported as a problem
+    rather than silently attached to whatever is nearest.
+    """
+    from .placeables import KIND_WAYPOINT, PLACEABLE_PROP
+    from .rif import waypoints as rif_waypoints
+    from .rif.chunks.waypoint import WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER
+
+    bounds = [(obj.name, _world_box(obj)) for obj in objs]
+    bounds = [(name, box) for name, box in bounds if box is not None]
+    if not bounds:
+        return {}, [], []
+
+    placed = [obj for obj in context.scene.objects
+              if obj.get(PLACEABLE_PROP) == KIND_WAYPOINT]
+    if not placed:
+        return {}, [], []
+
+    # Group by owning module, then link within each group.
+    grouped = {}
+    orphaned = []
+    rotated = [obj.name for obj in placed if _waypoint_is_rotated(obj)]
+    for obj in placed:
+        box = _waypoint_box(obj)
+        if box is None:
+            continue
+        low, high = box
+        origin = obj.matrix_world.translation
+        owner = None
+        for index, (_name, (m_low, m_high)) in enumerate(bounds):
+            if all(m_low[k] <= origin[k] <= m_high[k] for k in range(3)):
+                owner = index
+                break
+        if owner is None:
+            orphaned.append(obj.name)
+            continue
+        # Stored in millimetres, absolute, matching the file format.
+        grouped.setdefault(owner, []).append((
+            tuple(int(round(v * 1000.0)) for v in low),
+            tuple(int(round(v * 1000.0)) for v in high),
+        ))
+
+    specs = {}
+    for index, boxes in grouped.items():
+        graph = rif_waypoints.build_graph(boxes)
+        links = rif_waypoints.link_entries(graph)
+        records = []
+        for position, (low, high) in enumerate(boxes):
+            centre = tuple((low[k] + high[k]) // 2 for k in range(3))
+            # The centre is placed by the artist, never derived, so the flag
+            # that says so is always set.
+            records.append((low, high, centre,
+                            WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER,
+                            links[position]))
+        specs[index] = records
+    return specs, orphaned, rotated
+
+
+def _world_box(obj):
+    """Return ((min), (max)) of an object's bounds in world metres, or None.
+
+    Uses ound_box, the object's local box, transformed by matrix_world —
+    the same transform the exporter places geometry with, so the check matches
+    what actually lands in the file.
+    """
+    corners = getattr(obj, "bound_box", None)
+    if not corners:
+        return None
+    matrix = obj.matrix_world
+    xs, ys, zs = [], [], []
+    for corner in corners:
+        world = matrix @ Vector(corner)
+        xs.append(world.x)
+        ys.append(world.y)
+        zs.append(world.z)
+    return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
+
+
+def _module_layout_problems(objs, hierarchy):
+    """Return a list of things wrong with the level's modules, worst first.
+
+    One source of truth: the export warnings and the Validate Level command
+    both read this, so they can never drift apart. An empty list means the
+    layout is one the engine expects.
+    """
+    problems = []
     count = len(objs)
     if count < 2:
-        return
-    if hierarchy:
-        return
-    operator.report(
-        {'WARNING'},
-        f"Level has {count} modules but nothing is linked in the Outliner, so "
-        f"each one will render on its own and you will see only the room you "
-        f"stand in. Parent modules to each other to link visibility (see the "
-        f"README section on modules). Leave a generator's module unlinked to "
-        f"keep it out of sight so its generator runs")
+        problems.append(
+            f"Only one module. The engine will not create an NPC while the "
+            f"generator's module is visible, and with a single module every "
+            f"generator is always visible — so Mixed Enemy and Default Enemy "
+            f"can never spawn. Split the level into at least two objects")
+        return problems
+
+    if not hierarchy:
+        problems.append(
+            f"{count} modules and nothing parented in the Outliner, so no "
+            f"module names any other and each one renders on its own: you will "
+            f"see only the room you stand in. Parent modules to each other to "
+            f"link visibility, and leave a generator's module unlinked so it "
+            f"stays out of sight")
+
+    boxes = [(obj.name, _world_box(obj)) for obj in objs]
+    boxes = [(name, box) for name, box in boxes if box is not None]
+    overlapping, isolated = set(), []
+    for index, (name, box) in enumerate(boxes):
+        low, high = box
+        touches = False
+        for other, (other_name, other_box) in enumerate(boxes):
+            if index == other:
+                continue
+            o_low, o_high = other_box
+            gaps = [min(high[a], o_high[a]) - max(low[a], o_low[a])
+                    for a in range(3)]
+            if any(gap < -0.001 for gap in gaps):
+                continue
+            touches = True
+            if all(gap > 0.001 for gap in gaps):
+                overlapping.add(" / ".join(sorted((name, other_name))))
+        if not touches:
+            isolated.append(name)
+
+    if overlapping:
+        problems.append(
+            "Modules overlap instead of touching: "
+            + ", ".join(sorted(overlapping)[:4])
+            + ". The engine expects modules to meet at a face; move them apart "
+              "or expect the level to misbehave in game")
+    if isolated:
+        problems.append(
+            "Modules touch nothing, so the player falls into empty space beside "
+            "them: " + ", ".join(isolated[:4]))
+    return problems
+
+
+def _report_module_links(operator, objs, hierarchy):
+    """Warn about every module layout problem the engine will not tolerate."""
+    for problem in _module_layout_problems(objs, hierarchy):
+        _report(operator, {"WARNING"}, problem)
+
+
+class RIF_OT_validate_level(bpy.types.Operator):
+    """Check the scene is fit to export, and say what to fix if it is not."""
+
+    bl_idname = "object.rif_validate_level"
+    bl_label = "Validate Level"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        """Run every pre-export check and report the result.
+
+        The same rules the export warnings use, gathered in one place and run
+        on demand, so a level can be audited without exporting it and reading
+        the console afterwards.
+        """
+        from . import placeables  # noqa: F401  (ensures the module loads)
+
+        objs = _gather_meshes(context, False)
+        problems = []
+        notes = []
+
+        if not objs:
+            _report(self, {"ERROR"}, "No mesh objects in the scene to export")
+            return {"CANCELLED"}
+        notes.append(f"{len(objs)} module(s)")
+
+        hierarchy = {
+            o.name: o.parent.name for o in objs if o.parent is not None
+        } or None
+        problems.extend(_module_layout_problems(objs, hierarchy))
+
+        # ---- player start
+        player_start = _resolve_player_start(context)
+        spawns, skipped = _collect_spawns(context)
+        mp_spawns = [spec for spec in spawns
+                     if spec.get("kind") == placeables.KIND_PLAYER_START_MP]
+        if player_start is None and not mp_spawns:
+            problems.append(
+                "No Player Start and no multiplayer spawn: the level begins at "
+                "the world origin, which is usually inside a wall")
+
+        # ---- generators
+        generators = [spec for spec in spawns
+                      if spec.get("kind") not in (
+                          placeables.KIND_PLAYER_START_MP,
+                          placeables.KIND_PLAYER_START_SP)]
+        notes.append(f"{len(generators)} generator(s)")
+        budget = _collect_global_generator(context)
+        if generators and not budget.get("npcs_per_minute"):
+            problems.append(
+                "Global Generator Data has NPCSPerMinute = 0, which disables "
+                "the whole generator system silently (BH_GENER.C:189). No "
+                "generator will ever create an NPC")
+        if skipped:
+            problems.append("Skipped objects: " + ", ".join(sorted(skipped)[:4]))
+
+        # ---- lighting
+        world = _scene_world(context)
+        if world is None:
+            problems.append(
+                "No World in the scene, so the level has no ambient light and "
+                "every unlit surface renders black")
+
+        for line in notes:
+            print(f"[RIF] validate: {line}")
+        for problem in problems:
+            print(f"[RIF] validate: PROBLEM - {problem}")
+
+        if not problems:
+            _report(self, {"INFO"},
+                        f"Level looks exportable ({', '.join(notes)})")
+            return {"FINISHED"}
+        _report(self, {"WARNING"},
+                    f"{len(problems)} problem(s): " + " | ".join(problems)[:500])
+        return {"FINISHED"}
 
 
 def _report_spawns(operator, specs, skipped):
     """Report what was exported, and name what was left out."""
     if specs:
-        operator.report({"INFO"}, f"Exported {len(specs)} AvP generator(s)")
+        _report(operator, {"INFO"}, f"Exported {len(specs)} AvP generator(s)")
     # Skirmish sets maxAlien to 0, so an alien-only spawn can never be used.
     alien_only = [s for s in specs
                   if s["flags"] & 0x1000
                   and not s["flags"] & (0x800 | 0x2000)]
     if alien_only:
-        operator.report(
+        _report(operator, 
             {"WARNING"},
             f"{len(alien_only)} spawn(s) allow only the alien, which skirmish "
             "forbids - tick Marine or Predator as well")
     if skipped:
         names = ", ".join(name for name, _kind in skipped[:4])
         more = "" if len(skipped) <= 4 else f" (+{len(skipped) - 4} more)"
-        operator.report(
+        _report(operator, 
             {"WARNING"},
             f"{len(skipped)} AvP object(s) not exported yet: {names}{more}")
 
@@ -903,20 +1183,20 @@ def _report_bake_quality(operator, baked, base_colour):
     spread = max(levels) - min(levels)
 
     if saturated > total * 0.9:
-        operator.report(
+        _report(operator, 
             {"WARNING"},
             f"{saturated}/{total} vertices are fully saturated. World ambient "
             f"is about {base}/255 — lower World > Strength so lights and "
             "colour can show")
     elif spread <= 2:
-        operator.report(
+        _report(operator, 
             {"WARNING"},
             "Baked lighting is flat: only "
             f"{spread} brightness level(s) across {total} vertices. World "
             f"ambient is about {base}/255; lower World > Strength or raise "
             "light Power")
     else:
-        operator.report(
+        _report(operator, 
             {"INFO"},
             f"Baked {total} vertices: brightness {min(levels)}-{max(levels)}, "
             f"World ambient {base}/255")
@@ -942,12 +1222,10 @@ def _light_range_mm(light_object, default_range_m, settings=None):
     0.25 m and describes shadow softness, not reach. Using it gave every light
     a 250 mm radius and left whole rooms unlit.
     """
-    if settings is None:
-        settings = _rif_light_settings(light_object)
-    if settings is not None and getattr(settings, "range_m", 0.0) > 0.0:
-        return max(1, int(round(settings.range_m * 1000.0)))
-    # Blender objects expose the legacy custom property through .get(); other
-    # callers (tests, the overlay's selection logic) may not have it.
+    # Reach is no longer a setting: the distance is not something an artist can
+    # judge in the viewport, and the per-light value only got in the way. The
+    # legacy custom property is still honoured so levels built with older
+    # versions of the exporter keep the distances they were authored with.
     getter = getattr(light_object, "get", None)
     legacy = getter(RIF_RANGE_PROP) if getter is not None else None
     if legacy:
@@ -1098,7 +1376,7 @@ def _collect_scene_lights(context, default_range_m):
 
 def _object_world_rif(obj):
     """Return (location_rif, quaternion) for one Blender mesh object."""
-    loc, rot_q, _scale = obj.matrix_local.decompose()
+    loc, rot_q, _scale = obj.matrix_world.decompose()
     bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
     return ((meters_to_rif(bx), meters_to_rif(by), meters_to_rif(bz)), rot_q)
 
@@ -1187,12 +1465,12 @@ def _report_player_start(operator, player_start, spawns):
         return
     multiplayer = [s for s in spawns or () if s.get("flags", 0) & 0x40000000]
     if multiplayer:
-        operator.report(
+        _report(operator, 
             {"INFO"},
             f"No Player Start (single player); {len(multiplayer)} multiplayer "
             "spawn(s) will place players instead")
         return
-    operator.report(
+    _report(operator, 
         {"WARNING"},
         "No Player Start and no multiplayer spawn: the level has no AVPSTART, "
         "so the game starts the player at the world origin. Place a "
@@ -1224,7 +1502,7 @@ class RIF_PT_light(bpy.types.Panel):
                 and getattr(obj.data, "type", "") in ("POINT", "SPOT"))
 
     def draw(self, context):
-        """Draw the reach and brightness controls for the active light."""
+        """Draw the brightness controls for the active light."""
         obj = context.object
         layout = self.layout
         settings = obj.rif_light
@@ -1232,7 +1510,6 @@ class RIF_PT_light(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
-        layout.prop(settings, "range_m")
         layout.prop(settings, "brightness_scale")
 
         # Show what the exporter will actually write, so the numbers are never
@@ -1240,39 +1517,17 @@ class RIF_PT_light(bpy.types.Panel):
         from .rif import lighting as rif_lighting
         watts = _light_power_watts(obj, obj.data)
         brightness = rif_lighting.effective_brightness(
-            watts, _light_range_mm(obj, DEFAULT_LIGHT_RANGE_MM / 1000.0,
-                                   settings))
+            watts, _light_range_mm(obj, DEFAULT_LIGHT_RANGE_MM / 1000.0))
         layout.separator()
         column = layout.column(align=True)
         column.label(text=f"Power: {watts:.0f} W", icon="LIGHT")
         column.label(text=f"Engine brightness: {brightness}")
         if brightness >= rif_lighting.BRIGHTNESS_CEILING:
-            column.label(text="At the ceiling - raise Reach or lower Power",
+            column.label(text="At the ceiling - lower Power",
                          icon="ERROR")
 
         layout.separator()
-        layout.prop(settings, "show_reach")
-
-
-class RIF_OT_diagnose_lights(bpy.types.Operator):
-    """Print why the reach overlay is or is not drawing anything."""
-
-    bl_idname = "object.rif_diagnose_lights"
-    bl_label = "Diagnose RIF Reach Overlay"
-    bl_options = {"REGISTER"}
-
-    def execute(self, context):
-        """Report handler state, light settings and the last draw error."""
-        from . import gizmos
-        report = gizmos.describe_state(context)
-        for line in report.splitlines():
-            print(f"[RIF] {line}")
-        # Also surface it in the UI: the console is easy to miss.
-        failed = gizmos.LAST_ERROR is not None
-        self.report({"ERROR" if failed else "INFO"},
-                    report.replace("\n", " | ")[:500])
-        return {"FINISHED"}
-
+    
 
 class RIF_OT_select_lights(bpy.types.Operator):
     """Select every supported light in the scene, so the panel is reachable."""
@@ -1292,11 +1547,11 @@ class RIF_OT_select_lights(bpy.types.Operator):
             obj.select_set(True)
             count += 1
         if not count:
-            self.report({"WARNING"},
+            _report(self, {"WARNING"},
                         "No POINT or SPOT lights in this scene — RIF Light "
                         "settings live on those objects")
             return {"CANCELLED"}
-        self.report({"INFO"},
+        _report(self, {"INFO"},
                     f"Selected {count} light(s); RIF Light is in Object "
                     "Properties")
         return {"FINISHED"}
@@ -1333,7 +1588,7 @@ class RIF_MT_debug_avp(bpy.types.Menu):
     def draw(self, context):
         """List the diagnostic helpers for inspecting a scene before export."""
         self.layout.operator(RIF_OT_select_lights.bl_idname, icon="LIGHT")
-        self.layout.operator(RIF_OT_diagnose_lights.bl_idname, icon="QUESTION")
+        self.layout.operator(RIF_OT_validate_level.bl_idname, icon="CHECKMARK")
 
 
 def _menu_func_debug(self, context):
@@ -1363,7 +1618,7 @@ _CLASSES = (
     RIF_OT_build_texture_gallery,
     RIF_OT_clear_texture_library,
     RIF_OT_select_lights,
-    RIF_OT_diagnose_lights,
+    RIF_OT_validate_level,
     RIF_MT_add_avp,
     RIF_MT_debug_avp,
 )
@@ -1380,15 +1635,11 @@ def register():
     bpy.types.TOPBAR_MT_file_export.append(_menu_func_export)
     bpy.types.VIEW3D_MT_add.append(_menu_func_add)
     bpy.types.VIEW3D_MT_object.append(_menu_func_debug)
-    from . import gizmos
-    gizmos.register_overlay()
 
 
 def unregister():
     """Unregister everything registered by register()."""
-    from . import gizmos
     from . import placeables
-    gizmos.unregister_overlay()
     bpy.types.VIEW3D_MT_add.remove(_menu_func_add)
     bpy.types.VIEW3D_MT_object.remove(_menu_func_debug)
     bpy.types.TOPBAR_MT_file_export.remove(_menu_func_export)

@@ -91,7 +91,7 @@ if _RIF_PATH is None:
 
 try:
     import bpy
-    from mathutils import Quaternion
+    from mathutils import Matrix, Quaternion, Vector
     HAS_BPY = True
 except ImportError:
     bpy = None
@@ -818,38 +818,6 @@ def test_multi_shape_file_ids_are_distinct():
     assert len(heads) == 2
     ids = [_read_i32(data, i + 12 + 20) for i, _s in heads]
     assert ids == [1, 2], f"file_id_num list = {ids}"
-
-
-@test
-def test_hierarchy_flat_tree_structure():
-    """Parent with one child: 3 OBJCHIER, 2 OBJHIERD, 1 OBHIERNM.
-
-    Note the identifier is OBHIERNM (8 chars, no J) — the format only
-    allows eight ASCII bytes per chunk id. Verified against sentry.txt.
-    """
-    objs = _make_cubes(2)
-    hierarchy = {objs[1].name: objs[0].name}
-    data = build_rif_multi(objs, hierarchy=hierarchy)
-    assert data.count(b"OBJCHIER") == 3, \
-        f"OBJCHIER count = {data.count(b'OBJCHIER')}"
-    assert data.count(b"OBJHIERD") == 2, \
-        f"OBJHIERD count = {data.count(b'OBJHIERD')}"
-    assert data.count(b"OBHIERNM") == 1, \
-        f"OBHIERNM count = {data.count(b'OBHIERNM')}"
-    assert b"OBJHIERNM" not in data
-
-
-@test
-def test_hierarchy_deep_chain():
-    """Chain A→B→C: 4 OBJCHIER, 3 OBJHIERD."""
-    objs = _make_cubes(3)
-    hierarchy = {
-        objs[1].name: objs[0].name,
-        objs[2].name: objs[1].name,
-    }
-    data = build_rif_multi(objs, hierarchy=hierarchy)
-    assert data.count(b"OBJCHIER") == 4
-    assert data.count(b"OBJHIERD") == 3
 
 
 @test
@@ -1910,7 +1878,6 @@ def test_placeable_panel_draws_for_every_kind():
                 placeables.KIND_DEFAULT_ENEMY,
                 placeables.KIND_WEIGHTED,
                 placeables.KIND_WAYPOINT,
-                placeables.KIND_WAYPOINT_LINK,
                 placeables.KIND_PATROL_PATH,
                 placeables.KIND_GLOBAL_GENERATOR}):
             holder.rif_placeable.kind = kind
@@ -2296,6 +2263,7 @@ class _FakeExportSettings:
         self.global_scale = 1.0
         self.override_shape_flags = False
         self.shape_flags_override = 0
+        self.export_selected_only = False
 
 
 def _draw_export(module, mode):
@@ -2486,52 +2454,224 @@ def test_adjmdlep_ignores_geometry_that_only_grazes():
 def test_vmdarray_follows_the_outliner_hierarchy():
     """Parenting in the Outliner is the visibility graph.
 
-    A module sees its parent and its children. A corridor of rooms is a tree:
-    the middle room is the parent of the two ends, so each end sees the middle
-    and the middle sees both.
+    A module sees its parent and its children, and never itself.
     """
     objs = _make_cubes(3)
     data = build_rif_level(objs, "lvl", hierarchy={"Cube0": "Cube1",
                                                    "Cube2": "Cube1"})
     peers = _vmdarray_peers(data)
     assert len(peers) == 3, peers
-    assert sorted(peers[0]) == [0, 1], f"Cube0: {peers[0]}"
-    assert sorted(peers[1]) == [0, 1, 2], f"Cube1: {peers[1]}"
-    assert sorted(peers[2]) == [1, 2], f"Cube2: {peers[2]}"
+    assert sorted(peers[0]) == [1], f"Cube0: {peers[0]}"
+    assert sorted(peers[1]) == [0, 2], f"Cube1: {peers[1]}"
+    assert sorted(peers[2]) == [1], f"Cube2: {peers[2]}"
     print(f"    hierarchia -> widocznosc: {peers}")
 
 
 @test
-def test_unlinked_module_sees_only_itself():
-    """A module with no parent and no children is invisible from everywhere.
+def test_module_never_lists_itself():
+    """No module may list itself, which is what every retail module does.
 
-    That is the natural way to mark a generator space, and it replaces the old
-    Sealed flag: nothing to forget, and no way to hide a room the player can
-    plainly see into.
+    Across all 63 retail levels and 12,805 modules, not one lists itself. Our
+    exporter used to put self first, and a module marked visible that way never
+    receives a map, so it silently stops drawing. The engine marks the player's
+    module on its own (MODULE.C:132).
     """
     objs = _make_cubes(3)
-    # Only Cube0 and Cube1 are linked; Cube2 is left out of the tree.
-    data = build_rif_level(objs, "lvl", hierarchy={"Cube0": "Cube1"})
-    peers = _vmdarray_peers(data)
-    assert peers[2] == [2], f"an unlinked module sees only itself: {peers[2]}"
-    for index in (0, 1):
-        assert 2 not in peers[index], (
-            f"module {index} must not list the unlinked module: {peers[index]}")
-    print(f"    modul niepodpiety widzi tylko siebie: {peers}")
+    data = build_rif_level(objs, "lvl", hierarchy={"Cube0": "Cube1",
+                                                   "Cube2": "Cube1"})
+    for index, listed in enumerate(_vmdarray_peers(data)):
+        assert index not in listed, (
+            f"module {index} lists itself: {listed}")
 
 
 @test
-def test_no_hierarchy_leaves_every_module_visible_to_itself_only():
-    """Without parenting each module renders alone, which is a loud change.
+def test_unlinked_module_lists_nothing():
+    """A module outside the tree sees nothing and renders only from inside.
+
+    That is how a generator space stays out of sight, and it matches retail:
+    the list holds other visible modules, never the module's own index.
+    """
+    objs = _make_cubes(3)
+    data = build_rif_level(objs, "lvl", hierarchy={"Cube0": "Cube1"})
+    peers = _vmdarray_peers(data)
+    assert peers[2] == [], f"an unlinked module lists nothing: {peers[2]}"
+    for index in (0, 1):
+        assert 2 not in peers[index], (
+            f"module {index} must not list the unlinked module: {peers[index]}")
+    print(f"    modul niepodpiety nie wymienia nikogo: {peers}")
+
+
+@test
+def test_no_hierarchy_leaves_every_module_with_no_list():
+    """Without parenting no module names any other, so each draws alone.
 
     Exporting warns about it, because a level that used to draw in full would
     silently turn into single-room rendering.
     """
     objs = _make_cubes(3)
     data = build_rif_level(objs, "lvl")
-    peers = _vmdarray_peers(data)
-    for index, listed in enumerate(peers):
-        assert listed == [index], (index, listed)
+    for index, listed in enumerate(_vmdarray_peers(data)):
+        assert listed == [], (index, listed)
+
+
+def _module_world_boxes(data):
+    """Return [(origin, (min), (max))] per module, in world RIF mm.
+
+    Origin comes from OBJHEAD1, bounds from SHPHEAD1, paired through
+    shape_id_no. Used to prove that a change of representation leaves the
+    module exactly where it was.
+    """
+    shapes = {}
+    for payload in _all_chunk_payloads(data, "SHPHEAD1"):
+        file_id = struct.unpack_from("<i", payload, 20)[0]
+        bounds = struct.unpack_from("<6i", payload, 36)
+        shapes[file_id] = ((bounds[1], bounds[3], bounds[5]),
+                           (bounds[0], bounds[2], bounds[4]))
+    out = []
+    for payload in _all_chunk_payloads(data, "OBJHEAD1"):
+        origin = struct.unpack_from("<3i", payload, 20)
+        shape_id = struct.unpack_from("<i", payload, 56)[0]
+        low, high = shapes[shape_id]
+        out.append((origin,
+                    tuple(origin[a] + low[a] for a in range(3)),
+                    tuple(origin[a] + high[a] for a in range(3))))
+    return out
+
+
+@test
+def test_parenting_does_not_move_modules():
+    """The Outliner tree links visibility; it must not relocate geometry.
+
+    Parenting changes an object's matrix_local, which is relative to its
+    parent. Writing that as the module's world position puts the module
+    somewhere else entirely, which is how Origin to Geometry on a parented
+    object produced overlapping modules. Positions must come from
+    matrix_world, so the exported boxes are identical with and without the
+    tree.
+    """
+    objs = _make_cubes(3)
+    positions = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (4.0, 0.0, 0.0)]
+    for obj, location in zip(objs, positions):
+        obj.location = location
+    bpy.context.view_layer.update()
+
+    flat = _module_world_boxes(build_rif_level(objs, "lvl"))
+    linked = _module_world_boxes(build_rif_level(
+        objs, "lvl", hierarchy={"Cube0": "Cube1", "Cube2": "Cube1"}))
+    assert flat == linked, (
+        f"parenting moved geometry:\n  bez drzewa: {flat}\n  z drzewem : {linked}")
+
+
+@test
+def test_parented_module_export_keeps_its_world_position():
+    """A child object is placed by its world transform, not its local one.
+
+    The parent sits away from the origin, so a module that used the local
+    transform would land next to its parent instead of where it belongs.
+    """
+    parent, child = _cubes_at([(0.0, 0.0, 0.0), (4.0, 0.0, 0.0)])
+    child.parent = parent
+    bpy.context.view_layer.update()
+
+    boxes = _module_world_boxes(build_rif_level([parent, child], "lvl"))
+    # Cubes are 1 m across, so the child spans 3500..4500 mm in x.
+    child_low = boxes[1][1]
+    assert child_low[0] == 3500, (
+        f"child must stay at its world position, got {child_low}")
+    print(f"    dziecko na {boxes[1][0]} (swiat), nie przy rodzicielu")
+
+
+@test
+def test_offcentre_mesh_is_recentred_into_the_retail_frame():
+    """Geometry is stored around the origin, with the position in location.
+
+    Retail always keeps shape vertices LOCAL and carries the module position in
+    object_data.location. World-space vertices with a zero location make the
+    engine read m_world as the world origin for every module, which is what
+    stops a module drawing. The world box must not move.
+    """
+    first, second = _cubes_at([(0.0, 0.0, 0.0), (4.0, 0.0, 0.0)])
+    # Move the MESH, not the object: vertices end up far from the origin while
+    # matrix_world stays put, exactly like a world-space mesh.
+    first.data.transform(Matrix.Translation(Vector((16.0, 0.0, 0.0))))
+    bpy.context.view_layer.update()
+
+    origin, low, high = _module_world_boxes(
+        build_rif_level([first, second], "lvl"))[0]
+    assert origin[0] == 16000, f"location must carry the position: {origin}"
+    assert origin[0] - low[0] == high[0] - origin[0], (
+        f"local bounds must straddle zero: {(low, high)}")
+    local_low = tuple(low[a] - origin[a] for a in range(3))
+    local_high = tuple(high[a] - origin[a] for a in range(3))
+    assert local_low == (-500, -500, -500), local_low
+    assert local_high == (500, 500, 500), local_high
+    print(f"    lokalne {local_low}..{local_high}  location={origin}")
+
+
+@test
+def test_recentring_survives_parenting():
+    """Recentring, world positions and the Outliner tree must all hold at once.
+
+    The three interact: parenting changes matrix_local, recentring changes
+    location, and only matrix_world keeps geometry where the artist put it.
+    """
+    trio = _cubes_at([(0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (9.0, 0.0, 0.0)])
+    parent, child = trio[0], trio[1]
+    child.data.transform(Matrix.Translation(Vector((2.0, 0.0, 0.0))))
+    child.parent = parent
+    bpy.context.view_layer.update()
+
+    flat = _module_world_boxes(build_rif_level(trio, "lvl"))
+    linked = _module_world_boxes(build_rif_level(
+        trio, "lvl", hierarchy={"Cube0": "Cube1"}))
+    assert flat == linked, f"parenting moved geometry: {flat} vs {linked}"
+    # The child sits at 4 m and its mesh is shifted a further 2 m.
+    assert flat[1][0][0] == 6000, flat[1]
+    assert flat[1][1][0] == 5500, flat[1]
+
+
+@test
+def test_export_takes_the_whole_scene_by_default():
+    """A level is the scene; a stray selection must not shrink the export.
+
+    Exporting only what happened to be selected drops rooms silently, and the
+    level then looks broken in game with nothing in Blender to explain it.
+    """
+    operators = load_operators()
+    trio = _cubes_at([(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (4.0, 0.0, 0.0)])
+    host = _PanelHost(None)
+    host.scene = bpy.context.scene
+    host.selected_objects = [trio[0]]
+
+    everything = operators._gather_meshes(host, False)
+    assert len(everything) == 3, [o.name for o in everything]
+    only_selected = operators._gather_meshes(host, True)
+    assert [o.name for o in only_selected] == [trio[0].name], only_selected
+
+    # Order is by name, so object indices and module links are reproducible.
+    assert [o.name for o in everything] == sorted(o.name for o in everything)
+
+
+@test
+def test_validator_reports_a_single_module_level():
+    """One module is the mistake that silently kills every runtime generator.
+
+    The engine will not create an NPC while the generator's module is visible,
+    and with a single module everything is always visible.
+    """
+    operators = load_operators()
+    _make_cube("Only")
+
+    problems = operators._module_layout_problems(
+        list(bpy.context.scene.objects), None)
+    assert problems, "a one-module level must be reported"
+    assert "one module" in problems[0].lower(), problems[0]
+
+    recorder = _ReportRecorder()
+    operators.RIF_OT_validate_level.execute(recorder, bpy.context)
+    assert recorder.reports, "the validator said nothing at all"
+    assert recorder.warnings(), recorder.reports
+    print(f"    walidator: {recorder.warnings()[0][:90]}")
 
 
 # ------------------------------------------------------------------ runner

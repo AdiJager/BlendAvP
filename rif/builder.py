@@ -54,6 +54,7 @@ S6 F9 (ROOT CAUSE — "empty level with Include Prelight on"):
 from math import sqrt
 
 from . import modules
+from .chunks.waypoint import WaypointChunk
 from .types import (
     DEFAULT_LOCK_USER, DEFAULT_NOTES,
     meters_to_rif, uv_to_rif_pixels, blender_to_rif_axis,
@@ -92,6 +93,7 @@ from .chunks.lighting import (
 )
 from .chunks.module import (
     ObjectModuleDataChunk, AdjacentModuleEntryPointsChunk,
+    ModuleAcousticsChunk, VModuleArrayChunk,
     VModuleArrayChunk, ModuleAcousticsChunk,
 )
 
@@ -244,14 +246,17 @@ def build_rif_multi(objects, hierarchy=None,
             raise ValueError(f"Object {obj.name!r} is not a mesh")
         file_id = i + 1
         slot_bitmaps = _resolve_bitmap_indices(obj.data)
-        shapes.append(_build_shape_chunk(
+        shape = _build_shape_chunk(
             obj.data, obj.name, file_id, slot_bitmaps,
-            shape_flags=shape_flags,
-        ))
+            shape_flags=shape_flags, recentre=True,
+        )
+        shapes.append(shape)
 
-        loc, rot_q, _scale = obj.matrix_local.decompose()
+        loc, rot_q, _scale = obj.matrix_world.decompose()
         bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
-        loc_rif = (meters_to_rif(bx), meters_to_rif(by), meters_to_rif(bz))
+        shift = shape.origin_offset
+        loc_rif = (meters_to_rif(bx) + shift[0], meters_to_rif(by) + shift[1],
+                   meters_to_rif(bz) + shift[2])
         orient_rif = _convert_orientation(rot_q)
 
         num_vertices = len(obj.data.vertices)
@@ -271,8 +276,11 @@ def build_rif_multi(objects, hierarchy=None,
         ))
 
     children = [RIFVersionChunk(0)] + shapes + objs
-    if hierarchy:
-        children.append(_build_hierarchy_chunk(hierarchy))
+    # NOTE: the OBJCHIER / OBJHIERD / OBHIERNM chunks are deliberately NOT
+    # written. They appear in ZERO of the 63 retail levels, and emitting them
+    # crashes the game on level load as soon as anything is parented. The
+    # outliner hierarchy is still read for the module visibility graph; it just
+    # does not belong in the file.
 
     return GodFatherChunk(children).serialize()
 
@@ -292,7 +300,8 @@ def build_rif_level(objects, level_name, texture_paths=None,
                     object_intensities=None,
                     shape_flags_override=None,
                     spawns=None,
-                    global_generator=None) -> bytes:
+                    global_generator=None,
+                    waypoints=None) -> bytes:
     """Assemble a level RIF: shapes + objects + MODULEDT + REBENVDT.
 
     Composition:
@@ -346,6 +355,10 @@ def build_rif_level(objects, level_name, texture_paths=None,
         with `rif.lighting.bake_for_object` so the values match what the
         engine would have produced itself.
 
+    waypoints : optional {module index: [record, ...]} mapping. Each record
+        is `(min, max, centre, flags, links)` in absolute RIF millimetres. A
+        module with no entry gets no WAYPOINT chunk at all.
+
     shape_flags_override : force a specific SHAPE_FLAGS value instead
         of the computed one. Kept for diagnostics only — never set bit
         0x1000 on a module shape (see the SHAPE_FLAG_EXTERNALFILE note at
@@ -376,10 +389,16 @@ def build_rif_level(objects, level_name, texture_paths=None,
     for obj in objects:
         if obj.type != "MESH":
             raise ValueError(f"Object {obj.name!r} is not a mesh")
-        loc, _rot, _scale = obj.matrix_local.decompose()
+        loc, _rot, _scale = obj.matrix_world.decompose()
         bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
-        module_origins.append((meters_to_rif(bx), meters_to_rif(by),
-                               meters_to_rif(bz)))
+        world_origin = (meters_to_rif(bx), meters_to_rif(by),
+                        meters_to_rif(bz))
+        # The shape is recentred below, so the module's position has to absorb
+        # the same shift. world_origin is the true world position and is what
+        # the module box and the AI entry points are measured against; the two
+        # only differ in which frame they are expressed in, never in where the
+        # geometry ends up.
+        module_origins.append(world_origin)
         points = []
         matrix = obj.matrix_world
         for vertex in obj.data.vertices:
@@ -408,14 +427,23 @@ def build_rif_level(objects, level_name, texture_paths=None,
             raise ValueError(f"Object {obj.name!r} is not a mesh")
         file_id = i + 1
         slot_bitmaps = _resolve_bitmap_indices(obj.data, texture_paths)
-        shapes.append(_build_shape_chunk(
+        shape = _build_shape_chunk(
             obj.data, obj.name, file_id, slot_bitmaps,
-            shape_flags=shape_flags,
-        ))
+            shape_flags=shape_flags, recentre=True,
+        )
+        shapes.append(shape)
 
-        loc, rot_q, _scale = obj.matrix_local.decompose()
-        bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
-        loc_rif = (meters_to_rif(bx), meters_to_rif(by), meters_to_rif(bz))
+        # `module_origins[i]` is the true world position, which the module box
+        # and the AI entry points are measured against. The location written to
+        # the file also absorbs the shape's recentring offset, so that
+        # `location + local vertices` still lands on exactly the same world
+        # point. This is the retail convention: local vertices, position in
+        # `object_data.location`.
+        shift = shape.origin_offset
+        loc_rif = tuple(module_origins[i][a] + shift[a] for a in range(3))
+
+        loc, rot_q, _scale = obj.matrix_world.decompose()
+        orient_rif = _convert_orientation(rot_q)
         orient_rif = _convert_orientation(rot_q)
 
         module_data = None
@@ -434,6 +462,7 @@ def build_rif_level(objects, level_name, texture_paths=None,
                 "adjmdlep": modules.build_adjmdlep(
                     module_neighbours.get(i, []), module_origins),
                 "modacous": (-1, -1.0, 0),
+                "waypoints": (waypoints or {}).get(i),
             }
 
         num_vertices = len(obj.data.vertices)
@@ -497,8 +526,11 @@ def build_rif_level(objects, level_name, texture_paths=None,
     env = EnvironmentDataChunk(env_children)
 
     children = [RIFVersionChunk(0)] + shapes + objs
-    if hierarchy:
-        children.append(_build_hierarchy_chunk(hierarchy))
+    # NOTE: the OBJCHIER / OBJHIERD / OBHIERNM chunks are deliberately NOT
+    # written. They appear in ZERO of the 63 retail levels, and emitting them
+    # crashes the game on level load as soon as anything is parented. The
+    # outliner hierarchy is still read for the module visibility graph; it just
+    # does not belong in the file.
     children.append(env)
 
     return GodFatherChunk(children).serialize()
@@ -564,23 +596,39 @@ def _build_hierarchy_node(name, children_of):
 
 
 def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
-                       shape_flags=None):
+                       shape_flags=None, recentre=False):
     """Return a fully assembled REBSHAPE chunk for one mesh.
 
     shape_flags : SHPHEAD1.flags value; defaults to SHAPE_FLAGS_DEFAULT.
         Pass SHAPE_FLAG_PRELIT when the shape should read SHPVTINT.
+
+    recentre : shift the vertices so the shape sits around the origin, and
+        publish the shift as chunk.origin_offset. The caller adds that offset
+        to the object's location, which leaves every vertex exactly where it
+        was while putting the shape into the frame the engine expects: retail
+        stores LOCAL vertices and carries the module's position in
+        object_data.location, never world-space vertices with a zero
+        location. With world-space vertices, m_world reads as (0, 0, 0) for
+        every module, so the engine believes each one sits at the origin while
+        its geometry is metres away — which is what makes a module fail to
+        draw.
     """
     if shape_flags is None:
         shape_flags = SHAPE_FLAGS_DEFAULT
 
     verts_int, vert_normals, polys, poly_normals, uv_lists = \
         _extract_geometry(mesh, slot_bitmaps)
+    offset = (0, 0, 0)
+    if recentre:
+        offset = _compute_centre(_compute_bounds(verts_int))
+        verts_int = [(v[0] - offset[0], v[1] - offset[1], v[2] - offset[2])
+                     for v in verts_int]
     bounds = _compute_bounds(verts_int)
     centre = _compute_centre(bounds)
     radius = _compute_radius(verts_int, centre)
     uv_pixels = _uv_to_pixels(uv_lists)
 
-    return ShapeChunk([
+    chunk = ShapeChunk([
         ShapeHeaderChunk(
             flags=shape_flags,
             lock_user=DEFAULT_LOCK_USER,
@@ -601,6 +649,8 @@ def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
         ShapePolygonChunk(polys),
         ShapeUVCoordChunk(uv_pixels),
     ])
+    chunk.origin_offset = offset
+    return chunk
 
 
 def _build_object_chunk(name, location_rif, orientation_rif,
@@ -648,12 +698,22 @@ def _build_object_chunk(name, location_rif, orientation_rif,
 
 
 def _build_module_data(spec):
-    """Build a MODULEDT chunk from a spec dict."""
+    """Build a MODULEDT chunk from a spec dict.
+
+    Children order follows retail: the adjacency list first, then acoustics and
+    the visibility array, with the waypoint volumes last when the module has
+    any. A module with no waypoints gets no WAYPOINT child at all, rather than
+    an empty one — retail ships both shapes, and omitting it keeps a level
+    without navigation identical to before.
+    """
     children = [
         AdjacentModuleEntryPointsChunk(spec.get("adjmdlep", [])),
         ModuleAcousticsChunk(*spec.get("modacous", (-1, -1.0, 0))),
         VModuleArrayChunk(spec.get("vmdarray", [])),
     ]
+    waypoints = spec.get("waypoints")
+    if waypoints:
+        children.append(WaypointChunk(waypoints))
     return ObjectModuleDataChunk(children)
 
 
