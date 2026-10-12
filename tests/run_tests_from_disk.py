@@ -20,7 +20,33 @@ import sys
 import time
 import traceback
 
-TESTS_DIR = r"G:\RIF Exporter\avp_rif_exporter"
+def _project_root():
+    """Return the project root, working under both ways this script is run.
+
+    Run as a file, the root is derived from `__file__`: `tests/` sits inside
+    `avp_rif_exporter/`, which sits in the project root. Run from a Blender Text
+    datablock, `__file__` is a virtual path inside the .blend
+    ("...\\blends\\AvP.blend\\run_tests_from_disk.py.003") and that directory
+    does not exist — the `isdir` check catches it, and `RIF_EXPORTER_ROOT` is
+    consulted before falling back to the working directory.
+
+    Nothing here is machine-specific, so a fresh clone works without editing.
+    """
+    configured = os.environ.get("RIF_EXPORTER_ROOT")
+    if configured and os.path.isdir(configured):
+        return os.path.abspath(configured)
+    here = globals().get("__file__")
+    if here:
+        directory = os.path.dirname(os.path.abspath(here))
+        if os.path.isdir(directory):
+            candidate = os.path.dirname(os.path.dirname(directory))
+            if os.path.isdir(candidate):
+                return candidate
+    return os.getcwd()
+
+
+ROOT = _project_root()
+TESTS_DIR = os.path.join(ROOT, "avp_rif_exporter")
 MODULE = "tests.blender_roundtrip"
 # Where logs are written: the project's own logs folder, NOT the tests folder.
 #
@@ -28,12 +54,7 @@ MODULE = "tests.blender_roundtrip"
 # every run, and the build then shipped all of them — eleven machine-specific
 # files in one build, growing without bound. Keeping them outside the package
 # fixes that at the source rather than filtering it later.
-#
-# This CANNOT be derived from `__file__`. When Blender runs this from a Text
-# datablock, `__file__` is a virtual path inside the .blend
-# ("...\blends\AvP.blend\run_tests_from_disk.py.003"), so the directory does not
-# exist and opening a log there raises FileNotFoundError.
-LOG_DIR = r"G:\RIF Exporter\logs"
+LOG_DIR = os.path.join(ROOT, "logs")
 
 
 def log_path():

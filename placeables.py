@@ -48,10 +48,20 @@ CAT_PLAYER_START = "PLAYER_START"
 CAT_GENERATOR = "GENERATOR"
 CAT_NAVIGATION = "NAVIGATION"
 CAT_GAMEPLAY = "GAMEPLAY"
+CAT_PICKUP = "PICKUP"
+CAT_OBJECT = "OBJECT"
+CAT_SOUND = "SOUND"
+CAT_EFFECTS = "EFFECTS"
+CAT_MORPH = "MORPH"
 
 CATEGORY_LABELS = (
     (CAT_PLAYER_START, "Player Start"),
     (CAT_GENERATOR, "NPC Generator"),
+    (CAT_PICKUP, "Pickups"),
+    (CAT_OBJECT, "Objects"),
+    (CAT_SOUND, "Sound"),
+    (CAT_EFFECTS, "Effects"),
+    (CAT_MORPH, "Morphs"),
     (CAT_NAVIGATION, "Navigation"),
     (CAT_GAMEPLAY, "Gameplay"),
 )
@@ -65,6 +75,15 @@ KIND_WEIGHTED = "WEIGHTED"
 KIND_WAYPOINT = "WAYPOINT"
 KIND_PATROL_PATH = "PATROL_PATH"
 KIND_GLOBAL_GENERATOR = "GLOBAL_GENERATOR"
+# A placed object carrying an AVPSTRAT strategy: not a module.
+KIND_PICKUP = "PICKUP"
+# Scenery and lights: same strategy 62, same placed-object path, a
+# different INANIMATEOBJECT_TYPE.
+KIND_OBJECT = "OBJECT"
+# Entries that exist so the menu is complete and the shape of the tool is
+# visible, but write nothing yet. They are reported as unsupported on
+# export rather than dropped in silence.
+KIND_PLACEHOLDER = "PLACEHOLDER"
 
 # Empty display type per kind: a generator is a point, a waypoint is a volume.
 DISPLAY_BY_KIND = {
@@ -115,6 +134,40 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         default=1,
         min=0,
         max=9,
+    )
+    object_mass: bpy.props.IntProperty(
+        name="Mass",
+        description=(
+            "SimpleStrategy.mass in grams. Retail uses 50 for pickups and "
+            "40-2000 for furniture; 0 for scenery that cannot be moved"),
+        default=50,
+        min=0,
+        max=1000000,
+    )
+    object_integrity: bpy.props.IntProperty(
+        name="Integrity",
+        description=(
+            "SimpleStrategy.integrity, roughly 0-21. The top bit is a spares "
+            "marker and is added automatically, so the value shown here is the "
+            "real one"),
+        default=2,
+        min=0,
+        max=1000,
+    )
+    object_heavy: bpy.props.BoolProperty(
+        name="Too heavy to move",
+        description=(
+            "Sets flag 0x10. Retail uses it on furniture of 1000 g and above"),
+        default=False,
+    )
+    pickup_type: bpy.props.IntProperty(
+        name="Category",
+        description=(
+            "INANIMATEOBJECT_TYPE written to AVPSTRAT. Set by the menu entry "
+            "that created this object; 2 weapon, 3 ammo, 4 health, 5 armour, "
+            "15 field charge"),
+        default=0,
+        min=0,
     )
     sub_type: bpy.props.IntProperty(
         name="Weapon / Variant",
@@ -298,7 +351,8 @@ class _PlaceableSpec:
     """One menu entry: identity, placement, and the properties it presets."""
 
     def __init__(self, key, label, description, icon, category, kind,
-                 npc_type=0, display=None, flags=None, legacy_marker=None):
+                 npc_type=0, display=None, flags=None, legacy_marker=None,
+                 pickup_type=None):
         self.key = key
         self.label = label
         self.description = description
@@ -306,6 +360,7 @@ class _PlaceableSpec:
         self.category = category
         self.kind = kind
         self.npc_type = npc_type
+        self.pickup_type = pickup_type
         self.display = display or DISPLAY_BY_KIND.get(kind, "PLAIN_AXES")
         self.flags = dict(flags or {})
         # Set on objects the existing export path finds by marker rather than
@@ -426,6 +481,165 @@ PLACEABLES = (
             "limit, spawns per minute, and the hive state change time. Placing "
             "a second one is a mistake - the game reads a single chunk."),
         "EMPTY_AXIS", CAT_GAMEPLAY, KIND_GLOBAL_GENERATOR),
+    _PlaceableSpec(
+        "pickup_weapon", "Weapon  (choose none)", (
+            "Placeholder entry kept for the category; use one of the specific "
+            "weapons below, which preset the sub_type"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
+        flags={"sub_type": 0}),
+    _PlaceableSpec(
+        "pickup_weapon_pulserifle", "Weapon: Pulse Rifle", (
+            "IOT_Weapon (2), sub_type 0. Only the eight marine weapons "
+            "appear in retail - the Predator and Alien start armed, so no "
+            "level places a pickup for them"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
+        flags={"sub_type": 0}),
+    _PlaceableSpec(
+        "pickup_weapon_smartgun", "Weapon: Smartgun", (
+            "IOT_Weapon (2), sub_type 2. Only the eight marine weapons "
+            "appear in retail - the Predator and Alien start armed, so no "
+            "level places a pickup for them"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
+        flags={"sub_type": 2}),
+    _PlaceableSpec(
+        "pickup_weapon_flamethrower", "Weapon: Flamethrower", (
+            "IOT_Weapon (2), sub_type 3. Only the eight marine weapons "
+            "appear in retail - the Predator and Alien start armed, so no "
+            "level places a pickup for them"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
+        flags={"sub_type": 3}),
+    _PlaceableSpec(
+        "pickup_weapon_sadar", "Weapon: SADAR", (
+            "IOT_Weapon (2), sub_type 5. Only the eight marine weapons "
+            "appear in retail - the Predator and Alien start armed, so no "
+            "level places a pickup for them"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
+        flags={"sub_type": 5}),
+    _PlaceableSpec(
+        "pickup_weapon_grenadelauncher", "Weapon: Grenade Launcher", (
+            "IOT_Weapon (2), sub_type 6. Only the eight marine weapons "
+            "appear in retail - the Predator and Alien start armed, so no "
+            "level places a pickup for them"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
+        flags={"sub_type": 6}),
+    _PlaceableSpec(
+        "pickup_weapon_minigun", "Weapon: Minigun", (
+            "IOT_Weapon (2), sub_type 7. Only the eight marine weapons "
+            "appear in retail - the Predator and Alien start armed, so no "
+            "level places a pickup for them"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
+        flags={"sub_type": 7}),
+    _PlaceableSpec(
+        "pickup_weapon_marinepistol", "Weapon: Marine Pistol", (
+            "IOT_Weapon (2), sub_type 22. Only the eight marine weapons "
+            "appear in retail - the Predator and Alien start armed, so no "
+            "level places a pickup for them"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
+        flags={"sub_type": 22}),
+    _PlaceableSpec(
+        "pickup_weapon_frisbee", "Weapon: Frisbee Launcher", (
+            "IOT_Weapon (2), sub_type 23. Only the eight marine weapons "
+            "appear in retail - the Predator and Alien start armed, so no "
+            "level places a pickup for them"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
+        flags={"sub_type": 23}),
+    _PlaceableSpec(
+        "pickup_ammo_10mm", "Ammo: 10mm Ammo", (
+            "IOT_Ammo (3), sub_type 0. 10mm rounds, the commonest ammo retail places"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
+        flags={"sub_type": 0}),
+    _PlaceableSpec(
+        "pickup_ammo_smartgun", "Ammo: Smartgun Ammo", (
+            "IOT_Ammo (3), sub_type 2. Smartgun rounds for the smartgun"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
+        flags={"sub_type": 2}),
+    _PlaceableSpec(
+        "pickup_ammo_flamethrower", "Ammo: Flamethrower Fuel", (
+            "IOT_Ammo (3), sub_type 3. Fuel canisters for the flamethrower"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
+        flags={"sub_type": 3}),
+    _PlaceableSpec(
+        "pickup_ammo_sadar", "Ammo: SADAR Rockets", (
+            "IOT_Ammo (3), sub_type 5. Rockets for the SADAR launcher"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
+        flags={"sub_type": 5}),
+    _PlaceableSpec(
+        "pickup_ammo_grenade", "Ammo: Grenades", (
+            "IOT_Ammo (3), sub_type 6. Grenades for the grenade launcher"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
+        flags={"sub_type": 6}),
+    _PlaceableSpec(
+        "pickup_ammo_minigun", "Ammo: Minigun Ammo", (
+            "IOT_Ammo (3), sub_type 7. Minigun rounds for the minigun"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
+        flags={"sub_type": 7}),
+    _PlaceableSpec(
+        "pickup_ammo_pulsegrenade", "Ammo: Pulse Grenades", (
+            "IOT_Ammo (3), sub_type 8. Pulse grenades for the pulse rifle"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
+        flags={"sub_type": 8}),
+    _PlaceableSpec(
+        "pickup_health", "Medkit", (
+            "IOT_Health (4). sub_type is always 0 in retail - the category "
+            "holds a single item"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=4),
+    _PlaceableSpec(
+        "pickup_armour", "Armour", (
+            "IOT_Armour (5). sub_type is always 0 in retail"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=5),
+    _PlaceableSpec(
+        "pickup_fieldcharge", "Energy Orb", (
+            "IOT_FieldCharge (15) - the Predator's energy pickup. sub_type is "
+            "always 0 in retail"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=15),
+    _PlaceableSpec(
+        "object_static", "Static", (
+            "IOT_Static (0). Scenery the player cannot interact with: tanks, "
+            "TVs, grills. 2453 of them in retail, the second largest category. "
+            "Pick the model from the panel"),
+        "MESH_CUBE", CAT_OBJECT, KIND_OBJECT, pickup_type=0),
+    _PlaceableSpec(
+        "object_furniture", "Furniture", (
+            "IOT_Furniture (1). Crates, drums, seats - scenery that can be "
+            "pushed. 922 in retail, mass 40-2000 g"),
+        "MESH_CUBE", CAT_OBJECT, KIND_OBJECT, pickup_type=1),
+    _PlaceableSpec(
+        "object_screen", "Screens", (
+            "IOT_ReservedForJohn (9) despite the placeholder-sounding name: "
+            "the video screens, models screen1, screen2 and so on. 196 in "
+            "retail"),
+        "MESH_CUBE", CAT_OBJECT, KIND_OBJECT, pickup_type=9),
+    _PlaceableSpec(
+        "object_light", "Lights", (
+            "Placed light objects, 2846 in retail - the largest category, all "
+            "named light*. They need a PLOBJLIT chunk, which is not written "
+            "yet, so for now a light here is scenery with no glow"),
+        "MESH_CUBE", CAT_OBJECT, KIND_OBJECT, pickup_type=16),
+    _PlaceableSpec(
+        "placeholder_sound", "Sound", (
+            "NOT IMPLEMENTED. A sound emitter - retail writes SOUNDOB2 with an "
+            "inner radius at full volume and an outer radius at zero, wired "
+            "into the strategy system. Placing one exports nothing yet"),
+        "MESH_UVSPHERE", CAT_SOUND, KIND_PLACEHOLDER),
+    _PlaceableSpec(
+        "placeholder_effect", "Particle Effect", (
+            "NOT IMPLEMENTED. One of the game's own particle systems, such as "
+            "sparks or smoke, attached to a point in the level. Placing one "
+            "exports nothing yet"),
+        "MESH_UVSPHERE", CAT_EFFECTS, KIND_PLACEHOLDER),
+    _PlaceableSpec(
+        "placeholder_morph", "Morph", (
+            "NOT IMPLEMENTED. Geometry that moves or changes shape: doors, "
+            "lifts, fans, platforms. Twelve retail strategies cover these "
+            "(StratDoor 50, StratTrack 72, StratFan 75, StratPlatLift 54 and "
+            "others), each with its own chunk layout. Placing one exports "
+            "nothing yet"),
+        "MESH_CUBE", CAT_MORPH, KIND_PLACEHOLDER),
+    _PlaceableSpec(
+        "pickup_security", "Security Pass", (
+            "IOT_SpecialPickupObject (13). Models bypass and secpass01. Only "
+            "two in retail, but a working pickup"),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=13),
 )
 
 
@@ -490,7 +704,21 @@ def _make_operator(spec):
         empty it still has a real `bound_box`, so the exported size needs no
         guesswork about how Blender interprets a display size.
         """
-        if spec.kind == KIND_WAYPOINT:
+        if spec.kind in (KIND_PICKUP, KIND_OBJECT):
+            # A pickup is a placed object with its own REBSHAPE, so it has to
+            # be a mesh. A small cube stands in until the artist swaps in the
+            # real model; the dimensions here are only a placement aid and are
+            # not written to the strategy, which carries no size.
+            mesh = bpy.data.meshes.new("Pickup")
+            verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1)
+                     for z in (-1, 1)]
+            faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
+                     (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+            mesh.from_pydata(verts, [], faces)
+            mesh.update()
+            obj = bpy.data.objects.new(spec.label.split("  (")[0], mesh)
+            obj.scale = (0.15, 0.15, 0.15)
+        elif spec.kind == KIND_WAYPOINT:
             mesh = bpy.data.meshes.new("Waypoint")
             verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1)
                      for z in (-1, 1)]
@@ -512,6 +740,8 @@ def _make_operator(spec):
             obj[MARKER_PROP] = spec.legacy_marker
         obj.rif_placeable.kind = spec.kind
         obj.rif_placeable.npc_type = spec.npc_type
+        if spec.pickup_type is not None:
+            obj.rif_placeable.pickup_type = spec.pickup_type
         for key, value in spec.flags.items():
             setattr(obj.rif_placeable, key, value)
         context.collection.objects.link(obj)
@@ -650,6 +880,16 @@ class RIF_PT_placeable(bpy.types.Panel):
             box = layout.box()
             box.label(text="Volume: use position and scale", icon="CUBE")
             box.prop(settings, "can_crawl")
+
+        if kind in (KIND_PICKUP, KIND_OBJECT):
+            # The fields SimpleStrategy carries that nothing exposed until now.
+            box = layout.box()
+            box.label(text="Placed object", icon="CUBE")
+            if kind == KIND_PICKUP:
+                box.prop(settings, "sub_type")
+            box.prop(settings, "object_mass")
+            box.prop(settings, "object_integrity")
+            box.prop(settings, "object_heavy")
 
         if kind == KIND_PATROL_PATH:
             layout.prop(settings, "patrol_closed")

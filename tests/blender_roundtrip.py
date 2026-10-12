@@ -2657,7 +2657,9 @@ def test_validator_reports_a_single_module_level():
     """One module is the mistake that silently kills every runtime generator.
 
     The engine will not create an NPC while the generator's module is visible,
-    and with a single module everything is always visible.
+    and with a single module everything is always visible. A lone module is also
+    an arrangement retail never uses, which is worth saying without claiming it
+    cannot work.
     """
     operators = load_operators()
     _make_cube("Only")

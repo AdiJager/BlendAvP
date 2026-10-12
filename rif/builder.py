@@ -54,6 +54,7 @@ S6 F9 (ROOT CAUSE — "empty level with Include Prelight on"):
 from math import sqrt
 
 from . import modules
+from .chunks.strategy import AVPStrategyChunk, ObjectProjectDataChunk
 from .chunks.waypoint import WaypointChunk
 from .types import (
     DEFAULT_LOCK_USER, DEFAULT_NOTES,
@@ -168,6 +169,14 @@ POLY_ENGINE_TYPE = 7
 #
 # Every static renderable module in battle.rif uses exactly 0x200.
 OBJ_FLAGS = 0x00000200
+
+# What retail puts on a placed object. Measured across the 63 shipping levels:
+# 4530 objects carry exactly this, and it is the six bits below. `PCLOAD` is not
+# decorative -- `Objsetup.cpp:2278` skips an object without it **silently**, and
+# one of the AVPGAMEMODE bits is likewise required before the object is created
+# at all. All three race bits are set because a pickup is not race-specific in
+# the shipping data.
+PLACED_OBJECT_FLAGS = 0x0000FC00
 OBJ_VERSION_NO = 1
 
 POLY_BITMAP_MASK = 0x00000FFF
@@ -301,7 +310,8 @@ def build_rif_level(objects, level_name, texture_paths=None,
                     shape_flags_override=None,
                     spawns=None,
                     global_generator=None,
-                    waypoints=None) -> bytes:
+                    waypoints=None,
+                    placed_objects=None) -> bytes:
     """Assemble a level RIF: shapes + objects + MODULEDT + REBENVDT.
 
     Composition:
@@ -354,6 +364,20 @@ def build_rif_level(objects, level_name, texture_paths=None,
         that mesh. This is where baked point-light results go: compute them
         with `rif.lighting.bake_for_object` so the values match what the
         engine would have produced itself.
+
+    placed_objects : optional list of dicts, each describing one placed
+        object such as a pickup. Keys:
+            mesh      : the mesh datablock to export as its REBSHAPE
+            name      : object name written to OBJHEAD1
+            location  : (x, y, z) in RIF millimetres
+            orientation : quaternion, already in RIF form
+            strategy  : keyword arguments for `AVPStrategyChunk`
+
+        A placed object gets a shape and an RBOBJECT but **no MODULEDT**: the
+        engine treats it as a thing in the world rather than as space the player
+        walks through, and it is the presence of the group flag that decides
+        that (Projload.cpp:2078). Its shape index continues the module
+        numbering, because the loader resolves shapes through one list.
 
     waypoints : optional {module index: [record, ...]} mapping. Each record
         is `(min, max, centre, flags, links)` in absolute RIF millimetres. A
@@ -485,6 +509,28 @@ def build_rif_level(objects, level_name, texture_paths=None,
             num_vertices=num_vertices,
             module_data=module_data,
             prelight_intensities=prelight,
+        ))
+
+    # ---- placed objects -------------------------------------------------
+    # A pickup is not a module: it carries PLACED_OBJECT_FLAGS and an
+    # OBJPRJDT > AVPSTRAT child, and no MODULEDT at all. Its shape is built
+    # exactly like a module's so the item can be seen in the world.
+    for entry in (placed_objects or []):
+        file_id = len(shapes) + 1
+        bitmap_slots = _resolve_bitmap_indices(entry["mesh"], texture_paths)
+        # Local vertices with the position in location is the retail
+        # convention, so no recentring is wanted here: a pickup is small and
+        # sits where the artist put it.
+        shapes.append(_build_shape_chunk(
+            entry["mesh"], entry["name"], file_id, bitmap_slots,
+        ))
+        objs.append(_build_object_chunk(
+            name=entry["name"],
+            location_rif=entry["location"],
+            orientation_rif=entry["orientation"],
+            index_num=len(objs) + 1,
+            shape_id_no=file_id,
+            strategy=entry["strategy"],
         ))
 
     # ---- environment skeleton (REBENVDT) ----
@@ -655,11 +701,17 @@ def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
 
 def _build_object_chunk(name, location_rif, orientation_rif,
                         index_num, shape_id_no, num_vertices=0,
-                        module_data=None, prelight_intensities=None):
+                        module_data=None, prelight_intensities=None,
+                        strategy=None):
     """Return a fully assembled RBOBJECT chunk.
 
     Children order matches battle.rif:
         OBJHEAD1 → OBINTDT → MODULEDT (opt.) → SHPVTINT (opt.)
+
+    strategy : dict or None. When provided the object is a **placed
+        object** rather than a module: `OBJHEAD1` gets `PLACED_OBJECT_FLAGS`
+        and an `OBJPRJDT > AVPSTRAT` child is emitted instead of `MODULEDT`.
+        Keys are the keyword arguments of `AVPStrategyChunk`.
 
     module_data : dict or None. When provided, a MODULEDT child is
         emitted. Keys:
@@ -673,7 +725,7 @@ def _build_object_chunk(name, location_rif, orientation_rif,
         set or the engine ignores this chunk (see Kshape.c).
     """
     obj_header = ObjectHeaderChunk(
-        flags=OBJ_FLAGS,
+        flags=(PLACED_OBJECT_FLAGS if strategy is not None else OBJ_FLAGS),
         lock_user=DEFAULT_LOCK_USER,
         location=location_rif,
         orientation=orientation_rif,
@@ -688,6 +740,11 @@ def _build_object_chunk(name, location_rif, orientation_rif,
     ]
     if module_data is not None:
         children.append(_build_module_data(module_data))
+    if strategy is not None:
+        # The engine reaches the strategy as
+        # `ob->lookup_single_child("OBJPRJDT")->lookup_single_child("AVPSTRAT")`,
+        # so both levels are needed (Objsetup.cpp:2235).
+        children.append(ObjectProjectDataChunk([AVPStrategyChunk(**strategy)]))
     if prelight_intensities:
         children.append(ShapeVertexIntensitiesChunk(
             light_set_name=DEFAULT_LIGHT_SET,

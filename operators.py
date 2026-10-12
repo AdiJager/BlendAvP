@@ -446,6 +446,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 spawns=spawns,
                 global_generator=_collect_global_generator(context),
                 waypoints=waypoint_specs,
+                placed_objects=_collect_placed_objects(context, objs),
             )
         finally:
             _restore_bitmap_indices(originals)
@@ -771,10 +772,12 @@ def _collect_spawns(context):
             # as skipped would report a working feature as unsupported.
             continue
         elif kind in (placeables.KIND_PLAYER_START_SP,
-                      placeables.KIND_WAYPOINT):
+                      placeables.KIND_WAYPOINT,
+                      placeables.KIND_PICKUP,
+                      placeables.KIND_OBJECT):
             # Handled elsewhere, so not skips: a single-player start
             # becomes AVPSTART, and a waypoint goes into its module
-            # WAYPOINT chunk via _collect_waypoints. Reporting either as
+            # WAYPOINT chunk via _collect_waypoints. Reporting any of them as
             # unsupported would be a lie, and this message has to mean what
             # it says.
             continue
@@ -878,6 +881,50 @@ def _gather_meshes(context, selected_only=False):
               if obj.type == "MESH" and PLACEABLE_PROP not in obj]
     meshes.sort(key=lambda obj: obj.name)
     return meshes
+
+
+def _collect_placed_objects(context, objs):
+    """Return a spec per placed object, such as a pickup.
+
+    A pickup is a **mesh** carrying the placeable marker, and it must not reach
+    the module list: `_gather_meshes` already drops every marked object, which
+    is what keeps it out of the collision system. It still needs a REBSHAPE and
+    an RBOBJECT, so it is gathered here instead and the builder emits it with
+    `PLACED_OBJECT_FLAGS` and an `OBJPRJDT > AVPSTRAT` child.
+
+    The category comes from the menu entry that created the object and the
+    concrete item from `sub_type`, so neither is guessed here.
+    """
+    from .placeables import KIND_OBJECT, KIND_PICKUP, PLACEABLE_PROP
+    from .rif.builder import _convert_orientation
+    from .rif.chunks.strategy import compose_integrity
+
+    specs = []
+    for obj in context.scene.objects:
+        if obj.get(PLACEABLE_PROP) not in (KIND_PICKUP, KIND_OBJECT) \
+                or obj.type != "MESH":
+            continue
+        settings = obj.rif_placeable
+        loc = obj.matrix_world.translation
+        bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
+        _, rotation, _scale = obj.matrix_world.decompose()
+        specs.append({
+            "mesh": obj.data,
+            "name": obj.name,
+            "location": (meters_to_rif(bx), meters_to_rif(by),
+                         meters_to_rif(bz)),
+            "orientation": _convert_orientation(rotation),
+            "strategy": {
+                "type_id": settings.pickup_type,
+                "sub_type": settings.sub_type,
+                # Shown as a plain number in the panel; the spares marker the
+                # format always carries is added here rather than by the artist.
+                "integrity": compose_integrity(settings.object_integrity),
+                "mass": settings.object_mass,
+                "flags": 1 | (0x10 if settings.object_heavy else 0),
+            },
+        })
+    return specs
 
 
 def _waypoint_box(obj):
@@ -1003,7 +1050,10 @@ def _module_layout_problems(objs, hierarchy):
             f"Only one module. The engine will not create an NPC while the "
             f"generator's module is visible, and with a single module every "
             f"generator is always visible — so Mixed Enemy and Default Enemy "
-            f"can never spawn. Split the level into at least two objects")
+            f"can never spawn. A lone module also lists no peers in its "
+            f"VMDARRAY, which no retail level does: the smallest has 14 "
+            f"modules and the median is 190, so this arrangement is untested "
+            f"by the game. Split the level into at least two objects")
         return problems
 
     if not hierarchy:
