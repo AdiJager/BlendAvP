@@ -52,6 +52,11 @@ from ..chunk_writer import Chunk
 WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER = 0x80000000
 # Set by the writer on the first ground waypoint; retail never sets it.
 WAYPOINT_FLAG_FIRST_GROUND_WAYPOINT = 0x40000000
+# Marks a node the alien can use to climb a wall or cross a ceiling.
+# Undocumented in the source, but it is the only flag beyond the two named
+# ones, and retail sets it on 1179 of its 5528 waypoints -- the ones on
+# vertical and overhead surfaces.
+WAYPOINT_FLAG_CAN_CRAWL = 0x00000001
 
 # Bytes of a record before its link array.
 RECORD_HEADER_BYTES = 52

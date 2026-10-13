@@ -29,6 +29,7 @@ property annotations into strings, and Blender registers properties by reading
 the annotation value, so the fields would silently never exist. `operators.py`
 avoids it for the same reason.
 """
+import math
 import bpy
 from bpy.props import (
     BoolProperty, EnumProperty, IntProperty, PointerProperty, StringProperty,
@@ -84,6 +85,8 @@ KIND_OBJECT = "OBJECT"
 # visible, but write nothing yet. They are reported as unsupported on
 # export rather than dropped in silence.
 KIND_PLACEHOLDER = "PLACEHOLDER"
+# A SOUNDOB2 emitter, drawn as a wireframe sphere whose size is its range.
+KIND_SOUND = "SOUND"
 
 # Empty display type per kind: a generator is a point, a waypoint is a volume.
 DISPLAY_BY_KIND = {
@@ -135,6 +138,38 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         min=0,
         max=9,
     )
+    sound_wav: bpy.props.EnumProperty(
+        name="Sound",
+        description=(
+            "File played by this emitter, from the game's own library. The "
+            "list is ordered so the sounds retail uses most are first; type to "
+            "filter it"),
+        # Deferred: the callback is defined below this class.
+        items=lambda self, context: _sound_items(self, context))
+    sound_inner_fraction: bpy.props.FloatProperty(
+        name="Inner",
+        description=(
+            "How much of the sphere is at full volume, as a fraction of its "
+            "radius: 0.25 means the nearest quarter is loud and it fades to "
+            "silence by the edge. Cannot exceed the radius, which is what the "
+            "engine expects"),
+        default=0.25, min=0.0, max=1.0, subtype="FACTOR")
+    sound_volume: bpy.props.IntProperty(
+        name="Volume", description="max_volume, 0 to 127",
+        default=127, min=0, max=127)
+    sound_pitch: bpy.props.IntProperty(
+        name="Pitch",
+        description=(
+            "Pitch shift in 1/1536ths of an octave: 128 units is one semitone"),
+        default=0, min=-100000, max=100000)
+    sound_not_at_start: bpy.props.BoolProperty(
+        name="Not playing at start",
+        description="Sets flag 0x1: the emitter stays silent until triggered",
+        default=False)
+    sound_no_loop: bpy.props.BoolProperty(
+        name="No loop",
+        description="Sets flag 0x2: play once rather than repeating",
+        default=False)
     object_mass: bpy.props.IntProperty(
         name="Mass",
         description=(
@@ -616,11 +651,12 @@ PLACEABLES = (
             "yet, so for now a light here is scenery with no glow"),
         "MESH_CUBE", CAT_OBJECT, KIND_OBJECT, pickup_type=16),
     _PlaceableSpec(
-        "placeholder_sound", "Sound", (
-            "NOT IMPLEMENTED. A sound emitter - retail writes SOUNDOB2 with an "
-            "inner radius at full volume and an outer radius at zero, wired "
-            "into the strategy system. Placing one exports nothing yet"),
-        "MESH_UVSPHERE", CAT_SOUND, KIND_PLACEHOLDER),
+        "sound", "Sound", (
+            "SOUNDOB2: one emitter. inner_range is at full volume, outer_range "
+            "is silence, and the sphere's size shows outer_range. Pick the file "
+            "in the panel - the folder it comes from is the level's Sound "
+            "Directory, set once for the whole level"),
+        "MESH_UVSPHERE", CAT_SOUND, KIND_SOUND),
     _PlaceableSpec(
         "placeholder_effect", "Particle Effect", (
             "NOT IMPLEMENTED. One of the game's own particle systems, such as "
@@ -686,6 +722,52 @@ def _make_waypoint_material():
     return material
 
 
+def _sound_folder_items(_self, context):
+    """Return the env folders as (identifier, label, description).
+
+    Generated from the fastfiles and shipped, so the panel does not have to open
+    109 files to fill a dropdown.
+    """
+    from . import sounds
+
+    # An explicit empty choice, first: an enum with no declared default selects
+    # its first item, which would count as a folder the artist never picked.
+    entries = [(sounds.NONE_CHOICE, "(none)",
+                "Sounds will not resolve without a folder")]
+    folders = sounds.folder_list()
+    if not folders:
+        # No shipped table: the empty entry alone, rather than a folder name
+        # that may not exist on this install.
+        return entries
+    entries.extend((name, name, f"{count} sounds") for name, count in folders)
+    return entries
+
+
+def _sound_items(_self, context):
+    """Return (identifier, label, description) for every sound in the library.
+
+    Blender calls this whenever the list is drawn, so it reads the shipped table
+    rather than scanning the game: the scan takes minutes, the table takes
+    milliseconds. The order is the library's own -- the env catalogue first,
+    then most used -- and the counts stay out of the labels.
+    """
+    from . import sounds
+
+    # First, an explicit empty choice; without one Blender selects the first
+    # sound in the list, which looks like a deliberate choice and is not.
+    entries = [(sounds.NONE_CHOICE, "(none)", "No sound chosen yet")]
+    root = sounds.game_root(context)
+    if not root:
+        return entries + [(sounds.NONE_CHOICE,
+                       "(set the game directory in preferences)", "")]
+    names = sounds.sound_names(root, sounds.directory_of(context))
+    if not names:
+        return entries + [(sounds.NONE_CHOICE,
+                       "(set Sound Directory for this scene)", "")]
+    entries.extend((name, name, f"Play {name}") for name in names)
+    return entries
+
+
 def _make_operator(spec):
     """Build the operator class for one menu entry.
 
@@ -704,7 +786,37 @@ def _make_operator(spec):
         empty it still has a real `bound_box`, so the exported size needs no
         guesswork about how Blender interprets a display size.
         """
-        if spec.kind in (KIND_PICKUP, KIND_OBJECT):
+        if spec.kind == KIND_SOUND:
+            # A sphere reads as "a radius", which is what the object is, so the
+            # mesh is generated rather than fetched from a Blender operator:
+            # that keeps this branch like the others and testable offline.
+            segments, rings = 16, 8
+            verts = []
+            for ring in range(rings + 1):
+                phi = math.pi * ring / rings
+                for seg in range(segments):
+                    theta = 2.0 * math.pi * seg / segments
+                    verts.append((math.sin(phi) * math.cos(theta),
+                                  math.sin(phi) * math.sin(theta),
+                                  math.cos(phi)))
+            faces = []
+            for ring in range(rings):
+                for seg in range(segments):
+                    a = ring * segments + seg
+                    b = ring * segments + (seg + 1) % segments
+                    c = (ring + 1) * segments + (seg + 1) % segments
+                    d = (ring + 1) * segments + seg
+                    faces.append((a, b, c, d))
+            mesh = bpy.data.meshes.new("Sound")
+            mesh.from_pydata(verts, [], faces)
+            mesh.update()
+            obj = bpy.data.objects.new(spec.label.split("  (")[0], mesh)
+            obj.display_type = "WIRE"
+            # 20 m, the commonest reach in retail: the mesh has a radius of one
+            # metre, so the scale in metres is the radius in metres.
+            obj.scale = (20.0, 20.0, 20.0)
+            mesh.materials.append(_make_waypoint_material())
+        elif spec.kind in (KIND_PICKUP, KIND_OBJECT):
             # A pickup is a placed object with its own REBSHAPE, so it has to
             # be a mesh. A small cube stands in until the artist swaps in the
             # real model; the dimensions here are only a placement aid and are
@@ -881,6 +993,24 @@ class RIF_PT_placeable(bpy.types.Panel):
             box.label(text="Volume: use position and scale", icon="CUBE")
             box.prop(settings, "can_crawl")
 
+        if kind == KIND_SOUND:
+            box = layout.box()
+            box.label(text="Sound", icon="SPEAKER")
+            box.prop(settings, "sound_wav", text="")
+            # The radius is the object's size, so it is reported rather than
+            # typed: scale the sphere in the viewport and this follows.
+            scale = obj.matrix_world.to_scale()
+            radius = (abs(scale.x) + abs(scale.y) + abs(scale.z)) / 3.0
+            box.label(text=f"Outer range: {radius * 1000.0:.0f} mm "
+                           f"(the sphere's size)")
+            box.prop(settings, "sound_inner_fraction")
+            box.prop(settings, "sound_volume")
+            box.prop(settings, "sound_pitch")
+            row = box.row(align=True)
+            row.prop(settings, "sound_not_at_start")
+            row.prop(settings, "sound_no_loop")
+            box.operator("object.rif_audition_sound", icon="PLAY")
+
         if kind in (KIND_PICKUP, KIND_OBJECT):
             # The fields SimpleStrategy carries that nothing exposed until now.
             box = layout.box()
@@ -903,11 +1033,47 @@ def menu_draw(self, context):
                     icon="COLLECTION_NEW")
 
 
+class RIF_PT_world_audio(bpy.types.Panel):
+    """Audio settings for the current level, kept on the scene's World.
+
+    The folder belongs to the level rather than to the add-on, and a .blend can
+    hold several scenes, so the World -- which is stored per scene -- is where
+    it goes. The audio itself lives in the game's shared fastfile, so any of the
+    listed folders works and a custom level needs none of its own.
+    """
+
+    bl_label = "Level Audio"
+    bl_idname = "RIF_PT_world_audio"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "world"
+
+    @classmethod
+    def poll(cls, context):
+        """Only meaningful once the scene has a World to store it on."""
+        return context.scene.world is not None
+
+    def draw(self, context):
+        """Draw the folder, and say what happens without one."""
+        from .sounds import SOUND_DIRECTORY_PROP
+
+        layout = self.layout
+        world = context.scene.world
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(world, SOUND_DIRECTORY_PROP)
+        if not getattr(world, SOUND_DIRECTORY_PROP, ""):
+            layout.label(text="Sounds will not resolve without a folder",
+                         icon="ERROR")
+
+
+
 CLASSES = (
     RIF_PlaceableSettings,
     RIF_PT_placeable,
     *PLACEABLE_OPERATORS.values(),
     *CATEGORY_MENUS.values(),
+    RIF_PT_world_audio,
 )
 
 
@@ -915,12 +1081,23 @@ def register_placeables():
     """Register the placeable objects, their menus and their properties."""
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    # The sound folder belongs to the level, and a .blend holds several scenes,
+    # so it lives on the World rather than in the addon preferences.
+    bpy.types.World.rif_sound_directory = bpy.props.EnumProperty(
+        name="Sound Directory",
+        description=(
+            "Folder this level's sounds come from. The audio itself is in the "
+            "shared common.ffl, so any folder works - a level that sets none "
+            "has sounds that cannot resolve"),
+        items=lambda self, context: _sound_folder_items(self, context),
+    )
     bpy.types.Object.rif_placeable = bpy.props.PointerProperty(
         type=RIF_PlaceableSettings)
 
 
 def unregister_placeables():
     """Undo everything register_placeables() did."""
+    del bpy.types.World.rif_sound_directory
     del bpy.types.Object.rif_placeable
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)

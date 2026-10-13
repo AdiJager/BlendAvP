@@ -1,427 +1,325 @@
 # RIF Exporter
 
-A Blender extension that exports a scene to the `.rif` format used by
-**Aliens versus Predator (1999)** — geometry, collisions, lighting, textures,
-multiplayer spawn points and enemy generators.
+A Blender extension that writes `.rif` levels for **Aliens versus Predator
+(1999)**, the original Rebellion game and its *Classic* re-release.
+
+---
+
+## 1. About
+
+### What it does
+
+Build a level in Blender out of ordinary meshes, place the gameplay objects from
+`Add > AvP`, and export a `.rif` the game loads. No external tool sits in the
+middle and nothing needs converting.
 
 | | |
 |---|---|
-| Blender | 4.2.0 or newer |
-| License | GPL-3.0-or-later |
-| Game | Aliens versus Predator Classic (1999) |
+| **Geometry** | any mesh becomes a level module, with collision |
+| **Textures** | read straight out of the game's own archives |
+| **Lighting** | Blender point and spot lamps, plus ambient from the World |
+| **Player starts** | single player and multiplayer, one per player slot |
+| **NPC generators** | eleven kinds, with a spawning budget |
+| **Pickups** | weapons, ammunition, medkit, armour, energy orb, security pass |
+| **Scenery** | static dressing, furniture, video screens, light fittings |
+| **Sound** | emitters with an inner and outer range, auditioned in Blender |
+| **Navigation** | alien waypoints, with the link graph worked out for you |
 
-## Installing and enabling
+### What it does not do
 
-1. `Edit > Preferences > Add-ons > Install...` and point it at the extension
-   package.
-2. Enable **RIF Exporter** in the add-on list.
+Listed plainly, because a missing feature that behaves silently is worse than
+one that announces itself.
 
-## Building the extension package
-
-```
-python tools/build_extension.py
-```
-
-This writes `builds/rif_exporter-<version>.zip`, ready to install. Use
-`--check` to validate without writing anything, `--out DIR` to put the archive
-elsewhere, and `--name NAME` to change its base name.
-
-Blender looks for `blender_manifest.toml` at the **root** of the archive, so a
-zip that wraps everything in a subfolder is rejected as an extension. The tool
-builds a flat archive and verifies that before reporting success.
-
-When Blender is installed the build is delegated to its own
-`blender --command extension build`, which is authoritative. Blender is found
-automatically, including Steam installs; override it with `--blender PATH` or
-the `BLENDER` environment variable. On a machine without Blender the tool falls
-back to a pure-Python build that produces an equivalent archive — pass
-`--no-blender` to force that path.
-
-## Placing AvP gameplay objects
-
-`Object > Add > AvP` holds everything the game needs beyond geometry. The menu
-is grouped **by category first**, so the first choice answers "where does this
-work in the game", not "which chunk is it".
-
-| Category | What it places |
+| | |
 |---|---|
-| **Player Start** | where the player begins: a single-player start, or multiplayer spawn points |
-| **NPC Generator** | where enemies come from — one fixed creature, the level's default, or a chosen mix |
-| **Navigation** | alien waypoints and the patrol paths humans walk |
-| **Gameplay** | the level's global generator settings |
+| **No geometry import** | models from the game cannot be brought in yet, so a pickup placed today is a placeholder cube. The pipeline is ready for a real mesh — it just has to be modelled or imported elsewhere first |
+| **Placed lights cannot be shot out** | `Objects > Lights` gives the fittings retail hangs in a corridor, but the destructible kind — the lamps that go dark when hit — need the `PLOBJLIT` chunk, which is not written yet. Ordinary lighting is unaffected: it comes from Blender lamps and works |
+| **No moving geometry** | doors, lifts, fans and platforms are not supported; the `Morphs` entry is a placeholder |
+| **No particle effects** | the `Effects` entry is a placeholder |
+| **No custom textures** | only the textures already in the game can be used. Adding new ones means writing to the game's own archives, which the game does not take kindly to |
+| **No level import** | a retail `.rif` cannot be opened in Blender |
+| **No single-player missions** | a level can place a player start and enemies, but objectives, triggers, mission scripting and NPC patrols do not exist yet. What can be built today is a **coop or skirmish** map — geometry, lighting, enemies, pickups and sound — and a single-player level only as far as walking around it |
+| **Some sound kinds** | indexed sounds (`INDSOUND`) and sounds attached to moving objects (`TRAKSOUN`) are not written |
 
-### Multiplayer spawn points
+### What is planned
 
-For a deathmatch, coop or skirmish map you place **Multiplayer Spawn** points —
-six is the usual number. Each one has three race toggles in
-`Properties > Object > AvP Placeable`:
+- **Geometry import**, which unblocks models for pickups, scenery and lights
+- **`PLOBJLIT`**, so placed lights can be shot out and go dark like retail's
+- **Doors, lifts and fans** — twelve retail strategies, one at a time
+- **Destroyable objects**, which need little more than a mass and an integrity
+  value on a placed object
+- **Weights for the remaining generator kinds**, for single-player levels
 
-- **Marine** and **Predator** are what skirmish allows. Both on is the most
-  common combination in the shipped levels.
-- **Alien** is off by default. Skirmish forbids the alien player outright, so a
-  spawn that allows *only* the alien can never place anyone. The exporter warns
-  when it sees one.
+---
 
-A single-player **Player Start** is not required on a skirmish map — two thirds
-of the shipped multiplayer levels have none. Place one only if you also want to
-play the level in single player.
+## 2. Installation
 
-### NPC generators
+### Requirements
 
-Three of the generator entries work in a network game: **Alien Drone**,
-**Predalien** and **Praetorian**. The others are marked
-`(single player)` in the menu because the engine refuses to spawn them in
-skirmish or coop — placing them on a network map has no effect.
+- **Blender 4.2 or newer.** Developed against 5.2 LTS.
+- **Aliens versus Predator Classic** installed, for its textures and sounds.
 
-Those three appear as soon as the level loads. The remaining two entries below
-are different in kind: they are *runtime* spawners, and the engine deliberately
-will not create an NPC while the generator's module is visible to the player —
-enemies are meant to arrive from somewhere you cannot see.
+### Installing the extension
 
-A module is one mesh object in the level. **A level built from a single object
-therefore has a single module, and a runtime generator in it will never fire**,
-because the player is standing inside the only module there is. To use them,
-split the level into at least two separate objects and place the generator where
-the player cannot see it.
+1. Download `rif_exporter-<version>.zip`.
+2. In Blender: **`Edit > Preferences > Add-ons`**, then the dropdown in the
+   top-right and **`Install from Disk…`**.
+3. Choose the zip. The add-on appears as **RIF Exporter**; tick it.
 
-### The spawning budget
+It installs into Blender's own extensions folder, and updates or removes the
+same way.
 
-A level with generators but no spawning budget stays **empty**, however correct
-the generators are. The exporter adds a budget automatically as soon as the
-level contains any generator that is not a player spawn, so normally there is
-nothing to do. Place **Global Generator Data** when you want to control it:
-the NPC cap, the rate, the acceleration, the hive timing, and which creature
-generators without weights fall back to.
-
-Never place two — the game reads a single one.
-
-### Modules, and why a generator may stay silent
-
-A level is divided into **modules**, one per mesh object. Modules are what the
-game's visibility and AI navigation work in, and those are **two separate
-things**:
-
-- **Sight** — you declare it, by parenting modules to each other in the
-  **Outliner**. A module sees **itself, its parent and its children**.
-- **Travel** — the exporter builds this from geometry. Modules whose boxes meet
-  are linked, so NPCs can walk between them. Modules touching only along an edge
-  or a corner are not linked, so NPCs cannot path through a wall.
-
-**Parenting is the visibility graph.** One drag in the Outliner links two spaces
-both ways, which is the usual case — "these two rooms are connected".
-
-A corridor of rooms is a tree. The middle room is the parent:
+### Building it yourself
 
 ```
-Red
- ├── Green
- └── Vent_01
-      └── Vent_02
+blender --command extension build --source-dir avp_rif_exporter
 ```
 
-`Red` sees `Green` and `Vent_01`; `Vent_01` also sees `Vent_02`. If you want
-`Red` to see straight down the shaft into `Vent_02`, parent `Vent_02` to `Red`.
-
-> **A module with no parent and no children renders on its own.** You will see
-> only the room you are standing in. The exporter warns when a level has several
-> modules and nothing linked, because that is easy to miss.
-
-#### Hiding a generator
-
-The game deliberately **will not create an NPC while the generator's module is
-visible**. Enemies are meant to arrive from somewhere you cannot see.
-
-So a runtime generator — **Mixed Enemy** or **Default Enemy** — only fires in a
-module nothing links to. **Leave that module out of the tree** and it is
-invisible from everywhere:
+or use the bundled helper, which also validates the result:
 
 ```
-Red
- ├── Green
- └── Vent_01          <- the way in
-Vent_02               <- unlinked: generator here
+python avp_rif_exporter/tools/build_extension.py
 ```
 
-There is no checkbox for this, and that is on purpose: what makes a generator
-work is the same thing that stops the module being drawn, so a hidden room is
-hidden from the eye too. Keep the generator's module somewhere the player
-genuinely cannot see — around a corner, or behind the module they can see — and
-its absence will not be noticeable.
+### Pointing at the game
 
-A level built from a single object has a single module, so anything in it is
-always visible and no runtime generator can ever fire. Split such a level into
-at least two objects.
+Texture and sound loading both read from your game install, so tell the add-on
+where it is. In **`Edit > Preferences > Add-ons > RIF Exporter`**, set **Game
+Directory** to the folder containing `avp_rifs` and `fastfile`.
 
-Fixed generators — **Alien Drone**, **Predalien**, **Praetorian** — are not
-affected by any of this. They are created when the level loads, which is why
-they work anywhere.
+### The settings in full
 
-## Where the **RIF Light** panel is
+Everything lives in **`Edit > Preferences > Add-ons > RIF Exporter`**.
 
-Light settings that Blender has no equivalent for — reach in game units, a
-brightness multiplier, viewport preview — live **on the light object, not in the
-export dialog**. To find them:
-
-1. In the viewport, **select a light object** (Point or Spot).
-2. Open the **Properties** editor and the **Object** tab — the first icon in the
-   vertical bar on the left (an orange square).
-3. The **RIF Light** panel is at the top of the panel stack.
-
-The panel appears **only for Point/Spot lights**. With a mesh, camera or Sun
-selected it is absent, which is expected.
-
-> Cannot find the lights in your scene? `Object > Debug > Select RIF Lights`
-> selects them all and reports how many there are.
-
-## What the panel contains
-
-| Field | Meaning |
+| | |
 |---|---|
-| **Reach (m)** | how far the light reaches; `0` = the 25 m default |
-| **Brightness Scale** | a game-only multiplier on power; `0`/`1` = unchanged |
-| **Show Reach in Viewport** | draws the light's reach in the viewport |
+| **Game Directory** | the folder holding `avp_rifs` and `fastfile` |
+| **Pack Images Into .blend** | store the converted textures inside the .blend. On, the file is self-contained but larger; off, it references the `.png` files under the game directory and only opens on a machine that has them |
+| **Load Game Textures** | the main button: unpacks the archives, converts them and builds the blender material library |
+| **Build Texture Gallery** | makes a scene showing every imported texture, for finding one by eye |
+| **Clear Texture Library** | removes the imported materials, for starting over |
 
-Below that the panel reports **live** what the exporter will write:
+Below them the panel reports **Materials in library**, so you can see whether
+the import has happened.
 
-```
-Power: 500 W
-Engine brightness: 46592
-```
+**Nothing else needs setting up.** With the game directory wrong or unset the
+exporter still writes geometry — you simply get no textures and no sound list.
 
-If the light has hit the ceiling you will see the warning
-`At the ceiling - raise Reach or lower Power`.
+### What the import costs
 
-## Reach visualisation
+**Load Game Textures is slow, and that is expected.** The game keeps 1028
+textures inside 58 compressed archives; the add-on unpacks every one, converts
+it to `.png` and builds a material for it. **On a first run this takes several
+minutes**, and the progress bar moves in fits because each archive is a single
+step. Let it finish — interrupting part-way leaves a partial library, and
+**Clear Texture Library** then starts you clean.
 
-With **Show Reach in Viewport** enabled, each light draws its own zone in the
-viewport:
+**Blender will also stutter, and may freeze for a few seconds at a time.** That
+is shader compilation: each new material has to be compiled before it can be
+drawn, and the first time you look at a texture, or scroll through the gallery,
+Blender does that work on the spot. **It settles as you use the library** — the
+second pass over the same materials is smooth. It is not a sign that anything is
+wrong, and nothing is lost by waiting.
 
-- **Point** — a wireframe sphere: the full reach plus rings at 2/3 and 1/3, so
-  you can see which zone a wall falls into;
-- **Spot** — a cone at the angle taken from `Spot Size`.
+---
 
-The selected light draws clearly, the rest faintly.
+## 3. The `Add > AvP` menu
 
-## When the reach does not appear
+Every gameplay object is placed from `Add > AvP`, in nine categories.
 
-Blender **swallows errors raised while drawing in the viewport** — a crash looks
-exactly like the preview simply being switched off. That is why there is a
-diagnostic tool:
+### Player Start — 2 entries
 
-**`Object > Debug > Diagnose RIF Reach Overlay`**
+- **Single Player** — where the player begins. One per level.
+- **Multiplayer Spawn** — one per player slot, with the races it accepts.
 
-It prints to the console (`Window > Toggle System Console`) and to the UI:
+A level wants one or the other. A level with no start still loads, but drops the
+player at the world origin.
 
-- whether the preview is registered at all,
-- how many lights are in the active view layer,
-- which lights qualify for drawing — with their `range_m` and `show_reach`,
-- **the last drawing error**, if there was one.
+**The start marker is all the single-player support there is.** It puts the
+player in the level; the mission around them — objectives, triggers, patrols —
+is not implemented, so build coop or skirmish maps for now.
 
-Check two things first:
+### NPC Generator — 11 entries
 
-1. **`Reach` is non-zero.** `Reach = 0` means "use the 25 m default" and does
-   draw, but if you set a very small reach the circle may be smaller than you
-   expect — zoom out.
-2. **`Show Reach in Viewport` is on** *for that light* — this is a per-object
-   setting, not a global one.
+Nine fixed creatures (**Alien Drone, Predalien, Praetorian, Predator,
+Facehugger, Xenoborg, Queen, Marine, Sentry Turret**), plus **Default Enemy
+Generator** and **Mixed Enemy Generator**.
 
-## Textures from the game
+The two generic ones draw on the level's spawning budget, which lives in
+**Global Generator Data** — see *Gameplay* below. A generator only produces
+enemies while its own module is **not** visible to the player, which is what
+makes the level's module layout matter.
 
-The game keeps its textures in the compressed archives `Tex1.FFL`…`Tex58.FFL`
-(1028 `.RIM` files). The extension can unpack them, convert them to `.png` and
-build a **material library** ready to use on your levels.
+### Pickups — 20 entries
 
-### Pointing at the game directory
+Eight marine weapons, seven kinds of ammunition, the **Medkit**, **Armour**,
+**Energy Orb** and **Security Pass**.
 
-1. `Edit > Preferences > Add-ons`, find **RIF Exporter** and expand the arrow
-   next to its name (this opens the extension's settings).
-2. In **Game Directory**, point at the game folder — the one containing the
-   `fastfile` and `avp_rifs` subfolders.
+Only the marine's weapons exist as pickups: the Predator and the alien begin
+armed, so no retail level places one for them.
 
-### Load Game Textures
+### Objects — 4 entries
 
-The **Load Game Textures** button does everything in sequence:
+Scenery, in the four kinds the game distinguishes: **Static** (tanks, grills),
+**Furniture** (crates, drums, seats), **Screens** and **Lights**.
 
-1. reads the archives `Tex1.FFL`…`Tex58.FFL` (sound archives are skipped),
-2. unpacks them to `<game directory>\fastfile\_ffl_unpacked`,
-3. converts each `.RIM` to a `.png` beside it,
-4. creates **one material per texture**.
+`Lights` places the fittings themselves. The destructible behaviour — a lamp
+that goes dark when shot — needs a chunk that is not written yet, so these are
+currently ordinary scenery. Lighting a room is a separate thing, and comes from
+Blender lamps.
 
-The operation runs once and takes a while. It is safe to interrupt and restart —
-whatever is already done is skipped.
+### Sound — 1 entry
 
-### How the materials are named
+One emitter, drawn as a wireframe sphere whose **size is the range**. Scale the
+sphere and the reach follows.
 
-A material's name is the texture's **in-game path**, e.g.
-`Envrnmts\Battle\Cliff04.RIM`. That makes the source level obvious at a glance,
-and the names are unique — 109 file names in the game repeat across directories
-**with different artwork**, so the bare file name would be ambiguous.
+- **Inner** is the part of that sphere at full volume, as a fraction.
+- **Sound** is the file, narrowed to the level's folder, most-used first.
+- **Audition Sound** plays it without leaving Blender.
 
-Every material has **backface culling** enabled, so the preview matches how the
-game draws walls.
+The folder itself is set once per level, in **`Properties > World > Level
+Audio`**.
 
-### The material gallery
+### Effects and Morphs — 1 entry each
 
-The **Build Texture Gallery** button creates a separate scene holding a grid of
-planes, each with a different material. Press `0` to enter camera view and
-browse the whole library. It is the quickest way to find a texture by eye.
+**Placeholders.** They exist so the shape of the tool is visible and so nothing
+is quietly missing. Placing one writes nothing, and the export says so.
 
-**Clear Texture Library** removes the game materials and any unused images, for
-when you want to start over.
+### Navigation — 2 entries
 
-### Assigning textures to walls
+- **Alien Waypoint** — a navigation volume for the aliens.
+- **Patrol Path** — planned; not written yet.
 
-The extension **does not assign textures to geometry** — there is no way to
-predict which texture belongs on which surface. You apply materials yourself,
-as in any other Blender project. On export each material becomes a separate
-entry in the file, so different walls can carry different textures.
+### Gameplay — 1 entry
 
-### What happens without game textures
+**Global Generator Data** — the level's spawning budget: the default enemy, the
+NPC limit, spawns per minute and the hive state change time. **One per level**;
+a second is a mistake.
 
-A material with no game texture still exports — under its own name. If the game
-cannot find that texture, **the walls turn black and stop responding to light**
-(the engine degrades them to unlit polygons). This is the commonest cause of
-"dark geometry", and it is not a lack of lights.
+---
 
-## Where the lighting comes from
+## 4. Quick start
 
-| What | Where in Blender |
-|---|---|
-| ambient light | `World > Color` × `World > Strength` |
-| a lamp's brightness and colour | the light's `Power`, `Color`, `Temperature` |
-| reach | `RIF Light > Reach` |
-| cone | `Spot Size` + `Spot Blend` |
+From an empty scene to a level the game runs.
 
-**Watch out for `World > Strength`.** It is the brightness of the entire
-environment: at `1.0` the level comes out uniformly bright and no light can show
-through. Sensible values for a level are **0.05–0.3**.
+**1. Build the geometry.** Ordinary meshes — a cube is a room. Everything the
+player can walk through must be inside one.
 
-**Watch out for `Power`.** 500 W at 5 m gives a mid grey, and 1000 W already
-reaches the maximum the engine can store. Above that threshold more power stops
-changing anything — `Reach` is the only remaining lever.
+**2. Set the World.** `Properties > World` gives the ambient colour. In the
+**Level Audio** panel there, pick a **Sound Directory** if the level will have
+sound.
 
-## Exporting
+**3. Place the gameplay.** From `Add > AvP`:
 
-`File > Export > Aliens vs Predator RIF`. Three modes:
+- one **Player Start**
+- a **Global Generator Data**, if the level spawns enemies
+- one or more **NPC Generators**
+- any **Pickups**, **Objects** and **Sound** emitters
 
-| Mode | What it writes |
-|---|---|
-| **Single Shape** | one active mesh |
-| **Multi-Object** | every selected mesh, with no environment |
-| **Level Skeleton** | selected meshes plus the level environment (textures, lights, spawns) |
+**3a. Link the modules.** Two rules, and a level misbehaves without either.
 
-`Level Skeleton` is the default, and the one you want for a level. The settings
-are grouped into two sections:
+- **Every module's pivot must sit at `0.0.0`.** The exporter writes each
+  module's position and its geometry separately, and reads the position from the
+  object's origin; a pivot anywhere else moves the geometry away from the
+  collision that is supposed to match it.
+  `Object > Set Origin > Origin to World Origin` fixes an object that has
+  drifted.
+- **Link modules by parenting them.** Select the child first, then the parent,
+  and press **`Ctrl+P`** — or drag one object onto another in the Outliner.
+  This is the visibility graph: a module sees its parent and its children, and
+  nothing else. A module with neither sees only itself, which is how a room is
+  kept hidden until the player opens the door. Parent a room to the corridor it
+  leads off.
 
-**Level**
+**4. Point at the game.** `Edit > Preferences > Add-ons > RIF Exporter > Game
+Directory`, then **Load Game Textures** to bring the game's textures in.
 
-| Field | Notes |
-|---|---|
-| **Mode** | `Level Skeleton` writes the environment; the other two write geometry only |
-| **Level Name** | written into the file and shown in the game's level list, so keep it matching your exported file name. Defaults to `custom`. Shown only in Level mode |
+**5. Texture the walls.** Assign the imported materials as you would any other.
 
-**Advanced** — rarely needed:
+**6. Check before exporting.** **`Object > Debug > Validate Level`** reports
+what the engine will not tolerate. Fixing those here beats deducing them from a
+level that half-works.
 
-| Field | Notes |
-|---|---|
-| **Global Scale** | multiplies every position in the level when the game loads it. Leave at `1.0` |
-| **Use Flags Override** | testing only; leave off |
-| **ShapeFlag_PreLit Override** | testing only; leave off |
+**7. Export.** `File > Export > AvP RIF Level`.
 
-Everything else is taken from the scene: textures from the materials, lights
-from the light objects, spawns and generators from the objects you placed with
-`Add > AvP`, and the spawning budget from a Global Generator Data marker.
+**8. Install it.** Put the `.rif` in the game's **`avp_rifs\custom`** folder.
+That folder is what the game scans, and a file anywhere else is never seen.
 
-The exporter warns rather than failing when something is missing, so watch the
-status line after an export. It reports a level with no player start, a scene
-with no World to supply ambient light, and any AvP object it could not export.
+### The `(c)` in the filename
+
+A **coop** level is recognised by a lowercase **`(c)`** before the extension —
+`mylevel(c).rif`. Add it for a coop map. A **skirmish** map is found by being in
+`avp_rifs\custom` alone and needs no marker.
 
 ### About Global Scale
 
-This setting writes the `ENVSDSCL` chunk, a **level-wide scale multiplier**: the
-loader does `local_scale = GlobalScale * ENVSDSCL.scale`, so it scales geometry
-placement, generators, waypoints and lights together.
+Under *Advanced* in the export panel. It rescales the whole level on the way
+out; leave it at **1.0** unless you are matching an existing map's proportions.
 
-At `1.0` **no chunk is written at all**, which is what 58 of the 63 retail levels
-do — multiplying by one is what the chunk's absence already means. Retail uses
-`0.8` and `0.9` in the five levels that scale.
+---
 
-It is useful for fitting a level that was built at the wrong size onto the
-game's expectations without rebuilding the geometry. It is not a substitute for
-building at the right scale: the engine's own positions, speeds and ranges are
-not scaled with it.
+## 5. Common mistakes
 
-Textures come **from the materials** — there is no `Texture Override` field any
-more. Each material carries its own in-game texture name, so different walls can
-have different textures with no extra setup.
+Each of these produces a level that loads and then misbehaves, which is why they
+are worth reading before the first export rather than after.
 
-## Getting the level into the game
+| What you see | What it is |
+|---|---|
+| **The level loads but nothing spawns** | A generator only works while its module is hidden from the player. With a single module, or a layout where the generator's room is always in view, it never fires |
+| **Nothing spawns, and the budget looks fine** | `NPCs per Minute` set to **0** in Global Generator Data switches the whole generator system off, silently. Three retail levels do this on purpose |
+| **The game crashes on load** | Two modules overlap. The engine assumes level space is divided, not shared, and overlapping volumes break it. Run **`Object > Debug > Validate Level`**, which reports every overlapping pair |
+| **Geometry sits away from where it should collide** | The module's pivot is not at `0.0.0`. The position is read from the object's origin, so a moved pivot moves the collision with it |
+| **A room is visible from across the level** | It is not parented into the visibility graph, and a module with no parent and no children sees only itself — which is right for a sealed room and wrong for an open one |
+| **The player falls through the floor** | The mesh is not inside a module, or the level has one module and it is not where the player stands |
+| **A pickup does nothing when touched** | Check it is not the placeholder cube buried inside a wall |
+| **Sounds are silent** | **Sound Directory** is unset in `Properties > World > Level Audio`. Audio is addressed as folder plus file name, so without a folder none of it resolves |
+| **A sound is audible only at one point** | The emitter's sphere has been scaled to nothing. Its size *is* the range |
+| **The level does not appear in the game** | The file is not in `avp_rifs\custom`, which is the only folder the game scans |
+| **Walls are untextured** | The materials were never assigned, or the game directory is unset so nothing could be imported |
+| **A material is named `…something.RIM`** | Its name is longer than the game can store; shorten it |
+| **The light is as bright as it will go** | The engine's brightness ceiling. Past it, more Power changes nothing |
 
-Put the exported file in `<game directory>\avp_rifs\custom\`.
+---
 
-**The file name decides which list the level appears on.** A custom level shows
-up under coop and skirmish only if its name contains a **lowercase `(c)`** —
-for example `MyMap(c).rif`. Without it the level is treated as a deathmatch map.
-The check is case-sensitive, so `(C)` and `(Custom)` do not count.
+## 6. Credits and links
 
-## Before you launch the game
+### The game
 
-Check the file with the validator — it catches the mistakes that show up in the
-game as an empty level with no message at all:
+**Aliens versus Predator** and its *Classic* re-release are the work of
+**Rebellion Developments** and **20th Century Fox**. This tool writes files for
+that game; it contains none of its assets, and using it requires your own
+licensed copy.
 
-```
-python tools/validate_level.py --game "<game directory>" <exported>.rif
-```
+### Standing on other people's work
 
-Supplying the game directory (`--game`, or the `AVP_GAME_DIR` environment
-variable) enables **the most important check**: the validator compares every
-texture name in `BMPNAMES` against the game's real archives and says plainly
-when one is missing.
+- **The AvP Modding Tools Bible** — the manual for Rebellion's original editor
+  suite. It documents the engine's architecture, and reading it first saved days
+  of guessing.
+- **The AvP modding community**, for keeping a twenty-five-year-old game
+  editable.
 
-That matters because **an unresolved texture does not merely lose its image** —
-the engine turns that wall into an unlit one and stops drawing it. A level where
-every texture is unresolved looks like empty space even though collisions work.
-Look for the line:
+### This extension
 
-```
-note    all 15/15 BMPNAMES names exist in the game's archives
-```
+- **AdiJager** — research and testing
+- **DeepSeek** — reverse engineering and coding
 
-or the warning `... are not in the game's archives`, which names the culprit.
+### The repository
 
-## Common problems
+<https://github.com/AdiJager/BlendAvP>
 
-| Symptom | Cause | What to do |
-|---|---|---|
-| **The level is empty** | a material with no game texture (its name is not in the archives) | run **Load Game Textures** and use materials from the library |
-| **Walls are black and take no light** | an unresolved texture — the engine degrades the wall to unlit | as above; this is not a lack of lights |
-| **Everything is uniformly bright** | `World > Strength` too high | bring it down to 0.05–0.3 |
-| **Everything is black** | no lights and zero ambient | add a lamp or raise `Power` |
-| **Power changes nothing** | the light is at the brightness ceiling | shorten `Reach` |
-| **The RIF Light panel is missing** | the selected object is not a Point/Spot light | select a lamp; `Object > Debug > Select RIF Lights` |
-| **The reach is not drawn** | `Reach = 0`, or `Show Reach in Viewport` is off | set `Reach` and enable the preview |
-| **No enemies appear** | no NPC generator in the level, or generators only of a single-player kind | add an **Alien Drone**, **Predalien** or **Praetorian** generator |
-| **Load Game Textures does nothing** | wrong `Game Directory` | point at the folder containing the `fastfile` subfolder |
-| **A material is named `...something.RIM`** | the name is longer than 63 characters (Blender's limit) | the full name is in the `RIM_PATH` property and export uses that |
-| **One texture did not import** | menu artwork with 11 planes — unsupported | skipped deliberately; not needed for levels |
-| **The tests in Blender show old errors** | the copy inside the `.blend` file is stale | run `tests/run_tests_from_disk.py` (see below) |
+Issues, corrections and pull requests are welcome there.
 
-### Tests inside Blender
+### Thanks
 
-Run the suite headlessly — the quickest way, and the only one suitable for a
-build script, because the process exit code reports failure:
+To the original developers of **Aliens versus Predator**, whose engine is still
+worth writing tools for twenty-five years on.
 
-```
-blender --background --factory-startup --python tests/run_tests_from_disk.py
-```
+---
 
-From inside Blender, open `tests/run_tests_from_disk.py` in the Text Editor and
-press **Run Script** (Alt+P). The script loads the module straight from the
-file, prints the result, and writes a log next to it.
+## 7. Licence
 
-The tests exist in two places: on disk
-(`tests/blender_roundtrip.py`) and as a **copy inside the
-`.blend` file**. The copy is a snapshot — fixes on disk do not change it, so
-running the copy reports errors that have already been fixed. Running the script
-above always measures the code on disk, and prints each loaded module with its
-modification time so a stale copy is visible at a glance.
+**GPL-3.0-or-later.** See `LICENSE`, or
+<https://www.gnu.org/licenses/gpl-3.0.html>.
+
+This matches Blender's own licence, which the extension API expects of add-ons
+distributed through it.

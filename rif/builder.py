@@ -54,6 +54,7 @@ S6 F9 (ROOT CAUSE — "empty level with Include Prelight on"):
 from math import sqrt
 
 from . import modules
+from .chunks.sound import SoundDirectoryChunk, SoundObjectChunk
 from .chunks.strategy import AVPStrategyChunk, ObjectProjectDataChunk
 from .chunks.waypoint import WaypointChunk
 from .types import (
@@ -311,7 +312,9 @@ def build_rif_level(objects, level_name, texture_paths=None,
                     spawns=None,
                     global_generator=None,
                     waypoints=None,
-                    placed_objects=None) -> bytes:
+                    placed_objects=None,
+                    sounds=None,
+                    sound_directory=None) -> bytes:
     """Assemble a level RIF: shapes + objects + MODULEDT + REBENVDT.
 
     Composition:
@@ -364,6 +367,20 @@ def build_rif_level(objects, level_name, texture_paths=None,
         that mesh. This is where baked point-light results go: compute them
         with `rif.lighting.bake_for_object` so the values match what the
         engine would have produced itself.
+
+    sounds : optional list of dicts, one per sound emitter. Keys:
+            position     : (x, y, z) in RIF millimetres
+            wav_name     : the file, resolved against `sound_directory`
+            snd_name     : this level's name for the emitter
+            inner_range  : full volume inside this radius, millimetres
+            outer_range  : silence outside it
+            max_volume   : 0-127
+            pitch, flags, probability
+
+    sound_directory : optional string such as "env\\Temple". Written as a
+        SOUNDDIR chunk beside SPECLOBJ. Retail's values are the level's own
+        folder, and every retail level that places a sound has one, so a level
+        with sounds and no directory is a level whose sounds will not resolve.
 
     placed_objects : optional list of dicts, each describing one placed
         object such as a pickup. Keys:
@@ -548,7 +565,21 @@ def build_rif_level(objects, level_name, texture_paths=None,
         )
     speclobj_children.extend(_build_generators(spawns))
     speclobj_children.extend(_build_generator_extras(spawns))
+    for entry in (sounds or []):
+        speclobj_children.append(SoundObjectChunk(
+            position=entry["position"],
+            wav_name=entry.get("wav_name", ""),
+            snd_name=entry.get("snd_name", ""),
+            inner_range=entry.get("inner_range", 5000),
+            outer_range=entry.get("outer_range", 20000),
+            max_volume=entry.get("max_volume", 127),
+            pitch=entry.get("pitch", 0),
+            flags=entry.get("flags", 0),
+            probability=entry.get("probability", 0),
+        ))
     env_children.append(SpecialObjectsChunk(speclobj_children))
+    if sound_directory:
+        env_children.append(SoundDirectoryChunk(sound_directory))
     data_chunk = _build_global_generator(global_generator, spawns)
     if data_chunk is not None:
         env_children.append(data_chunk)

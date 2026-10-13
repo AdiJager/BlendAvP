@@ -279,7 +279,6 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
     # -------------------------------------------------------- execution
 
     def draw(self, context):
-        """Draw the settings; see `_draw_export_settings` for the layout."""
         _draw_export_settings(self.layout, self)
 
     def execute(self, context):
@@ -353,7 +352,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         hierarchy = {
             o.name: o.parent.name for o in objs if o.parent is not None
         } or None
-        _report_module_links(self, objs, hierarchy)
+        _report_layout(self, context, objs, hierarchy)
 
         originals = _apply_bitmap_indices(objs, bitmap_mapping)
 
@@ -447,6 +446,8 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 global_generator=_collect_global_generator(context),
                 waypoints=waypoint_specs,
                 placed_objects=_collect_placed_objects(context, objs),
+                sounds=_collect_sounds(context),
+                sound_directory=_sound_directory(context),
             )
         finally:
             _restore_bitmap_indices(originals)
@@ -556,6 +557,8 @@ class RIF_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "game_directory")
         layout.prop(self, "keep_packed")
 
+
+
         row = layout.row()
         row.operator(RIF_OT_load_game_textures.bl_idname, icon="FILE_FOLDER")
 
@@ -577,6 +580,16 @@ class RIF_OT_load_game_textures(bpy.types.Operator):
 
     bl_idname = "object.rif_load_game_textures"
     bl_label = "Load Game Textures"
+    bl_description = (
+        "Unpack the game's texture archives into a material library.\n"
+        "\n"
+        "Takes several minutes on a first run: 1028 textures in 58 archives, "
+        "each one unpacked, converted and turned into a material. The progress "
+        "bar moves in fits because each archive is a single step.\n"
+        "\n"
+        "Let it finish. Stopping part-way leaves a partial library, and Clear "
+        "Texture Library then starts you clean."
+    )
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -650,6 +663,13 @@ class RIF_OT_build_texture_gallery(bpy.types.Operator):
 
     bl_idname = "object.rif_build_texture_gallery"
     bl_label = "Build Texture Gallery"
+    bl_description = (
+        "Lay every imported texture out in a scene, for finding one by eye.\n"
+        "\n"
+        "Blender will stutter while scrolling: each material has to be compiled "
+        "before it can be drawn, and that happens the first time a texture is "
+        "looked at. It settles on a second pass - nothing is wrong."
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -679,6 +699,11 @@ class RIF_OT_clear_texture_library(bpy.types.Operator):
 
     bl_idname = "object.rif_clear_texture_library"
     bl_label = "Clear Texture Library"
+    bl_description = (
+        "Remove the imported materials, to start the import over. Use this "
+        "after a run that was interrupted part-way, which leaves a partial "
+        "library behind"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -774,7 +799,8 @@ def _collect_spawns(context):
         elif kind in (placeables.KIND_PLAYER_START_SP,
                       placeables.KIND_WAYPOINT,
                       placeables.KIND_PICKUP,
-                      placeables.KIND_OBJECT):
+                      placeables.KIND_OBJECT,
+                      placeables.KIND_SOUND):
             # Handled elsewhere, so not skips: a single-player start
             # becomes AVPSTART, and a waypoint goes into its module
             # WAYPOINT chunk via _collect_waypoints. Reporting any of them as
@@ -883,6 +909,59 @@ def _gather_meshes(context, selected_only=False):
     return meshes
 
 
+def _sound_directory(context):
+    """Return this scene's Sound Directory, or None.
+
+    Read from the World rather than the addon preferences: one .blend can hold
+    several scenes, and each is a level with its own folder.
+    """
+    from . import sounds
+    return sounds.directory_of(context)
+
+
+def _collect_sounds(context):
+    """Return a spec per sound emitter in the scene.
+
+    `snd_name` comes from the Blender object name and `wav_name` from the
+    panel's chosen file, which is the same split retail uses: one names the
+    emitter in this level, the other names the audio. Keeping them apart means
+    renaming an object never changes what it plays.
+    """
+    from . import sounds
+    from .placeables import KIND_SOUND, PLACEABLE_PROP
+
+    specs = []
+    for obj in context.scene.objects:
+        if obj.get(PLACEABLE_PROP) != KIND_SOUND:
+            continue
+        settings = obj.rif_placeable
+        loc = obj.matrix_world.translation
+        bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
+        flags = ((0x1 if settings.sound_not_at_start else 0)
+                 | (0x2 if settings.sound_no_loop else 0))
+        # The sphere's size is the reach: the mesh has a radius of one metre, so
+        # its scale in metres is the radius in metres. A stretched sphere uses
+        # the mean, and the panel says so.
+        scale = obj.matrix_world.to_scale()
+        radius_m = (abs(scale.x) + abs(scale.y) + abs(scale.z)) / 3.0
+        outer = max(0, int(round(radius_m * 1000.0)))
+        fraction = min(max(settings.sound_inner_fraction, 0.0), 1.0)
+        specs.append({
+            "position": (meters_to_rif(bx), meters_to_rif(by),
+                         meters_to_rif(bz)),
+            "wav_name": ("" if settings.sound_wav == sounds.NONE_CHOICE
+                         else settings.sound_wav or ""),
+            "snd_name": obj.name,
+            "inner_range": int(round(outer * fraction)),
+            "outer_range": outer,
+            "max_volume": settings.sound_volume,
+            "pitch": settings.sound_pitch,
+            "flags": flags,
+            "probability": 0,
+        })
+    return specs
+
+
 def _collect_placed_objects(context, objs):
     """Return a spec per placed object, such as a pickup.
 
@@ -964,7 +1043,8 @@ def _collect_waypoints(context, objs):
     """
     from .placeables import KIND_WAYPOINT, PLACEABLE_PROP
     from .rif import waypoints as rif_waypoints
-    from .rif.chunks.waypoint import WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER
+    from .rif.chunks.waypoint import (
+        WAYPOINT_FLAG_CAN_CRAWL, WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER)
 
     bounds = [(obj.name, _world_box(obj)) for obj in objs]
     bounds = [(name, box) for name, box in bounds if box is not None]
@@ -994,24 +1074,31 @@ def _collect_waypoints(context, objs):
         if owner is None:
             orphaned.append(obj.name)
             continue
-        # Stored in millimetres, absolute, matching the file format.
+        # Stored in millimetres, absolute, matching the file format. The crawl
+        # setting rides along, because the box alone cannot say whether the node
+        # is meant for a wall.
         grouped.setdefault(owner, []).append((
             tuple(int(round(v * 1000.0)) for v in low),
             tuple(int(round(v * 1000.0)) for v in high),
+            bool(obj.rif_placeable.can_crawl),
         ))
 
     specs = {}
     for index, boxes in grouped.items():
-        graph = rif_waypoints.build_graph(boxes)
+        # The graph compares geometry only; the crawl setting is not part of it.
+        graph = rif_waypoints.build_graph([(lo, hi) for lo, hi, _c in boxes])
         links = rif_waypoints.link_entries(graph)
         records = []
-        for position, (low, high) in enumerate(boxes):
+        for position, (low, high, can_crawl) in enumerate(boxes):
             centre = tuple((low[k] + high[k]) // 2 for k in range(3))
             # The centre is placed by the artist, never derived, so the flag
-            # that says so is always set.
-            records.append((low, high, centre,
-                            WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER,
-                            links[position]))
+            # that says so is always set. The crawl flag is the artist's, and
+            # reaching the file is the whole point of the tick box: without it
+            # the bot has no route onto a wall.
+            flags = WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER
+            if can_crawl:
+                flags |= WAYPOINT_FLAG_CAN_CRAWL
+            records.append((low, high, centre, flags, links[position]))
         specs[index] = records
     return specs, orphaned, rotated
 
@@ -1034,6 +1121,61 @@ def _world_box(obj):
         ys.append(world.y)
         zs.append(world.z)
     return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
+
+
+def _sound_layout_problems(context):
+    """Return what is wrong with the scene's sound emitters, worst first.
+
+    `inner_range` must be smaller than `outer_range`: the engine fades from full
+    volume at the inner radius to silence at the outer one, and the shipping data
+    never reverses them. A reversed pair is silent everywhere except at the exact
+    centre, which looks like a broken sound rather than a mistyped number.
+
+    An emitter with no file chosen writes a name the game cannot resolve, and a
+    level with emitters but no Sound Directory resolves none of them, so both are
+    worth saying before the export rather than after a silent level.
+    """
+    from . import placeables
+    from . import sounds
+
+    problems = []
+    emitters = [obj for obj in context.scene.objects
+                if obj.get(placeables.PLACEABLE_PROP)
+                == placeables.KIND_SOUND]
+
+    # The fraction cannot exceed the radius by construction, so this is a
+    # guard against a .blend written when both were typed in by hand.
+    zero_reach = [obj.name for obj in emitters
+                  if (abs(obj.matrix_world.to_scale().x)
+                      + abs(obj.matrix_world.to_scale().y)
+                      + abs(obj.matrix_world.to_scale().z)) / 3.0 <= 0.0]
+    if zero_reach:
+        names = ", ".join(zero_reach[:4])
+        more = "" if len(zero_reach) <= 4 else \
+            f" (+{len(zero_reach) - 4} more)"
+        problems.append(
+            f"Zero-sized sound sphere on: {names}{more}. The sphere's size is "
+            f"the emitter's reach, so a zero-sized one is audible only at an "
+            f"exact point")
+
+    unset = [obj.name for obj in emitters
+             if not obj.rif_placeable.sound_wav
+             or obj.rif_placeable.sound_wav == sounds.NONE_CHOICE]
+    if unset:
+        names = ", ".join(unset[:4])
+        more = "" if len(unset) <= 4 else f" (+{len(unset) - 4} more)"
+        problems.append(
+            f"No sound chosen on: {names}{more}. The emitter is written with an "
+            f"empty file name, which the game cannot resolve")
+
+    if emitters and not sounds.directory_of(context):
+        problems.append(
+            f"{len(emitters)} sound emitter(s) but no Sound Directory for this "
+            f"scene. The audio is addressed as folder plus file name, so "
+            f"without a folder none of them resolve. Set it in Properties > "
+            f"World > Level Audio")
+
+    return problems
 
 
 def _module_layout_problems(objs, hierarchy):
@@ -1097,10 +1239,73 @@ def _module_layout_problems(objs, hierarchy):
     return problems
 
 
-def _report_module_links(operator, objs, hierarchy):
-    """Warn about every module layout problem the engine will not tolerate."""
+def _report_layout(operator, context, objs, hierarchy):
+    """Warn about every layout problem the engine will not tolerate.
+
+    Covers modules and sound emitters both, from the same rule sets the Debug
+    command reads, so the two can never disagree about what is wrong.
+    """
     for problem in _module_layout_problems(objs, hierarchy):
         _report(operator, {"WARNING"}, problem)
+    for problem in _sound_layout_problems(context):
+        _report(operator, {"WARNING"}, problem)
+
+
+class RIF_OT_audition_sound(bpy.types.Operator):
+    """Write the chosen sound to a temporary file and play it."""
+
+    bl_idname = "object.rif_audition_sound"
+    bl_label = "Audition Sound"
+    bl_description = (
+        "Play the sound this emitter uses. The audio is copied straight out of "
+        "the game's fastfile, so nothing needs unpacking first"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        """Offer the button only for a placed sound emitter."""
+        from . import placeables
+        obj = context.active_object
+        return (obj is not None
+                and obj.get(placeables.PLACEABLE_PROP)
+                == placeables.KIND_SOUND)
+
+    def execute(self, context):
+        """Carve the sound out of the library and play it."""
+        from . import sounds
+
+        obj = context.active_object
+        root = sounds.game_root(context)
+        if not root:
+            self.report({"ERROR"},
+                        "Set the game directory in preferences first")
+            return {"CANCELLED"}
+
+        name = obj.rif_placeable.sound_wav
+        if not name or name == sounds.NONE_CHOICE:
+            self.report({"ERROR"}, "No sound chosen for this emitter")
+            return {"CANCELLED"}
+
+        directory = sounds.directory_of(context)
+        if not sounds.carve(root, name, directory):
+            where = f" in {directory}" if directory else ""
+            self.report({"ERROR"},
+                        f"{name} is not in the game's library{where}")
+            return {"CANCELLED"}
+
+        path = sounds.audition(root, name, directory)
+        # Load it into Blender as well as playing it: that works everywhere, and
+        # gives the artist something to scrub when no system player is present.
+        loaded = sounds.load_into_blender(path, name)
+        note = sounds.play(path)
+        if note:
+            self.report({"INFO"}, note)
+        elif loaded:
+            self.report({"INFO"}, f"Playing {name}")
+        else:
+            self.report({"INFO"}, f"Playing {name}")
+        return {"FINISHED"}
 
 
 class RIF_OT_validate_level(bpy.types.Operator):
@@ -1132,6 +1337,7 @@ class RIF_OT_validate_level(bpy.types.Operator):
             o.name: o.parent.name for o in objs if o.parent is not None
         } or None
         problems.extend(_module_layout_problems(objs, hierarchy))
+        problems.extend(_sound_layout_problems(context))
 
         # ---- player start
         player_start = _resolve_player_start(context)
@@ -1579,34 +1785,6 @@ class RIF_PT_light(bpy.types.Panel):
         layout.separator()
     
 
-class RIF_OT_select_lights(bpy.types.Operator):
-    """Select every supported light in the scene, so the panel is reachable."""
-
-    bl_idname = "object.rif_select_lights"
-    bl_label = "Select RIF Lights"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        """Select all POINT and SPOT lights and report how many were found."""
-        count = 0
-        for obj in context.scene.objects:
-            if obj.type != "LIGHT":
-                continue
-            if getattr(obj.data, "type", "") not in ("POINT", "SPOT"):
-                continue
-            obj.select_set(True)
-            count += 1
-        if not count:
-            _report(self, {"WARNING"},
-                        "No POINT or SPOT lights in this scene — RIF Light "
-                        "settings live on those objects")
-            return {"CANCELLED"}
-        _report(self, {"INFO"},
-                    f"Selected {count} light(s); RIF Light is in Object "
-                    "Properties")
-        return {"FINISHED"}
-
-
 class RIF_MT_add_avp(bpy.types.Menu):
     """AvP submenu inside Object > Add."""
 
@@ -1637,7 +1815,6 @@ class RIF_MT_debug_avp(bpy.types.Menu):
 
     def draw(self, context):
         """List the diagnostic helpers for inspecting a scene before export."""
-        self.layout.operator(RIF_OT_select_lights.bl_idname, icon="LIGHT")
         self.layout.operator(RIF_OT_validate_level.bl_idname, icon="CHECKMARK")
 
 
@@ -1667,7 +1844,7 @@ _CLASSES = (
     RIF_OT_load_game_textures,
     RIF_OT_build_texture_gallery,
     RIF_OT_clear_texture_library,
-    RIF_OT_select_lights,
+    RIF_OT_audition_sound,
     RIF_OT_validate_level,
     RIF_MT_add_avp,
     RIF_MT_debug_avp,
