@@ -138,6 +138,69 @@ class AVPStrategyChunk(Chunk):
         return bytes(buf)
 
 
+# StrategyType values from Strachnk.hpp:25/34.
+STRAT_ENEMY = 69
+STRAT_GENERATOR = 79
+
+# Objsetup.cpp:2464 -- what the generator's creatures do.
+MISSION_NONE = 0          # leave the default, MM_Wait_Then_Wander
+MISSION_WANDER = 1
+MISSION_GUARD = 2
+MISSION_NON_COMBATANT = 3
+MISSION_LOCAL_GUARD = 4
+MISSION_PATHFINDER = 5    # follows a patrol route
+
+
+def compose_mission_data(path_id, start_object_index):
+    """Return the packed `ExtraMissionData` for a patrol.
+
+    `Objsetup.cpp:2478` splits it in half: the route id in the low 16 bits and
+    the object index of the starting module in the high 16. The engine then
+    looks that module up in the route's module list to find the step to begin
+    at, and treats a module that is not on the route as an error rather than
+    falling back.
+    """
+    return (int(path_id) & 0xFFFF) | ((int(start_object_index) & 0xFFFF) << 16)
+
+
+class GeneratorStrategyChunk(Chunk):
+    """AVPSTRAT — the strategy of a generator, as a 52-byte record.
+
+    `mission` decides what the spawned creatures do, and `mission_data` carries
+    the route and starting module for `MISSION_PATHFINDER`. `strategy_type`
+    picks the layout, because the two differ -- see the module docstring.
+    """
+
+    identifier = "AVPSTRAT"
+
+    def __init__(self, mission=MISSION_NONE, mission_data=0,
+                 strategy_type=STRAT_ENEMY, type_id=0, extra_data=0):
+        self.mission = int(mission)
+        self.mission_data = int(mission_data)
+        self.strategy_type = int(strategy_type)
+        self.type_id = int(type_id)
+        self.extra_data = int(extra_data)
+
+    def payload(self) -> bytes:
+        """Serialise the record, laying the fields out by strategy type."""
+        buf = bytearray()
+        buf += struct.pack("<2i", 0, 0)                  # index, spare2
+        buf += struct.pack("<i", self.strategy_type)     # +8
+        buf += struct.pack("<i", self.type_id)           # +12 Type
+        buf += struct.pack("<i", self.extra_data)        # +16 ExtraData
+        buf += struct.pack("<i", self.mission)           # +20 MissionType
+
+        if self.strategy_type == STRAT_GENERATOR:
+            buf += struct.pack("<i", self.mission_data)  # +24
+            buf += struct.pack("<6i", *([0] * 6))        # +28..+51
+        else:
+            buf += struct.pack("<i", 0)                  # +24 target_request
+            buf += struct.pack("<Q", 0)                  # +28 DeathTarget
+            buf += struct.pack("<i", self.mission_data)  # +36
+            buf += struct.pack("<3i", *([0] * 3))        # +40..+51
+        return bytes(buf)
+
+
 class ObjectProjectDataChunk(ChunkWithChildren):
     """OBJPRJDT — container for the project-side data of a placed object.
 

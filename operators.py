@@ -405,7 +405,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         _report_bake_quality(self, object_intensities, prelight_colour)
 
         try:
-            spawns, skipped = _collect_spawns(context)
+            spawns, skipped = _collect_spawns(context, objs)
             _report_spawns(self, spawns, skipped)
             _report_player_start(self, player_start, spawns)
             (waypoint_specs, orphaned_waypoints,
@@ -448,6 +448,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 placed_objects=_collect_placed_objects(context, objs),
                 sounds=_collect_sounds(context),
                 sound_directory=_sound_directory(context),
+                paths=_collect_paths(context, objs)[0],
             )
         finally:
             _restore_bitmap_indices(originals)
@@ -734,7 +735,25 @@ def _object_yaw_to_rif(obj):
     return units & (ORIENTATION_UNITS_PER_TURN - 1)
 
 
-def _collect_spawns(context):
+def _module_index_for(obj, objs):
+    """Return the index of the module containing `obj`'s origin, or None.
+
+    The index is the object's position in `objs`, which is the order the builder
+    writes them and therefore the number the engine's `get_object_by_index`
+    expects. A path start is looked up that way, so it has to be that number.
+    """
+    origin = obj.matrix_world.translation
+    for index, candidate in enumerate(objs):
+        box = _world_box(candidate)
+        if box is None:
+            continue
+        low, high = box
+        if all(low[axis] <= origin[axis] <= high[axis] for axis in range(3)):
+            return index
+    return None
+
+
+def _collect_spawns(context, objs=None):
     """Return (generator_specs, skipped) gathered from the scene.
 
     Handles the generator kinds whose chunk is a plain `AVPGENER`:
@@ -821,6 +840,31 @@ def _collect_spawns(context):
             else 0,
             "texture_id": settings.texture_id,
         }
+        mission = int(settings.mission or 0)
+        if mission:
+            spec["mission"] = mission
+        if mission == 5:
+            route = settings.patrol_path
+            routes = sorted(obj.name for obj in context.scene.objects
+                            if obj.get(placeables.PLACEABLE_PROP)
+                            == placeables.KIND_PATROL_PATH)
+            if not route:
+                skipped.append((obj.name,
+                                "patrol with no route chosen"))
+            elif route not in routes:
+                skipped.append((obj.name,
+                                f"route {route!r} is not in the scene"))
+            else:
+                spec["path_id"] = routes.index(route)
+                module = _module_index_for(obj, objs)
+                if module is None:
+                    skipped.append((
+                        obj.name,
+                        "patrol generator is outside every module, so the "
+                        "engine cannot place it on the route"))
+                else:
+                    spec["start_object_index"] = module
+
         if kind in (placeables.KIND_DEFAULT_ENEMY,
                     placeables.KIND_WEIGHTED):
             # The weight table is written even when every value is zero, which
@@ -919,6 +963,105 @@ def _sound_directory(context):
     return sounds.directory_of(context)
 
 
+def _curve_points(obj):
+    """Return a curve object's control points in world metres, in order.
+
+    Works for both curve types: a Bezier has handles and a NURBS or poly curve
+    has plain points. Handles are ignored because the engine's path is a
+    straight line between modules -- there is nothing for a curve to smooth into.
+    """
+    curve = getattr(obj, "data", None)
+    if curve is None or not hasattr(curve, "splines"):
+        return None
+    points = []
+    for spline in curve.splines:
+        if hasattr(spline, "bezier_points") and len(spline.bezier_points):
+            local = [p.co for p in spline.bezier_points]
+        else:
+            local = [p.co for p in spline.points]
+        for point in local:
+            local = Vector((point[0], point[1], point[2]))
+            world = obj.matrix_world @ local
+            points.append((world.x, world.y, world.z))
+    return points
+
+
+def _module_index_at(objs, bounds, position):
+    """Return the index of the module containing a point, or None.
+
+    The index is the position in `objs`, which is the order the builder writes
+    them, so it is the same number the engine's `get_object_by_index` expects.
+    """
+    for index, (_name, box) in enumerate(bounds):
+        if box is None:
+            continue
+        low, high = box
+        if all(low[axis] <= position[axis] <= high[axis] for axis in range(3)):
+            return index
+    return None
+
+
+def _collect_paths(context, objs):
+    """Return (path specs, problems) for every patrol curve in the scene.
+
+    Each spec carries `name`, `path_id`, `flags` and `points`, where a point is
+    `(module_index, location_mm)`. Paths whose points fall outside every module
+    are reported rather than exported with a guessed index, because a wrong
+    index points an NPC at a module it was never meant to walk.
+    """
+    from .placeables import KIND_PATROL_PATH, PLACEABLE_PROP
+    from .rif.chunks.path import PATH_FLAG_BACK_AND_FORTH
+
+    placed = [obj for obj in context.scene.objects
+              if obj.get(PLACEABLE_PROP) == KIND_PATROL_PATH]
+    if not placed:
+        return [], []
+
+    bounds = [(obj.name, _world_box(obj)) for obj in objs]
+    specs = []
+    problems = []
+
+    for slot, obj in enumerate(sorted(placed, key=lambda o: o.name)):
+        points = _curve_points(obj)
+        if not points:
+            problems.append(
+                f"Patrol route {obj.name!r} has no points. The engine has no "
+                f"path to walk, and a route with no modules is an error rather "
+                f"than an empty patrol")
+            continue
+
+        converted = []
+        outside = []
+        for point in points:
+            index = _module_index_at(objs, bounds, point)
+            if index is None:
+                outside.append(point)
+                continue
+            converted.append((index, tuple(int(round(v * 1000.0))
+                                           for v in point)))
+        if outside:
+            problems.append(
+                f"Patrol route {obj.name!r} has {len(outside)} point(s) outside "
+                f"every module. A path is a list of modules, so each point has "
+                f"to lie inside one; the export leaves those points out, which "
+                f"changes the route")
+
+        if not converted:
+            problems.append(
+                f"Patrol route {obj.name!r} has no point inside any module, so "
+                f"there is nothing to write and it is skipped")
+            continue
+
+        specs.append({
+            "name": obj.name,
+            "path_id": slot,
+            "flags": PATH_FLAG_BACK_AND_FORTH,
+            "points": converted,
+        })
+
+    return specs, problems
+
+
 def _collect_sounds(context):
     """Return a spec per sound emitter in the scene.
 
@@ -1010,16 +1153,31 @@ def _waypoint_box(obj):
     """Return ((min), (max)) for a waypoint in world metres, ignoring rotation.
 
     The engine's waypoint is an **axis-aligned box**, so a rotated object has no
-    meaning. Taking the AABB of the rotated cube would export a box far larger
-    than the one on screen — a cube turned to its corner measures 73% more — and
-    the artist would have no way to see why the volumes disagree. The half-extent
-    is the object's scale, because the cube mesh spans -1..1.
+    meaning. The local bounds are used rather than the world AABB for the same
+    reason: a cube turned to its corner measures 73% more once rotated into
+    world space, and the artist would have no way to see why the volumes
+    disagree.
+
+    The size comes from the mesh rather than from `obj.scale`, because
+    `Object > Apply > All Transforms` sets the scale to one and the location to
+    zero, baking both into the vertices. Reading the transform made every
+    applied waypoint collapse to the world origin -- 22 identical boxes with a
+    link between each pair. The mesh's bounds survive that, since that is where
+    the numbers went, and they are what the artist sees on screen either way.
     """
+    corners = [tuple(corner) for corner in obj.bound_box]
+    if not corners:
+        return None
     origin = obj.matrix_world.translation
     scale = obj.scale
-    half = (abs(scale.x), abs(scale.y), abs(scale.z))
-    return ((origin.x - half[0], origin.y - half[1], origin.z - half[2]),
-            (origin.x + half[0], origin.y + half[1], origin.z + half[2]))
+    low = []
+    high = []
+    for axis in range(3):
+        values = [corner[axis] for corner in corners]
+        factor = scale[axis]
+        low.append(origin[axis] + min(values) * factor)
+        high.append(origin[axis] + max(values) * factor)
+    return (tuple(low), tuple(high))
 
 
 def _waypoint_is_rotated(obj):
@@ -1043,8 +1201,7 @@ def _collect_waypoints(context, objs):
     """
     from .placeables import KIND_WAYPOINT, PLACEABLE_PROP
     from .rif import waypoints as rif_waypoints
-    from .rif.chunks.waypoint import (
-        WAYPOINT_FLAG_CAN_CRAWL, WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER)
+    from .rif.chunks.waypoint import WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER
 
     bounds = [(obj.name, _world_box(obj)) for obj in objs]
     bounds = [(name, box) for name, box in bounds if box is not None]
@@ -1080,24 +1237,24 @@ def _collect_waypoints(context, objs):
         grouped.setdefault(owner, []).append((
             tuple(int(round(v * 1000.0)) for v in low),
             tuple(int(round(v * 1000.0)) for v in high),
-            bool(obj.rif_placeable.can_crawl),
+            # The centre is the object's origin: the artist moves it inside a
+            # wall to mark a climb, which is the only way the engine is told to
+            # put an alien on a vertical surface.
+            tuple(int(round(origin[a] * 1000.0)) for a in range(3)),
         ))
 
     specs = {}
     for index, boxes in grouped.items():
         # The graph compares geometry only; the crawl setting is not part of it.
-        graph = rif_waypoints.build_graph([(lo, hi) for lo, hi, _c in boxes])
+        graph = rif_waypoints.build_graph(
+            [(lo, hi) for lo, hi, _o in boxes])
         links = rif_waypoints.link_entries(graph)
         records = []
-        for position, (low, high, can_crawl) in enumerate(boxes):
-            centre = tuple((low[k] + high[k]) // 2 for k in range(3))
-            # The centre is placed by the artist, never derived, so the flag
-            # that says so is always set. The crawl flag is the artist's, and
-            # reaching the file is the whole point of the tick box: without it
-            # the bot has no route onto a wall.
+        for position, (low, high, centre) in enumerate(boxes):
+            # Not the midpoint: see the module docstring. Moving the object
+            # puts the centre wherever the level needs it, and inside a wall is
+            # how a climb is declared.
             flags = WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER
-            if can_crawl:
-                flags |= WAYPOINT_FLAG_CAN_CRAWL
             records.append((low, high, centre, flags, links[position]))
         specs[index] = records
     return specs, orphaned, rotated
@@ -1178,6 +1335,41 @@ def _sound_layout_problems(context):
     return problems
 
 
+def _waypoint_layout_problems(context):
+    """Return what is wrong with the scene's waypoints.
+
+    The one worth catching is an origin that has been zeroed. `centre` is the
+    point a bot walks toward and it is read from the object's location, so
+    `Object > Apply > All Transforms` -- which sets that location to zero --
+    sends every applied waypoint's target to the world origin. The volume still
+    looks correct, because it reads the mesh, so nothing on screen gives it
+    away.
+    """
+    from .placeables import KIND_WAYPOINT, PLACEABLE_PROP
+
+    placed = [obj for obj in context.scene.objects
+              if obj.get(PLACEABLE_PROP) == KIND_WAYPOINT]
+    if not placed:
+        return []
+
+    translation = [obj.matrix_world.translation for obj in placed]
+    at_origin = [obj.name for obj, loc in zip(placed, translation)
+                 if max(abs(v) for v in loc) < 1e-6]
+    # One waypoint genuinely at the origin is possible. Every one of them is an
+    # apply, and nothing else produces that pattern.
+    if len(at_origin) < 2 or len(at_origin) != len(placed):
+        return []
+
+    return [
+        f"All {len(at_origin)} waypoint(s) have their origin at the world "
+        f"origin. The centre -- the point a bot walks toward -- is read from "
+        f"the object's location, so `Object > Apply > All Transforms` has sent "
+        f"every target there. The volumes still look right, which is why this "
+        f"is easy to miss. Undo the apply, or set each origin back with "
+        f"`Object > Set Origin`"
+    ]
+
+
 def _module_layout_problems(objs, hierarchy):
     """Return a list of things wrong with the level's modules, worst first.
 
@@ -1248,6 +1440,8 @@ def _report_layout(operator, context, objs, hierarchy):
     for problem in _module_layout_problems(objs, hierarchy):
         _report(operator, {"WARNING"}, problem)
     for problem in _sound_layout_problems(context):
+        _report(operator, {"WARNING"}, problem)
+    for problem in _waypoint_layout_problems(context):
         _report(operator, {"WARNING"}, problem)
 
 
@@ -1338,10 +1532,11 @@ class RIF_OT_validate_level(bpy.types.Operator):
         } or None
         problems.extend(_module_layout_problems(objs, hierarchy))
         problems.extend(_sound_layout_problems(context))
+        problems.extend(_waypoint_layout_problems(context))
 
         # ---- player start
         player_start = _resolve_player_start(context)
-        spawns, skipped = _collect_spawns(context)
+        spawns, skipped = _collect_spawns(context, objs)
         mp_spawns = [spec for spec in spawns
                      if spec.get("kind") == placeables.KIND_PLAYER_START_MP]
         if player_start is None and not mp_spawns:

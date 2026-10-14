@@ -54,6 +54,9 @@ S6 F9 (ROOT CAUSE — "empty level with Include Prelight on"):
 from math import sqrt
 
 from . import modules
+from .chunks.path import PathChunk, PathPoint
+from .chunks.strategy import (GeneratorStrategyChunk, STRAT_ENEMY,
+                              compose_mission_data)
 from .chunks.sound import SoundDirectoryChunk, SoundObjectChunk
 from .chunks.strategy import AVPStrategyChunk, ObjectProjectDataChunk
 from .chunks.waypoint import WaypointChunk
@@ -314,7 +317,8 @@ def build_rif_level(objects, level_name, texture_paths=None,
                     waypoints=None,
                     placed_objects=None,
                     sounds=None,
-                    sound_directory=None) -> bytes:
+                    sound_directory=None,
+                    paths=None) -> bytes:
     """Assemble a level RIF: shapes + objects + MODULEDT + REBENVDT.
 
     Composition:
@@ -376,6 +380,22 @@ def build_rif_level(objects, level_name, texture_paths=None,
             outer_range  : silence outside it
             max_volume   : 0-127
             pitch, flags, probability
+
+    paths : optional list of dicts, one per patrol route. Keys:
+
+            name         : the route's name, for people and the editor; the
+                           engine addresses paths by index, not by name
+            path_id      : index into the engine's PathArray. Must be dense from
+                           zero -- `Projload.cpp:178` sizes that array from the
+                           highest id it sees, so a gap wastes memory and
+                           suggests the ids are meant to be consecutive
+            flags        : PATH_FLAG_*; retail uses BACK_AND_FORTH on 80% and
+                           LOOP on none
+            points       : list of (module_index, (x, y, z) millimetres), in
+                           order. Each module must exist, and the module a
+                           generator starts on must be one of them or the engine
+                           logs "Error setting up path" and asserts
+                           (`Objsetup.cpp:2480`)
 
     sound_directory : optional string such as "env\\Temple". Written as a
         SOUNDDIR chunk beside SPECLOBJ. Retail's values are the level's own
@@ -577,6 +597,16 @@ def build_rif_level(objects, level_name, texture_paths=None,
             flags=entry.get("flags", 0),
             probability=entry.get("probability", 0),
         ))
+    # One AVPPATH2 per route, as siblings of the generators inside SPECLOBJ.
+    for entry in (paths or []):
+        speclobj_children.append(PathChunk(
+            entry["name"],
+            entry["path_id"],
+            [PathPoint(index, location, entry.get("point_flags", 0))
+             for index, location in entry["points"]],
+            entry.get("flags", 0x2),
+        ))
+
     env_children.append(SpecialObjectsChunk(speclobj_children))
     if sound_directory:
         env_children.append(SoundDirectoryChunk(sound_directory))
@@ -881,19 +911,33 @@ def _build_generator_extras(specs):
     extras = []
     for index, spec in enumerate(specs or (), start=1):
         weights = spec.get("weights")
-        if weights is None:
+        mission = int(spec.get("mission", 0))
+        # A generator needs its extra chunk when it has weights OR a mission.
+        # The two travel in the same chunk, so a patrol is written through the
+        # same object rather than a second one under the same name.
+        if weights is None and not mission:
             continue
         # The generator name must match the spec's exactly, including the
         # counter `_build_generators` may have appended, so it is resolved the
         # same way here rather than assumed.
-        extras.append(AVPGeneratorExtraChunk(
-            name=spec.get("_resolved_name") or spec.get("name")
-            or f"gen{index}",
-            settings=GeneratorExSettingsChunk(
+        children = []
+        if weights is not None:
+            children.append(GeneratorExSettingsChunk(
                 generation_rate=int(spec.get("generation_rate", 0)),
                 gen_rate_increase=int(spec.get("gen_rate_increase", 0)),
                 gen_limit=int(spec.get("gen_limit", 0)),
-                weights=weights),
+                weights=weights))
+        if mission:
+            children.append(GeneratorStrategyChunk(
+                mission=mission,
+                mission_data=compose_mission_data(
+                    spec.get("path_id", 0), spec.get("start_object_index", 0)),
+                strategy_type=int(spec.get("strategy_type", STRAT_ENEMY))))
+        extras.append(AVPGeneratorExtraChunk(
+            name=spec.get("_resolved_name") or spec.get("name")
+            or f"gen{index}",
+            settings=children[0] if len(children) == 1 else None,
+            children=children if len(children) > 1 else None,
         ))
     return extras
 

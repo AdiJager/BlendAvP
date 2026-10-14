@@ -170,6 +170,30 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         name="No loop",
         description="Sets flag 0x2: play once rather than repeating",
         default=False)
+    mission: bpy.props.EnumProperty(
+        name="Mission",
+        description=(
+            "What the creatures this generator produces spend their time "
+            "doing. Objsetup.cpp:2464 switches on this value. 'Patrol route' is "
+            "the only one that needs a route, and the creature will not leave "
+            "it"),
+        items=[
+            ("0", "Default", "Leave the creature's own behaviour alone"),
+            ("1", "Wander", "Roam the level"),
+            ("2", "Guard", "Hold position"),
+            ("3", "Non-combatant", "Civilians: flee rather than fight"),
+            ("4", "Local guard", "Guard a small area"),
+            ("5", "Patrol route", "Walk a patrol route, back and forth"),
+        ],
+        default="0")
+    patrol_path: bpy.props.EnumProperty(
+        name="Route",
+        description=(
+            "The patrol route to walk. Only used when Mission is 'Patrol "
+            "route'. Every point of the route has to lie inside a module, and "
+            "this generator has to stand in one of them, or the engine reports "
+            "'Error setting up path' and asserts"),
+        items=lambda self, context: _patrol_items(self, context))
     object_mass: bpy.props.IntProperty(
         name="Mass",
         description=(
@@ -258,14 +282,6 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         description=(
             "AVPGENFLAG_NOTDIFFICULTY*. Retail uses the three difficulty bits "
             "to thin out enemies on easier settings; this is a starter toggle"
-        ),
-        default=False,
-    )
-    can_crawl: bpy.props.BoolProperty(
-        name="Alien can crawl here",
-        description=(
-            "wayflag_cancrawl. Marks a waypoint as reachable on walls and "
-            "ceilings; 21% of retail waypoints have it"
         ),
         default=False,
     )
@@ -722,6 +738,15 @@ def _make_waypoint_material():
     return material
 
 
+def _patrol_items(_self, context):
+    """Return the scene's patrol routes, named, for the generator's list."""
+    entries = [("", "(none)", "No route chosen")]
+    for obj in sorted(context.scene.objects, key=lambda o: o.name):
+        if obj.get(PLACEABLE_PROP) == KIND_PATROL_PATH:
+            entries.append((obj.name, obj.name, "Walk this route"))
+    return entries
+
+
 def _sound_folder_items(_self, context):
     """Return the env folders as (identifier, label, description).
 
@@ -830,6 +855,16 @@ def _make_operator(spec):
             mesh.update()
             obj = bpy.data.objects.new(spec.label.split("  (")[0], mesh)
             obj.scale = (0.15, 0.15, 0.15)
+        elif spec.kind == KIND_PATROL_PATH:
+            # A real curve, not an empty with a curve-shaped display: the
+            # control points ARE the route, and the collector reads them.
+            curve = bpy.data.curves.new("PatrolPath", type="CURVE")
+            curve.dimensions = "3D"
+            spline = curve.splines.new("POLY")
+            spline.points.add(1)
+            for step, handle in enumerate(spline.points):
+                handle.co = (float(step) * 8.0, 0.0, 0.0, 1.0)
+            obj = bpy.data.objects.new(spec.label.split("  (")[0], curve)
         elif spec.kind == KIND_WAYPOINT:
             mesh = bpy.data.meshes.new("Waypoint")
             verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1)
@@ -841,8 +876,11 @@ def _make_operator(spec):
             obj = bpy.data.objects.new(spec.label.split("  (")[0], mesh)
             obj.display_type = "WIRE"
             mesh.materials.append(_make_waypoint_material())
-            # 2 m across, so a 4 m cube: a usable slab in a normal room.
-            obj.scale = (2.0, 2.0, 2.0)
+            # 8.5 m on a side. Retail's median waypoint in 	rapped measures
+            # 8550 mm, and a smaller volume makes a graph that is technically
+            # connected and too sparse to travel along -- the bots stand in it
+            # and never leave, which looks like a broken exporter and is not.
+            obj.scale = (4.25, 4.25, 4.25)
         else:
             obj = bpy.data.objects.new(spec.label.split("  (")[0], None)
             obj.empty_display_type = spec.display
@@ -962,6 +1000,14 @@ class RIF_PT_placeable(bpy.types.Panel):
             layout.prop(settings, "texture_id")
             box = layout.box()
             box.label(text="Behaviour", icon="OPTIONS")
+            box.prop(settings, "mission")
+            if settings.mission == "5":
+                # Only a patrol reads a route, so it is offered only then:
+                # a picker that is ignored is worse than no picker.
+                box.prop(settings, "patrol_path")
+                if not settings.patrol_path:
+                    box.label(text="A patrol needs a route",
+                              icon="ERROR")
             box.prop(settings, "inactive")
             box.prop(settings, "excluded_hard")
 
@@ -991,7 +1037,6 @@ class RIF_PT_placeable(bpy.types.Panel):
         if kind == KIND_WAYPOINT:
             box = layout.box()
             box.label(text="Volume: use position and scale", icon="CUBE")
-            box.prop(settings, "can_crawl")
 
         if kind == KIND_SOUND:
             box = layout.box()

@@ -1733,7 +1733,7 @@ def test_placeable_properties_register_in_blender():
     annotations = getattr(group, "__annotations__", {})
     assert annotations, "the property group declares no fields"
     for field in ("race_marine", "race_alien", "race_predator", "npc_type",
-                  "sub_type", "can_crawl", "mix_drone"):
+                  "sub_type", "mix_drone"):
         assert field in annotations, f"missing declared field {field}"
         # A string annotation means Blender cannot build the property from it.
         assert not isinstance(annotations[field], str), (

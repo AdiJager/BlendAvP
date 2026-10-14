@@ -71,13 +71,23 @@ def build_graph(boxes, tolerance=LINK_TOLERANCE_MM):
     return {index: sorted(peers) for index, peers in graph.items()}
 
 
-def link_entries(graph):
+def link_entries(graph, flags=None):
     """Return per-waypoint link lists as `[(index, flags), ...]`.
 
-    Flags are left at 0. Retail uses a small undocumented set (`0x4` dominates
-    at 63%, `0` at 33%), and `0` is both safe and present in the shipping data.
+    `flags` defaults to ALIEN_ONLY, and it is the whole reason an alien ever
+    leaves the ground: `AlienIsEncouragedToCrawl` returns 1 only when the link
+    it is about to traverse carries that bit (`Bh_waypt.c:895`). Writing zero,
+    as this once did, produced a graph the bots followed on the floor and never
+    climbed.
+
+    Retail uses ALIEN_ONLY on 9042 of its 14332 links and zero on 4674, so both
+    are shipped values; the default here is the one that makes crawling
+    possible.
     """
-    return {index: [(peer, 0) for peer in peers]
+    if flags is None:
+        from .chunks.waypoint import LINK_FLAG_ALIEN_ONLY
+        flags = LINK_FLAG_ALIEN_ONLY
+    return {index: [(peer, flags) for peer in peers]
             for index, peers in graph.items()}
 
 

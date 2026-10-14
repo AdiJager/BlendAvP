@@ -50,13 +50,21 @@ from ..chunk_writer import Chunk
 
 # Set when the author placed the centre rather than deriving it from the box.
 WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER = 0x80000000
+# Link flags, from `bh_waypt.h:16`. The one that matters here is
+# ALIEN_ONLY: `AlienIsEncouragedToCrawl` returns 1 only when the first
+# link of the route carries it, so a link without it can never be
+# climbed. Retail sets it on 9042 of its 14332 links.
+LINK_FLAG_ONEWAY = 0x00000001
+LINK_FLAG_REVERSED_ONEWAY = 0x00000002
+LINK_FLAG_ALIEN_ONLY = 0x00000004
+LINK_FLAG_LARGE_TARGET = 0x00000008
+
 # Set by the writer on the first ground waypoint; retail never sets it.
 WAYPOINT_FLAG_FIRST_GROUND_WAYPOINT = 0x40000000
-# Marks a node the alien can use to climb a wall or cross a ceiling.
-# Undocumented in the source, but it is the only flag beyond the two named
-# ones, and retail sets it on 1179 of its 5528 waypoints -- the ones on
-# vertical and overhead surfaces.
-WAYPOINT_FLAG_CAN_CRAWL = 0x00000001
+# 0x00000001 is `wayflag_cancrawl` (`bh_waypt.h:36`). Retail carries it on
+# 1179 of its 5528 waypoints, but the only code that reads it is inside
+# `#if 0` (`bh_waypt.c:884`), so it is a leftover the engine ignores. Not
+# written, and not offered in the panel.
 
 # Bytes of a record before its link array.
 RECORD_HEADER_BYTES = 52
