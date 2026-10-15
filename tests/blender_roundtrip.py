@@ -1740,6 +1740,9 @@ def test_placeable_properties_register_in_blender():
             f"{field} is declared as a string annotation, so Blender would "
             "skip it — remove `from __future__ import annotations`")
 
+    # The group carries a collection of switch targets, and Blender will not
+    # build it unless the target group is registered first.
+    bpy.utils.register_class(placeables.RIF_SwitchTarget)
     bpy.utils.register_class(group)
     bpy.types.Object.rif_placeable = bpy.props.PointerProperty(type=group)
     holder = None
@@ -1760,6 +1763,7 @@ def test_placeable_properties_register_in_blender():
             bpy.data.objects.remove(holder, do_unlink=True)
         del bpy.types.Object.rif_placeable
         bpy.utils.unregister_class(group)
+        bpy.utils.unregister_class(placeables.RIF_SwitchTarget)
 
 
 @test
@@ -1860,6 +1864,9 @@ def test_placeable_panel_draws_for_every_kind():
     panel = placeables.RIF_PT_placeable
     group = placeables.RIF_PlaceableSettings
 
+    # The group carries a collection of switch targets, and Blender will not
+    # build it unless the target group is registered first.
+    bpy.utils.register_class(placeables.RIF_SwitchTarget)
     bpy.utils.register_class(group)
     bpy.types.Object.rif_placeable = bpy.props.PointerProperty(type=group)
     holder = None
@@ -1890,6 +1897,7 @@ def test_placeable_panel_draws_for_every_kind():
             bpy.data.objects.remove(holder, do_unlink=True)
         del bpy.types.Object.rif_placeable
         bpy.utils.unregister_class(group)
+        bpy.utils.unregister_class(placeables.RIF_SwitchTarget)
 
 
 class _PanelHost:
@@ -2103,6 +2111,9 @@ def test_global_generator_panel_fields_reach_the_chunk():
     """
     placeables = load_package_module("placeables")
     group = placeables.RIF_PlaceableSettings
+    # The group carries a collection of switch targets, and Blender will not
+    # build it unless the target group is registered first.
+    bpy.utils.register_class(placeables.RIF_SwitchTarget)
     bpy.utils.register_class(group)
     bpy.types.Object.rif_placeable = bpy.props.PointerProperty(type=group)
     holder = None
@@ -2154,6 +2165,7 @@ def test_global_generator_panel_fields_reach_the_chunk():
             pass
         del bpy.types.Object.rif_placeable
         bpy.utils.unregister_class(group)
+        bpy.utils.unregister_class(placeables.RIF_SwitchTarget)
 
 
 @test
@@ -2212,6 +2224,10 @@ def test_player_start_comes_only_from_a_placed_object():
     bpy.context.collection.objects.link(marker)
     marker[operators.MARKER_PROP] = operators.PLAYER_START_MARKER
     marker.location = (1.5, 2.5, 3.5)
+    # The resolver reads matrix_world, which background mode does not recompute
+    # on its own, so without this it sees the position from before the line
+    # above. Every other test that reads a world transform does the same.
+    bpy.context.view_layer.update()
     found = operators._resolve_player_start(bpy.context)
     assert found == (1.5, 2.5, 3.5), found
     assert placeables.PLAYER_START_MARKER == operators.PLAYER_START_MARKER, \

@@ -116,6 +116,28 @@ class ModuleAcousticsChunk(Chunk):
         return struct.pack("<ifi", self.env_index, self.reverb, self.spare)
 
 
+# Module flags, from module.h:318. Only these four are worth offering: the
+# fifth, MODULEFLAG_HORIZONTALDOOR, is set while loading by Objsetup.cpp:1838.
+MODULE_FLAG_AIRDUCT = 0x80000000
+MODULE_FLAG_STAIRS = 0x40000000
+MODULE_FLAG_SKY = 0x20000000
+MODULE_FLAG_FOG = 0x10000000
+
+
+def module_flags(airduct=False, stairs=False, sky=False, fog=False):
+    """Return the packed module flag word from named booleans."""
+    word = 0
+    if airduct:
+        word |= MODULE_FLAG_AIRDUCT
+    if stairs:
+        word |= MODULE_FLAG_STAIRS
+    if sky:
+        word |= MODULE_FLAG_SKY
+    if fog:
+        word |= MODULE_FLAG_FOG
+    return word
+
+
 class ModuleFlagChunk(Chunk):
     """MODFLAGS — optional per-module flags bitfield.
 
@@ -132,4 +154,7 @@ class ModuleFlagChunk(Chunk):
 
     def payload(self) -> bytes:
         """Serialise two i32 fields."""
-        return struct.pack("<2i", self.flags, self.spare)
+        # Unsigned: MODULEFLAG_AIRDUCT is 0x80000000, which does not fit a
+        # signed int.
+        return struct.pack("<II", self.flags & 0xFFFFFFFF,
+                           self.spare & 0xFFFFFFFF)

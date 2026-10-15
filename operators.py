@@ -449,6 +449,12 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 sounds=_collect_sounds(context),
                 sound_directory=_sound_directory(context),
                 paths=_collect_paths(context, objs)[0],
+                envir=_envir_settings(context),
+                death_volumes=_collect_death_volumes(
+                    context, objs)[0],
+                mission_objective=_collect_mission_objective(
+                    context, objs)[0],
+                area_switches=_collect_area_switches(context, objs)[0],
             )
         finally:
             _restore_bitmap_indices(originals)
@@ -779,10 +785,17 @@ def _collect_spawns(context, objs=None):
     multiplayer spawns have no single-player start at all.
     """
     from . import placeables
+    # The patrol route's list uses a sentinel for "nothing chosen", because
+    # Blender discards an enum row whose identifier is empty. It has to be
+    # translated back here or the sentinel reads as a route that does not exist.
+    from .sounds import NONE_CHOICE
 
     specs = []
     skipped = []
-    for obj in bpy.data.objects:
+    # The scene, not `bpy.data.objects`: the datablock list also holds
+    # objects the artist unlinked or deleted, and exporting those puts
+    # generators in the level that are nowhere in the scene.
+    for obj in context.scene.objects:
         kind = obj.get(placeables.PLACEABLE_PROP)
         if kind is None:
             continue
@@ -819,12 +832,22 @@ def _collect_spawns(context, objs=None):
                       placeables.KIND_WAYPOINT,
                       placeables.KIND_PICKUP,
                       placeables.KIND_OBJECT,
-                      placeables.KIND_SOUND):
+                      placeables.KIND_SOUND,
+                      placeables.KIND_PATROL_PATH,
+                      placeables.KIND_DEATH_VOLUME,
+                      placeables.KIND_MISSION_OBJECTIVE,
+                      placeables.KIND_AREA_SWITCH):
             # Handled elsewhere, so not skips: a single-player start
-            # becomes AVPSTART, and a waypoint goes into its module
-            # WAYPOINT chunk via _collect_waypoints. Reporting any of them as
-            # unsupported would be a lie, and this message has to mean what
-            # it says.
+            # becomes AVPSTART, a waypoint goes into its module WAYPOINT
+            # chunk via _collect_waypoints, a patrol route into its own
+            # AVPPATH2, and a kill volume into a VIOBJECT. Reporting any of
+            # them as unsupported would be a lie, and this message has to
+            # mean what it says.
+            #
+            # The patrol route was missing from this list when it shipped, so
+            # the export warned about a feature that was working. The same
+            # omission then hit the kill volume -- which is why the list is
+            # worth reading whenever a new kind is added.
             continue
         else:
             skipped.append((obj.name, kind))
@@ -845,6 +868,8 @@ def _collect_spawns(context, objs=None):
             spec["mission"] = mission
         if mission == 5:
             route = settings.patrol_path
+            if route == NONE_CHOICE:
+                route = ""
             routes = sorted(obj.name for obj in context.scene.objects
                             if obj.get(placeables.PLACEABLE_PROP)
                             == placeables.KIND_PATROL_PATH)
@@ -856,14 +881,32 @@ def _collect_spawns(context, objs=None):
                                 f"route {route!r} is not in the scene"))
             else:
                 spec["path_id"] = routes.index(route)
-                module = _module_index_for(obj, objs)
-                if module is None:
+                # Which step the creature starts at is decided by looking a
+                # module up ON THE ROUTE (`Projload.cpp:279`), and a module the
+                # route does not contain makes the engine assert while the
+                # creature starts somewhere unrelated -- which is what a
+                # creature picking a point at random looks like from outside.
+                # The route's own first point is on the route by construction,
+                # so that lookup cannot fail. The generator's module was
+                # written here before, and it is the wrong question: the
+                # creature is placed on the route, not in the room the
+                # generator happens to sit in.
+                route_obj = next((o for o in context.scene.objects
+                                  if o.name == route), None)
+                first = None
+                if route_obj is not None:
+                    route_points = _curve_points(route_obj)
+                    if route_points:
+                        bounds = [(o.name, _world_box(o)) for o in objs]
+                        first = _module_index_at(objs, bounds,
+                                                 route_points[0])
+                if first is None:
                     skipped.append((
                         obj.name,
-                        "patrol generator is outside every module, so the "
-                        "engine cannot place it on the route"))
+                        f"route {route!r} has no point inside any module, so "
+                        f"there is no step to start the creature at"))
                 else:
-                    spec["start_object_index"] = module
+                    spec["start_object_index"] = first
 
         if kind in (placeables.KIND_DEFAULT_ENEMY,
                     placeables.KIND_WEIGHTED):
@@ -894,7 +937,7 @@ def _collect_global_generator(context):
     """
     from . import placeables
 
-    found = [obj for obj in bpy.data.objects
+    found = [obj for obj in context.scene.objects
              if obj.get(placeables.PLACEABLE_PROP)
              == placeables.KIND_GLOBAL_GENERATOR]
     if not found:
@@ -1033,12 +1076,20 @@ def _collect_paths(context, objs):
         converted = []
         outside = []
         for point in points:
+            # The owning module is worked out in Blender's frame, against boxes
+            # that are also in Blender's frame. Converting first would move the
+            # point out of the box it belongs to.
             index = _module_index_at(objs, bounds, point)
             if index is None:
                 outside.append(point)
                 continue
+            # The stored location, though, is world millimetres the engine
+            # reads directly, so it has to be in the engine's frame -- the same
+            # conversion the module positions and the vertices go through.
+            # Without it a marine walks the right route in the wrong place.
+            rif_point = blender_to_rif_axis(*point)
             converted.append((index, tuple(int(round(v * 1000.0))
-                                           for v in point)))
+                                           for v in rif_point)))
         if outside:
             problems.append(
                 f"Patrol route {obj.name!r} has {len(outside)} point(s) outside "
@@ -1370,6 +1421,306 @@ def _waypoint_layout_problems(context):
     ]
 
 
+def _collect_mission_objective(context, objs):
+    """Return (objective or None, problems) for the scene.
+
+    Retail ships exactly one objective in each of its 31 mission levels. A
+    second is reported and ignored rather than exported: the engine sorts them
+    by `mission_number` and uses the first, so writing both would leave the
+    level's ending decided by a number the artist may not have set.
+    """
+    from .placeables import KIND_MISSION_OBJECTIVE, PLACEABLE_PROP
+    from .rif.chunks.objective import MissionObjective
+
+    found = [obj for obj in context.scene.objects
+             if obj.get(PLACEABLE_PROP) == KIND_MISSION_OBJECTIVE]
+    if not found:
+        return None, []
+
+    problems = []
+    found.sort(key=lambda o: o.name)
+    if len(found) > 1:
+        names = ", ".join(o.name for o in found)
+        problems.append(
+            f"{len(found)} mission objectives in the scene: {names}. The game "
+            f"sorts them by order number and uses the first, so only {found[0].name!r} "
+            f"is written. A level has one ending")
+
+    # A marker, not a volume. Retail's objectives are all `size = 1000`, one
+    # metre, which is a default rather than a measurement, and the engine reads
+    # the position and the name and nothing else. The name is what matters most:
+    # the id a switch will aim at is `MD5("VirtOb" + name)`, so renaming the
+    # object changes the id a switch has to use.
+    obj = found[0]
+    world = obj.matrix_world.translation
+    rif_position = blender_to_rif_axis(world.x, world.y, world.z)
+    centre = tuple(int(round(v * 1000.0)) for v in rif_position)
+
+    settings = obj.rif_placeable
+    return MissionObjective(
+        name=obj.name,
+        position=centre,
+        description=int(settings.objective_description),
+        complete=int(settings.objective_complete),
+        order=int(settings.objective_order),
+    ), problems
+
+
+def _collect_area_switches(context, objs):
+    """Return (switches, problems) for the scene's AreaSwitch objects.
+
+    A switch names its targets, and the name becomes an object id here. Whether
+    that name matches anything is checked against the scene, because the engine
+    looks the id up and a name that matches nothing produces a switch that does
+    nothing at all -- silently, since the chunk is well formed either way.
+    """
+    from .placeables import (KIND_AREA_SWITCH, KIND_DEATH_VOLUME,
+                             KIND_MISSION_OBJECTIVE, KIND_AREA_SWITCH as _AS,
+                             PLACEABLE_PROP)
+    from .rif.chunks.switch import (AreaSwitch, SwitchTarget, REQUEST_OFF,
+                                    MODE_WAIT, TIMED_MODES)
+    from .rif.chunks.trigger import virtual_object_id
+
+    # Everything a switch may aim at, by the name the artist sees.
+    addressable = {}
+    for obj in context.scene.objects:
+        kind = obj.get(PLACEABLE_PROP)
+        if kind in (KIND_DEATH_VOLUME, KIND_MISSION_OBJECTIVE, KIND_AREA_SWITCH):
+            addressable[obj.name] = kind
+
+    switches = []
+    problems = []
+    for obj in sorted(context.scene.objects, key=lambda o: o.name):
+        if obj.get(PLACEABLE_PROP) != KIND_AREA_SWITCH:
+            continue
+        box = _world_box(obj)
+        if box is None:
+            problems.append(
+                f"Area switch {obj.name!r} has no measurable box, so nothing "
+                f"can walk into it")
+            continue
+        corners = [blender_to_rif_axis(*corner) for corner in box]
+        low = tuple(min(c[axis] for c in corners) for axis in range(3))
+        high = tuple(max(c[axis] for c in corners) for axis in range(3))
+        millimetres = [tuple(int(round(v * 1000.0)) for v in corner)
+                       for corner in (low, high)]
+        if any(millimetres[0][a] >= millimetres[1][a] for a in range(3)):
+            problems.append(
+                f"Area switch {obj.name!r} is flat in at least one axis, so "
+                f"nothing can be inside it")
+            continue
+
+        settings = obj.rif_placeable
+        targets = []
+        for entry in settings.switch_targets:
+            name = entry.target_name.strip()
+            if not name:
+                problems.append(
+                    f"Area switch {obj.name!r} has a target with no object "
+                    f"named, so there is nothing to send to")
+                continue
+            if name not in addressable:
+                problems.append(
+                    f"Area switch {obj.name!r} sends to {name!r}, which is not "
+                    f"a kill volume, mission objective or switch in this scene. "
+                    f"The engine matches on an id derived from the name, so this "
+                    f"target would never be found")
+            targets.append(SwitchTarget(virtual_object_id(name),
+                                        int(entry.target_request)))
+
+        mode = int(settings.switch_mode)
+        switches.append(AreaSwitch(
+            name=obj.name,
+            low=millimetres[0],
+            high=millimetres[1],
+            targets=targets,
+            mode=mode,
+            time_seconds=(float(settings.switch_time)
+                          if mode in TIMED_MODES else 0.0),
+            rest_state=1 if settings.switch_rest_on else 0,
+        ))
+
+    return switches, problems
+
+
+def _collect_death_volumes(context, objs):
+    """Return a DeathVolume per marked object, and any problems.
+
+    A kill volume needs no geometry, so the object is only a way of drawing the
+    box: its world bounds become `volume_min` and `volume_max` in millimetres,
+    and the object itself is left out of the level. It is excluded by its kind,
+    the same way a waypoint is.
+    """
+    from .placeables import KIND_DEATH_VOLUME, PLACEABLE_PROP
+    from .rif.chunks.trigger import DeathVolume
+
+    volumes = []
+    problems = []
+
+    for obj in sorted(context.scene.objects, key=lambda o: o.name):
+        if obj.get(PLACEABLE_PROP) != KIND_DEATH_VOLUME:
+            continue
+        box = _world_box(obj)
+        if box is None:
+            problems.append(
+                f"Kill volume {obj.name!r} has no measurable box. Its bounds "
+                f"are the whole of it, so there is nothing to write")
+            continue
+        # Into the engine's frame before anything else. Blender is Z-up and
+        # the engine Y-up, so an unconverted box is rotated 90 degrees and
+        # lands somewhere else -- except at the origin, where the rotation is
+        # invisible. That is exactly how a volume placed at (0, 0, 0) worked
+        # while the same volume on the floor did not.
+        corners = [blender_to_rif_axis(*corner) for corner in box]
+        low = tuple(min(c[axis] for c in corners) for axis in range(3))
+        high = tuple(max(c[axis] for c in corners) for axis in range(3))
+        millimetres = [tuple(int(round(v * 1000.0)) for v in corner)
+                       for corner in (low, high)]
+        if any(millimetres[0][a] >= millimetres[1][a] for a in range(3)):
+            problems.append(
+                f"Kill volume {obj.name!r} is flat in at least one axis, so "
+                f"nothing can be inside it")
+            continue
+        settings = obj.rif_placeable
+        volumes.append(DeathVolume(
+            name=obj.name,
+            low=millimetres[0],
+            high=millimetres[1],
+            damage=int(settings.death_damage),
+            starts_on=bool(settings.death_starts_on),
+            collision_required=bool(settings.death_collision_required),
+        ))
+
+    return volumes, problems
+
+
+def _envir_settings(context):
+    """Return the AVPENVIR settings for the scene's World, or None.
+
+    None when the scene has no World, which is the one case where there is
+    nothing to take the settings from; every level with an environment chunk in
+    retail has one, so a level without a World is unusual rather than normal.
+    """
+    world = context.scene.world
+    if world is None:
+        return None
+
+    def to_byte(value):
+        """Convert a linear float to the byte the engine stores."""
+        linear = max(0.0, min(1.0, float(value)))
+        sRGB = (linear * 12.92 if linear <= 0.0031308
+                else 1.055 * (linear ** (1.0 / 2.4)) - 0.055)
+        return int(round(max(0.0, min(1.0, sRGB)) * 255.0))
+
+    from .rif.chunks.environment_settings import pack_bits
+
+    return {
+        "sky_colour": tuple(to_byte(v)
+                            for v in getattr(world, "rif_sky_colour",
+                                             (0.0129, 0.0129, 0.0129))),
+        # The chunk stores one packed word, so the flags are packed here rather
+        # than handed over separately and re-packed by the writer.
+        "bits": pack_bits(
+            # The loader's own defaults: the Predator keeps all four of these
+            # unless a level says otherwise (AVPCHUNK.CPP:629).
+            predator_pistol=True,
+            predator_plasmacaster=True,
+            predator_disc=True,
+            predator_medicomp=True,
+            predator_grappling_hook=bool(
+                getattr(world, "rif_predator_grappling_hook", False)),
+            marine_jetpack=bool(getattr(world, "rif_marine_jetpack", False)),
+            stars_in_sky=bool(getattr(world, "rif_stars_in_sky", False))),
+        "predator_num_spears": 30,
+    }
+
+
+def _path_layout_problems(context, objs):
+    """Return what is wrong with the scene's patrol routes.
+
+    Only the faults the engine cannot recover from are reported. A route is
+    optional and a generator without a mission is normal, so silence is the
+    common case.
+    """
+    from .placeables import (KIND_NPC, KIND_DEFAULT_ENEMY, KIND_PATROL_PATH,
+                             KIND_WEIGHTED, PLACEABLE_PROP)
+    from .sounds import NONE_CHOICE
+
+    placed = [obj for obj in context.scene.objects
+              if obj.get(PLACEABLE_PROP) == KIND_PATROL_PATH]
+    generators = [obj for obj in context.scene.objects
+                  if obj.get(PLACEABLE_PROP) in
+                  (KIND_NPC, KIND_DEFAULT_ENEMY, KIND_WEIGHTED)]
+    if not placed and not generators:
+        return []
+
+    routes = {obj.name: obj for obj in placed}
+    bounds = [(obj.name, _world_box(obj)) for obj in objs]
+    problems = []
+
+    for obj in sorted(generators, key=lambda o: o.name):
+        settings = obj.rif_placeable
+        if int(settings.mission or 0) != 5:
+            continue
+
+        chosen = settings.patrol_path
+        route = None if chosen in ("", NONE_CHOICE) else routes.get(chosen)
+        if route is None:
+            problems.append(
+                f"Patrol generator {obj.name!r} has no route chosen. A patrol "
+                f"is a list of modules to walk, so without one the creature has "
+                f"nowhere to go")
+            continue
+
+        points = _curve_points(route) or []
+        modules = set()
+        sequence = []
+        for point in points:
+            index = _module_index_at(
+                objs, bounds, point)
+            if index is not None:
+                modules.add(index)
+                sequence.append(index)
+
+        # Two points in one module are two steps asking for the same place,
+        # because the engine walks `modules_in_path` and not the coordinates.
+        # Retail never repeats: in all 69 paths it ships, the points number
+        # exactly the distinct modules. A route that does repeat leaves the
+        # creature pacing in one room while the file looks correct.
+        repeated = [i for i, (a, b) in enumerate(zip(sequence, sequence[1:]))
+                    if a == b]
+        if repeated:
+            problems.append(
+                f"Patrol route {route.name!r} has {len(repeated)} place(s) "
+                f"where two points in a row are in the same module "
+                f"({len(sequence)} points in {len(modules)} module(s)). The "
+                f"engine walks the list of modules, so those are steps that ask "
+                f"for somewhere the creature already is, and it paces instead "
+                f"of patrolling. Put at most one point in each module, and give "
+                f"the route a point in every module it should visit")
+        if not modules:
+            problems.append(
+                f"Patrol route {route.name!r} has no point inside any module. "
+                f"A path is a list of modules, so a route that lies outside all "
+                f"of them cannot be written")
+            continue
+
+        start = _module_index_for(obj, objs)
+        if start is None:
+            problems.append(
+                f"Patrol generator {obj.name!r} stands outside every module, so "
+                f"the engine cannot place it on route {route.name!r}")
+        elif start not in modules:
+            problems.append(
+                f"Patrol generator {obj.name!r} stands in a module that is not "
+                f"on route {route.name!r}. The engine looks the module up on the "
+                f"route to find the starting step, and reports 'Error setting up "
+                f"path' -- with an assertion behind it -- when it is missing. Add "
+                f"a route point in this module")
+
+    return problems
+
+
 def _module_layout_problems(objs, hierarchy):
     """Return a list of things wrong with the level's modules, worst first.
 
@@ -1442,6 +1793,8 @@ def _report_layout(operator, context, objs, hierarchy):
     for problem in _sound_layout_problems(context):
         _report(operator, {"WARNING"}, problem)
     for problem in _waypoint_layout_problems(context):
+        _report(operator, {"WARNING"}, problem)
+    for problem in _path_layout_problems(context, objs):
         _report(operator, {"WARNING"}, problem)
 
 
@@ -1533,6 +1886,7 @@ class RIF_OT_validate_level(bpy.types.Operator):
         problems.extend(_module_layout_problems(objs, hierarchy))
         problems.extend(_sound_layout_problems(context))
         problems.extend(_waypoint_layout_problems(context))
+        problems.extend(_path_layout_problems(context, objs))
 
         # ---- player start
         player_start = _resolve_player_start(context)
@@ -1899,9 +2253,16 @@ def _resolve_player_start(context):
     because a single-player level without it starts at the world origin, which
     is usually inside a wall.
     """
-    for obj in bpy.data.objects:
+    for obj in context.scene.objects:
         if obj.get(MARKER_PROP) == PLAYER_START_MARKER:
-            return (obj.location.x, obj.location.y, obj.location.z)
+            # World position, not `obj.location`: that one is measured from
+            # the parent, and a player start parented to its module -- which is
+            # how the visibility hierarchy is built -- would report its offset
+            # from that module instead of where it stands. Everything else in
+            # this file reads `matrix_world`, and the viewport shows the world
+            # position, so a local read is invisible until the level is played.
+            world = obj.matrix_world.translation
+            return (world.x, world.y, world.z)
     return None
 
 

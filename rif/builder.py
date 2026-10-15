@@ -54,6 +54,8 @@ S6 F9 (ROOT CAUSE — "empty level with Include Prelight on"):
 from math import sqrt
 
 from . import modules
+from .chunks.environment_settings import AVPEnvironmentChunk
+from .chunks.trigger import DeathVolume
 from .chunks.path import PathChunk, PathPoint
 from .chunks.strategy import (GeneratorStrategyChunk, STRAT_ENEMY,
                               compose_mission_data)
@@ -97,7 +99,7 @@ from .chunks.lighting import (
     IDENTITY_MATRIX_16_16, ONE_FIXED,
 )
 from .chunks.module import (
-    ObjectModuleDataChunk, AdjacentModuleEntryPointsChunk,
+    ModuleFlagChunk, ObjectModuleDataChunk, module_flags, AdjacentModuleEntryPointsChunk,
     ModuleAcousticsChunk, VModuleArrayChunk,
     VModuleArrayChunk, ModuleAcousticsChunk,
 )
@@ -318,7 +320,11 @@ def build_rif_level(objects, level_name, texture_paths=None,
                     placed_objects=None,
                     sounds=None,
                     sound_directory=None,
-                    paths=None) -> bytes:
+                    paths=None,
+                    envir=None,
+                    death_volumes=None,
+                    mission_objective=None,
+                    area_switches=None) -> bytes:
     """Assemble a level RIF: shapes + objects + MODULEDT + REBENVDT.
 
     Composition:
@@ -524,6 +530,14 @@ def build_rif_level(objects, level_name, texture_paths=None,
                     module_neighbours.get(i, []), module_origins),
                 "modacous": (-1, -1.0, 0),
                 "waypoints": (waypoints or {}).get(i),
+                # MODFLAGS, read off the object. Zero means no chunk: 12335 of
+                # retail's 12813 modules carry none.
+                "module_flags": module_flags(
+                    airduct=bool(getattr(obj, "rif_module_airduct", False)),
+                    stairs=bool(getattr(obj, "rif_module_stairs", False)),
+                    sky=bool(getattr(obj, "rif_module_sky", False)),
+                    fog=bool(getattr(obj, "rif_module_fog", False)),
+                ),
             }
 
         num_vertices = len(obj.data.vertices)
@@ -607,7 +621,27 @@ def build_rif_level(objects, level_name, texture_paths=None,
             entry.get("flags", 0x2),
         ))
 
+    # One VIOBJECT per kill volume, as siblings of the generators inside
+    # SPECLOBJ -- `Objsetup.cpp:3635` looks for them there.
+    for volume in (death_volumes or []):
+        speclobj_children.append(
+            volume.chunk() if hasattr(volume, "chunk") else volume)
+
+    # The level's ending, written the same way: a VIOBJECT in SPECLOBJ.
+    if mission_objective is not None:
+        speclobj_children.append(mission_objective.chunk())
+
+    # And the triggers, which are what finish an objective or arm a volume.
+    for switch in (area_switches or []):
+        speclobj_children.append(
+            switch.chunk() if hasattr(switch, "chunk") else switch)
+
     env_children.append(SpecialObjectsChunk(speclobj_children))
+
+    # AVPENVIR: the sky and the level's AVP weapon settings. Written from the
+    # World, and always present -- retail has one in every level that has an
+    # environment chunk at all.
+
     if sound_directory:
         env_children.append(SoundDirectoryChunk(sound_directory))
     data_chunk = _build_global_generator(global_generator, spawns)
@@ -618,10 +652,13 @@ def build_rif_level(objects, level_name, texture_paths=None,
                         runtime_flags=emit_runtime_lights)
     )
     if include_avpenvir:
+        settings = envir or {}
         env_children.append(AVPEnvironmentSettingsChunk(
-            sky_r=sky_colour[0],
-            sky_g=sky_colour[1],
-            sky_b=sky_colour[2],
+            sky_r=settings.get("sky_colour", sky_colour)[0],
+            sky_g=settings.get("sky_colour", sky_colour)[1],
+            sky_b=settings.get("sky_colour", sky_colour)[2],
+            bits=settings.get("bits", 0),
+            predator_num_spears=settings.get("predator_num_spears", 30),
         ))
     if global_scale is not None:
         # A level-wide multiplier applied to every position on load
@@ -832,6 +869,12 @@ def _build_module_data(spec):
     waypoints = spec.get("waypoints")
     if waypoints:
         children.append(WaypointChunk(waypoints))
+    # Only when a flag is set: 12335 of retail's 12813 modules carry no
+    # MODFLAGS chunk, so writing a zero one would change every level that is
+    # currently identical to the shipping data.
+    flags = spec.get("module_flags", 0)
+    if flags:
+        children.append(ModuleFlagChunk(flags))
     return ObjectModuleDataChunk(children)
 
 

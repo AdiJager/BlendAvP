@@ -469,26 +469,52 @@ class PlayerStartChunk(Chunk):
 
 
 class AVPEnvironmentSettingsChunk(Chunk):
-    """AVPENVIR — AVP_Environment_Settings_Chunk (24-byte minimal variant).
+    """AVPENVIR — AVP_Environment_Settings_Chunk.
 
-    The full struct in Avpchunk.cpp is larger, but the loader fills
-    defaults for fields past data_size. battle.rif uses the 24-byte form,
-    so we emit that for compatibility.
+    Layout from `AVPCHUNK.HPP:256`, verified byte for byte against all 57
+    retail chunks (`scratch/verify_env_writer.py`):
+
+        data_size            i32  24, and a VERSION TAG: the loader fills in the
+                                  sky colour below 16 and the weapon bits below
+                                  24, so older levels carry fewer fields
+        sky_colour_red       i32
+        sky_colour_green     i32
+        sky_colour_blue      i32
+        bits                 u32  seven flags then 25 spares, in the order
+                                  AVPCHUNK.HPP:268 declares them
+        predator_num_spears  i32
+
+    The two fields this class used to call `spare1` and `spare2` are the packed
+    word and the spear count; the offsets were right and the names were not.
+    `spare2` also defaulted to 128 where the engine's own default, and every
+    retail level, uses 30.
+
+    The sky is a COLOUR, not a texture: the engine fills the void with it.
+    Retail's commonest value is (30, 30, 30).
     """
 
     identifier = "AVPENVIR"
 
-    def __init__(self, sky_r: int = 128, sky_g: int = 128, sky_b: int = 128,
-                 spare1: int = 0, spare2: int = 128):
+    def __init__(self, sky_r: int = 30, sky_g: int = 30, sky_b: int = 30,
+                 bits: int = 0, predator_num_spears: int = 30):
         self.sky_r = sky_r
         self.sky_g = sky_g
         self.sky_b = sky_b
-        self.spare1 = spare1
-        self.spare2 = spare2
+        self.bits = bits
+        self.predator_num_spears = predator_num_spears
+
+    @property
+    def flags(self):
+        """Return the packed word as named booleans."""
+        from .environment_settings import unpack_bits
+        return unpack_bits(self.bits)
 
     def payload(self) -> bytes:
-        """Serialise data_size + RGB + 2 spares = 24 bytes."""
-        return struct.pack(
-            "<6i", 24, self.sky_r, self.sky_g, self.sky_b,
-            self.spare1, self.spare2,
+        """Serialise data_size + RGB + the packed word + spears = 24 bytes."""
+        from .environment_settings import SETTINGS_BYTES
+        buf = struct.pack(
+            "<6i", SETTINGS_BYTES, self.sky_r, self.sky_g, self.sky_b,
+            self.bits, self.predator_num_spears,
         )
+        assert len(buf) == SETTINGS_BYTES, len(buf)
+        return buf

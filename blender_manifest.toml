@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "rif_exporter"
-version = "2.29.1"
+version = "2.42.0"
 name = "RIF Exporter"
 tagline = "Export meshes to Alien vs Predator 1999 RIF format"
 maintainer = "RIF Exporter contributors"

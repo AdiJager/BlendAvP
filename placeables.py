@@ -85,6 +85,9 @@ KIND_OBJECT = "OBJECT"
 # visible, but write nothing yet. They are reported as unsupported on
 # export rather than dropped in silence.
 KIND_PLACEHOLDER = "PLACEHOLDER"
+KIND_DEATH_VOLUME = "DEATH_VOLUME"
+KIND_MISSION_OBJECTIVE = "MISSION_OBJECTIVE"
+KIND_AREA_SWITCH = "AREA_SWITCH"
 # A SOUNDOB2 emitter, drawn as a wireframe sphere whose size is its range.
 KIND_SOUND = "SOUND"
 
@@ -118,6 +121,65 @@ NPC_TYPES = (
 RACE_MARINE = 0x00000800
 RACE_ALIEN = 0x00001000
 RACE_PREDATOR = 0x00002000
+
+
+class RIF_OT_switch_target_add(bpy.types.Operator):
+    """Add a target row to the selected switch."""
+
+    bl_idname = "rif.switch_target_add"
+    bl_label = "Add target"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        """Append an empty target to the active object's switch."""
+        obj = context.active_object
+        if obj is None or not hasattr(obj, "rif_placeable"):
+            return {"CANCELLED"}
+        obj.rif_placeable.switch_targets.add()
+        obj.rif_placeable.switch_target_index =             len(obj.rif_placeable.switch_targets) - 1
+        return {"FINISHED"}
+
+
+class RIF_OT_switch_target_remove(bpy.types.Operator):
+    """Remove the last target row from the selected switch."""
+
+    bl_idname = "rif.switch_target_remove"
+    bl_label = "Remove target"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        """Drop the last target, so the panel and the file stay in step."""
+        obj = context.active_object
+        if obj is None or not hasattr(obj, "rif_placeable"):
+            return {"CANCELLED"}
+        targets = obj.rif_placeable.switch_targets
+        if not len(targets):
+            return {"CANCELLED"}
+        targets.remove(len(targets) - 1)
+        obj.rif_placeable.switch_target_index = len(targets) - 1
+        return {"FINISHED"}
+
+
+class RIF_SwitchTarget(bpy.types.PropertyGroup):
+    """One object a switch sends to, named the way the artist named it."""
+
+    target_name: bpy.props.StringProperty(
+        name="Object",
+        description=(
+            "Name of the virtual object to send to -- a kill volume, a mission "
+            "objective, another switch. It is the Blender object's name, and "
+            "renaming that object breaks this link, because the engine matches "
+            "on an id derived from the name"),
+        default="")
+    target_request: bpy.props.EnumProperty(
+        name="Message",
+        description=(
+            "'on' starts the target, 'off' stops it. A mission objective is "
+            "completed by 'on'; a kill volume is armed by 'on' and disarmed by "
+            "'off'"),
+        items=[("1", "on", "Send an on message"),
+               ("0", "off", "Send an off message")],
+        default="1")
 
 
 class RIF_PlaceableSettings(bpy.types.PropertyGroup):
@@ -194,6 +256,72 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
             "this generator has to stand in one of them, or the engine reports "
             "'Error setting up path' and asserts"),
         items=lambda self, context: _patrol_items(self, context))
+    objective_description: bpy.props.IntProperty(
+        name="Description text",
+        description=(
+            "Index into the game's own english.txt, 1-based. 0 means blank, "
+            "which is what every retail level uses -- the level's text comes "
+            "from its mission file, not from the level"),
+        default=0, min=0, max=449)
+    objective_complete: bpy.props.IntProperty(
+        name="Complete text",
+        description="Index into english.txt for the completion message; 0 is blank",
+        default=0, min=0, max=449)
+    objective_order: bpy.props.IntProperty(
+        name="Order",
+        description=(
+            "Objectives are sorted by this and the first is used, so with one "
+            "objective it does nothing. Retail leaves every one at 0"),
+        default=0, min=0, max=1000)
+    switch_mode: bpy.props.EnumProperty(
+        name="Mode",
+        description=(
+            "Wait is the commonest in the game (548 of 690) and simply turns "
+            "on and stays on. Toggle lets the player work it. The other three "
+            "are the time-based modes and use the Duration below"),
+        items=[("1", "Wait", "Turns on and stays on"),
+               ("2", "Toggle", "The player can work it"),
+               ("0", "Timer", "Sends on, waits, then sends off"),
+               ("4", "Time Delay", "Waits, then sends on, and resets"),
+               ("5", "Time Delay (Autoexec)",
+                "A time delay that starts counting when the level loads")],
+        default="1")
+    switch_time: bpy.props.FloatProperty(
+        name="Duration (s)",
+        description=(
+            "How long the time-based modes count for. Retail's switches use "
+            "whole seconds: one, two, three, five. Ignored by Wait and Toggle"),
+        default=2.0, min=0.0, max=600.0)
+    switch_rest_on: bpy.props.BoolProperty(
+        name="On at rest",
+        description=(
+            "Where the switch sits before anything acts on it. Off in 689 of "
+            "the game's 690 switches"),
+        default=False)
+    switch_targets: bpy.props.CollectionProperty(type=RIF_SwitchTarget)
+    switch_target_index: bpy.props.IntProperty(default=-1)
+    death_damage: bpy.props.IntProperty(
+        name="Damage",
+        description=(
+            "Damage per second. 0 kills outright, which is what 53 of the 57 "
+            "volumes in the game do; anything else is a rate the player can "
+            "sometimes survive"),
+        default=0, min=0, max=100000)
+    death_starts_on: bpy.props.BoolProperty(
+        name="On at start",
+        description=(
+            "Active when the level loads. Off means the volume does nothing "
+            "until a switch turns it on -- 46 of the 57 retail volumes start on"),
+        default=True)
+    death_collision_required: bpy.props.BoolProperty(
+        name="Needs contact",
+        description=(
+            "Only harm things that are touching something. Leave this OFF for "
+            "a pit: the engine skips anything that did not collide this frame, "
+            "and a falling player touches nothing, so an on volume never sees "
+            "them. Retail clears it on 10 of its 57 volumes, which are the "
+            "ones under a drop"),
+        default=False)
     object_mass: bpy.props.IntProperty(
         name="Mass",
         description=(
@@ -527,6 +655,33 @@ PLACEABLES = (
 
     # -- Gameplay ----------------------------------------------------------
     _PlaceableSpec(
+        "death_volume", "Kill Volume  (single player)", (
+            "Everything inside this box dies. The volume is the object's "
+            "bounds, so there is no geometry to model and nothing else to set "
+            "but the damage. It only harms creatures and the player -- "
+            "scenery inside it is left alone"),
+        "MESH_CUBE", CAT_GAMEPLAY, KIND_DEATH_VOLUME),
+
+    _PlaceableSpec(
+        "mission_objective", "Mission Objective  (single player)", (
+            "Names the level's goal. This does NOT complete the level by "
+            "itself: the engine builds a separate completion block for it "
+            "(Objsetup.cpp:3329), and a SWITCH has to send that block a "
+            "request to finish. One per level -- retail has exactly one in "
+            "every mission it ships, and the engine sorts them by order "
+            "number. The box only says where the object sits. Switches are "
+            "not written yet, so a goal placed now waits for one"),
+        "EMPTY_SINGLE_ARROW", CAT_GAMEPLAY, KIND_MISSION_OBJECTIVE),
+
+    _PlaceableSpec(
+        "area_switch", "Area Switch  (trigger volume)", (
+            "Everything that walks into this box sends a message to the "
+            "objects named below. The commonest trigger in the game -- 690 of "
+            "them across 40 levels -- and the means of ending a level, opening "
+            "a door, or arming a kill volume. Walk into it yourself to test"),
+        "MESH_CUBE", CAT_GAMEPLAY, KIND_AREA_SWITCH),
+
+    _PlaceableSpec(
         "global_generator", "Global Generator Data", (
             "GLOGENDC: one per level. Sets the default enemy kind, the NPC "
             "limit, spawns per minute, and the hive state change time. Placing "
@@ -738,9 +893,46 @@ def _make_waypoint_material():
     return material
 
 
+class RIF_PT_module(bpy.types.Panel):
+    """Per-module flags, for any mesh in the level."""
+
+    bl_label = "RIF Module"
+    bl_idname = "RIF_PT_module"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        """Any mesh can be a module; nothing else can."""
+        obj = context.active_object
+        return obj is not None and obj.type == "MESH" and PLACEABLE_PROP not in obj
+
+    def draw(self, context):
+        """Draw the appearance flags and the AI ones, kept apart."""
+        obj = context.active_object
+        layout = self.layout
+
+        box = layout.box()
+        box.label(text="Appearance", icon="WORLD")
+        box.prop(obj, "rif_module_sky")
+        box.prop(obj, "rif_module_fog")
+
+        box = layout.box()
+        box.label(text="AI navigation", icon="OUTLINER_OB_ARMATURE")
+        box.prop(obj, "rif_module_airduct")
+        box.prop(obj, "rif_module_stairs")
+        box.label(text="These change how bots move, not how it looks",
+                  icon="INFO")
+
+
 def _patrol_items(_self, context):
     """Return the scene's patrol routes, named, for the generator's list."""
-    entries = [("", "(none)", "No route chosen")]
+    # A non-empty identifier: Blender discards an enum row whose id is "".
+    # `sounds.NONE_CHOICE` is the same sentinel the sound lists use.
+    from .sounds import NONE_CHOICE
+    entries = [(NONE_CHOICE, "(none)", "No route chosen")]
     for obj in sorted(context.scene.objects, key=lambda o: o.name):
         if obj.get(PLACEABLE_PROP) == KIND_PATROL_PATH:
             entries.append((obj.name, obj.name, "Walk this route"))
@@ -855,6 +1047,35 @@ def _make_operator(spec):
             mesh.update()
             obj = bpy.data.objects.new(spec.label.split("  (")[0], mesh)
             obj.scale = (0.15, 0.15, 0.15)
+        elif spec.kind == KIND_AREA_SWITCH:
+            # A box, not a marker: the engine tests this volume, so it is the
+            # trigger and not a note about where something is.
+            mesh = bpy.data.meshes.new("AreaSwitch")
+            verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1)
+                     for z in (-1, 1)]
+            faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
+                     (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+            mesh.from_pydata(verts, [], faces)
+            mesh.update()
+            obj = bpy.data.objects.new(spec.label.split("  (")[0], mesh)
+            obj.display_type = "WIRE"
+            mesh.materials.append(_make_waypoint_material())
+            obj.scale = (2.0, 2.0, 2.0)
+        elif spec.kind == KIND_DEATH_VOLUME:
+            # A real box: its bounds ARE the volume, so a viewport-only empty
+            # would leave nothing to write.
+            mesh = bpy.data.meshes.new("KillVolume")
+            verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1)
+                     for z in (-1, 1)]
+            faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
+                     (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+            mesh.from_pydata(verts, [], faces)
+            mesh.update()
+            obj = bpy.data.objects.new(spec.label.split("  (")[0], mesh)
+            obj.display_type = "WIRE"
+            mesh.materials.append(_make_waypoint_material())
+            # 4 m on a side, a room-sized trap.
+            obj.scale = (2.0, 2.0, 2.0)
         elif spec.kind == KIND_PATROL_PATH:
             # A real curve, not an empty with a curve-shaped display: the
             # control points ARE the route, and the collector reads them.
@@ -1019,6 +1240,50 @@ class RIF_PT_placeable(bpy.types.Panel):
             box.prop(settings, "mix_praetorian")
             box.label(text="Values are relative to each other", icon="INFO")
 
+        if kind == KIND_MISSION_OBJECTIVE:
+            box = layout.box()
+            box.label(text="Mission objective", icon="CHECKMARK")
+            box.prop(settings, "objective_description")
+            box.prop(settings, "objective_complete")
+            box.prop(settings, "objective_order")
+            box.label(text="One objective per level", icon="INFO")
+            # Said in the panel, not only in the tooltip: an objective that
+            # never completes looks like a broken export, and the missing
+            # piece is a switch, which is not offered yet.
+            box.label(text="Needs a switch to complete it", icon="ERROR")
+
+        if kind == KIND_AREA_SWITCH:
+            box = layout.box()
+            box.label(text="Area switch", icon="TRIA_RIGHT")
+            box.prop(settings, "switch_mode")
+            if settings.switch_mode in ("0", "4", "5"):
+                box.prop(settings, "switch_time")
+            box.prop(settings, "switch_rest_on")
+
+            targets = layout.box()
+            targets.label(text=f"Targets ({len(settings.switch_targets)})")
+            row = targets.row(align=True)
+            row.operator("rif.switch_target_add", icon="ADD", text="Add")
+            row.operator("rif.switch_target_remove", icon="REMOVE",
+                         text="Remove")
+            for index, target in enumerate(settings.switch_targets):
+                row = targets.row(align=True)
+                row.prop(target, "target_request", text="")
+                row.prop(target, "target_name", text="")
+            if not settings.switch_targets:
+                targets.label(text="A switch with no targets does nothing",
+                              icon="INFO")
+
+        if kind == KIND_DEATH_VOLUME:
+            box = layout.box()
+            box.label(text="Kill volume", icon="ERROR")
+            box.prop(settings, "death_damage")
+            if settings.death_damage == 0:
+                box.label(text="0 kills outright", icon="INFO")
+            box.prop(settings, "death_starts_on")
+            box.prop(settings, "death_collision_required")
+            box.label(text="The object's bounds are the volume", icon="INFO")
+
         if kind == KIND_GLOBAL_GENERATOR:
             box = layout.box()
             box.label(text="Spawning budget", icon="OPTIONS")
@@ -1087,7 +1352,7 @@ class RIF_PT_world_audio(bpy.types.Panel):
     listed folders works and a custom level needs none of its own.
     """
 
-    bl_label = "Level Audio"
+    bl_label = "Level Settings"
     bl_idname = "RIF_PT_world_audio"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -1111,9 +1376,25 @@ class RIF_PT_world_audio(bpy.types.Panel):
             layout.label(text="Sounds will not resolve without a folder",
                          icon="ERROR")
 
+        box = layout.box()
+        box.label(text="Sky", icon="WORLD")
+        box.prop(world, "rif_sky_colour")
+        box.prop(world, "rif_stars_in_sky")
+
+        box = layout.box()
+        box.label(text="Predator and Marine", icon="OUTLINER_OB_ARMATURE")
+        box.prop(world, "rif_predator_grappling_hook")
+        box.prop(world, "rif_marine_jetpack")
+        box.label(text="The other weapons are always available", icon="INFO")
+
 
 
 CLASSES = (
+    RIF_PT_module,
+    # Before the settings that carry a collection of them.
+    RIF_SwitchTarget,
+    RIF_OT_switch_target_add,
+    RIF_OT_switch_target_remove,
     RIF_PlaceableSettings,
     RIF_PT_placeable,
     *PLACEABLE_OPERATORS.values(),
@@ -1128,6 +1409,31 @@ def register_placeables():
         bpy.utils.register_class(cls)
     # The sound folder belongs to the level, and a .blend holds several scenes,
     # so it lives on the World rather than in the addon preferences.
+    bpy.types.World.rif_sky_colour = bpy.props.FloatVectorProperty(
+        name="Sky",
+        description=(
+            "The level's sky, as a colour: the engine has no sky texture, it "
+            "fills the void with this. Retail's commonest value is a very dark "
+            "grey, 30 of 255, which is what this default is"),
+        subtype="COLOR", size=3, min=0.0, max=1.0,
+        default=(0.0129, 0.0129, 0.0129))
+    bpy.types.World.rif_stars_in_sky = bpy.props.BoolProperty(
+        name="Stars",
+        description=(
+            "Scatter a starfield across the sky. Retail sets it on 25 of its "
+            "57 levels"),
+        default=False)
+    bpy.types.World.rif_predator_grappling_hook = bpy.props.BoolProperty(
+        name="Grappling hook",
+        description=(
+            "Give the Predator its grappling hook. Off by default, and off in "
+            "the engine's own defaults -- it changes how the race plays more "
+            "than the other weapons do"),
+        default=False)
+    bpy.types.World.rif_marine_jetpack = bpy.props.BoolProperty(
+        name="Marine jetpack",
+        description="Give the Marine a jetpack",
+        default=False)
     bpy.types.World.rif_sound_directory = bpy.props.EnumProperty(
         name="Sound Directory",
         description=(
@@ -1136,6 +1442,36 @@ def register_placeables():
             "has sounds that cannot resolve"),
         items=lambda self, context: _sound_folder_items(self, context),
     )
+    # Per-module flags, read from the engine rather than guessed. Kept on the
+    # object because that is what the engine checks.
+    bpy.types.Object.rif_module_sky = bpy.props.BoolProperty(
+        name="Open sky",
+        description=(
+            "This module is under open sky. The engine draws the sky only when "
+            "a module the player is standing in carries this, so without it the "
+            "sky colour in World > Level Settings does nothing. Note that a "
+            "starfield, if enabled for the level, replaces the clouds rather "
+            "than joining them"),
+        default=False)
+    bpy.types.Object.rif_module_fog = bpy.props.BoolProperty(
+        name="Fog",
+        description="Fog fills this module",
+        default=False)
+    bpy.types.Object.rif_module_airduct = bpy.props.BoolProperty(
+        name="Air duct",
+        description=(
+            "An air duct. Aliens always crawl here, the far AI treats it as a "
+            "duct rather than a room, and the clearance a bot needs is halved "
+            "-- which is what lets one fit through a space the player cannot"),
+        default=False)
+    bpy.types.Object.rif_module_stairs = bpy.props.BoolProperty(
+        name="Stairs",
+        description=(
+            "Stairs. The engine makes a bot here walk straight at its target "
+            "and ignore waypoints, because it otherwise snags on the small "
+            "polygons of a staircase. The engine's own comment calls this a "
+            "hack, so mark only actual staircases"),
+        default=False)
     bpy.types.Object.rif_placeable = bpy.props.PointerProperty(
         type=RIF_PlaceableSettings)
 
@@ -1144,5 +1480,10 @@ def unregister_placeables():
     """Undo everything register_placeables() did."""
     del bpy.types.World.rif_sound_directory
     del bpy.types.Object.rif_placeable
+    # The module flags, in the reverse order to their creation.
+    del bpy.types.Object.rif_module_sky
+    del bpy.types.Object.rif_module_fog
+    del bpy.types.Object.rif_module_airduct
+    del bpy.types.Object.rif_module_stairs
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
