@@ -86,6 +86,11 @@ class MissionObjectiveStrategyChunk(Chunk):
         return bytes(buf)
 
 
+# Retail's markers all carry this: one metre, the default. There is no
+# volume in a message, so nothing is measured and nothing is invented.
+DEFAULT_MESSAGE_SIZE = 1000
+
+
 class TextMessageStrategyChunk(Chunk):
     """AVPSTRAT — one on-screen message, as a 32-byte record.
 

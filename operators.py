@@ -455,6 +455,10 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 mission_objective=_collect_mission_objective(
                     context, objs)[0],
                 area_switches=_collect_area_switches(context, objs)[0],
+                multi_switches=_collect_multi_switches(context, objs)[0],
+                self_destructs=_collect_self_destructs(context, objs)[0],
+                messages=_collect_messages(context, objs)[0],
+                particles=_collect_particles(context, objs)[0],
             )
         finally:
             _restore_bitmap_indices(originals)
@@ -836,7 +840,11 @@ def _collect_spawns(context, objs=None):
                       placeables.KIND_PATROL_PATH,
                       placeables.KIND_DEATH_VOLUME,
                       placeables.KIND_MISSION_OBJECTIVE,
-                      placeables.KIND_AREA_SWITCH):
+                      placeables.KIND_AREA_SWITCH,
+                      placeables.KIND_MULTI_SWITCH,
+                      placeables.KIND_SELF_DESTRUCT,
+                      placeables.KIND_MESSAGE,
+                      placeables.KIND_PARTICLE_GENERATOR):
             # Handled elsewhere, so not skips: a single-player start
             # becomes AVPSTART, a waypoint goes into its module WAYPOINT
             # chunk via _collect_waypoints, a patrol route into its own
@@ -914,10 +922,26 @@ def _collect_spawns(context, objs=None):
             # is how the default-enemy fallback is reached: with no weights the
             # engine uses the creature named by GLOGENDC, but only if it can
             # find the extended settings at all.
+            # All fifteen, not the three a skirmish needs. `Objsetup.cpp:3085`
+            # copies the whole table without a network check -- the gate at
+            # `:2993` is about generator types, not weights -- so the other
+            # twelve are what a single-player level fields marines with.
             spec["weights"] = {
                 "Alien_Wt": settings.mix_drone,
                 "PredAlien_Wt": settings.mix_predalien,
                 "Praetorian_Wt": settings.mix_praetorian,
+                "PulseMarine_Wt": settings.mix_pulse_marine,
+                "FlameMarine_Wt": settings.mix_flame_marine,
+                "SmartMarine_Wt": settings.mix_smart_marine,
+                "SadarMarine_Wt": settings.mix_sadar_marine,
+                "GrenadeMarine_Wt": settings.mix_grenade_marine,
+                "MinigunMarine_Wt": settings.mix_minigun_marine,
+                "PistolMarine_Wt": settings.mix_pistol_marine,
+                "ShotgunCiv_Wt": settings.mix_shotgun_civilian,
+                "PistolCiv_Wt": settings.mix_pistol_civilian,
+                "FlameCiv_Wt": settings.mix_flame_civilian,
+                "UnarmedCiv_Wt": settings.mix_unarmed_civilian,
+                "MolotovCiv_Wt": settings.mix_molotov_civilian,
             }
         specs.append(spec)
     return specs, skipped
@@ -1466,6 +1490,221 @@ def _collect_mission_objective(context, objs):
     ), problems
 
 
+def _particle_orientation(obj):
+    """Return the emitter's direction as the chunk stores it.
+
+    `Objsetup.cpp:3809` negates x, y and z as it reads the four floats, so
+    the chunk holds the negation of the RIF quaternion and the engine's
+    negation restores it. Inverting twice is the whole conversion, and its
+    absence is why an emitter written with the identity always fired the
+    same way however its object was turned.
+
+    An emitter points along its own axis, so the object's rotation is what
+    the artist sets in the viewport.
+    """
+    from .rif.builder import _convert_orientation
+
+    quat = obj.matrix_world.to_quaternion()
+    x, y, z, w = _convert_orientation(quat)
+    return (-x, -y, -z, w)
+
+
+def _collect_particles(context, objs):
+    """Return (emitters, problems) for the scene's particle generators.
+
+    A marker with a world position: the engine works out which module the
+    generator belongs to from that position, so a generator outside every module
+    is one that never runs. The position takes the same axis conversion as every
+    other position here.
+
+    The sound is reported rather than written: `INDSOUND` is this chunk's child
+    in 444 of the 570 retail generators, but there is no writer for it yet, and
+    a generator without its sound is a whole emitter rather than a broken one.
+    """
+    from .placeables import KIND_PARTICLE_GENERATOR, PLACEABLE_PROP
+    from .rif.chunks.particle import (ParticleGenerator,
+                                      PARGEN_TYPE_SPARK)
+
+    bounds = [(obj.name, _world_box(obj)) for obj in objs]
+    emitters = []
+    problems = []
+    for obj in sorted(context.scene.objects, key=lambda o: o.name):
+        if obj.get(PLACEABLE_PROP) != KIND_PARTICLE_GENERATOR:
+            continue
+        world = obj.matrix_world.translation
+        rif_position = blender_to_rif_axis(world.x, world.y, world.z)
+        position = tuple(int(round(v * 1000.0)) for v in rif_position)
+
+        if _module_index_at(objs, bounds, (world.x, world.y, world.z)) is None:
+            problems.append(
+                f"Particle generator {obj.name!r} is outside every module. The "
+                f"engine works out which module it belongs to from its "
+                f"position, so this one would never run")
+
+        settings = obj.rif_placeable
+        particle_type = int(settings.particle_type)
+        emitters.append(ParticleGenerator(
+            name=obj.name,
+            position=position,
+            particle_type=particle_type,
+            # Only a spark reads the interval; the rest divide by quantity, and
+            # the engine does that division, so both are simply carried.
+            frequency_seconds=float(settings.particle_frequency),
+            probability=int(settings.particle_probability),
+            quantity=int(settings.particle_quantity),
+            speed_metres=float(settings.particle_speed),
+            active=bool(settings.particle_active),
+            sound_name=(settings.particle_sound.strip() or None),
+            # Millimetres in the chunk, metres in the panel.
+            sound_inner_mm=int(round(
+                float(settings.particle_sound_inner) * 1000.0)),
+            sound_outer_mm=int(round(
+                float(settings.particle_sound_outer) * 1000.0)),
+            sound_loop=bool(settings.particle_sound_loop),
+            orientation=_particle_orientation(obj),
+        ))
+        if particle_type != PARGEN_TYPE_SPARK and \
+                float(settings.particle_frequency):
+            problems.append(
+                f"Particle generator {obj.name!r} is not a spark, so its "
+                f"Frequency is ignored -- the interval comes from Quantity "
+                f"({settings.particle_quantity})")
+    return emitters, problems
+
+
+def _collect_messages(context, objs):
+    """Return (messages, problems) for the scene's Message objects.
+
+    A marker with no volume, so the position comes from `matrix_world`. The
+    only field that can be wrong is the text index, and the engine asserts on
+    it: outside one to 449 it takes the level down rather than failing quietly,
+    so it is checked here.
+    """
+    from .placeables import KIND_MESSAGE, PLACEABLE_PROP
+    from .rif.chunks.objective import (TextMessageStrategyChunk,
+                                       DEFAULT_MESSAGE_SIZE, MAX_TEXT_INDEX)
+    from .rif.chunks.trigger import VirtualObjectChunk
+
+    messages = []
+    problems = []
+    for obj in sorted(context.scene.objects, key=lambda o: o.name):
+        if obj.get(PLACEABLE_PROP) != KIND_MESSAGE:
+            continue
+        settings = obj.rif_placeable
+        index = int(settings.message_string)
+        if not 1 <= index < MAX_TEXT_INDEX:
+            problems.append(
+                f"Message {obj.name!r} uses text number {index}. The engine "
+                f"asserts on anything outside 1 to {MAX_TEXT_INDEX - 1}, so "
+                f"this would take the level down on load")
+            continue
+
+        world = obj.matrix_world.translation
+        rif_position = blender_to_rif_axis(world.x, world.y, world.z)
+        position = tuple(int(round(v * 1000.0)) for v in rif_position)
+
+        # `TextMessageFlag_NotActiveAtStart` is the only flag there is, and it
+        # is inverted against the panel: ticking "show at start" clears it.
+        flags = 0 if settings.message_shown_at_start else 1
+        messages.append(VirtualObjectChunk(
+            obj.name,
+            TextMessageStrategyChunk(index, flags, 0),
+            location=position,
+            size=DEFAULT_MESSAGE_SIZE,
+        ))
+    return messages, problems
+
+
+def _collect_self_destructs(context, objs):
+    """Return (self_destructs, problems) for the scene.
+
+    A marker, so the position comes from `matrix_world`. A level may carry more
+    than one -- `Vaults_M.RIF` ships two -- so unlike a mission objective a
+    second is not a fault.
+    """
+    from .placeables import KIND_SELF_DESTRUCT, PLACEABLE_PROP
+    from .rif.chunks.selfdestruct import SelfDestruct
+
+    found = []
+    problems = []
+    for obj in sorted(context.scene.objects, key=lambda o: o.name):
+        if obj.get(PLACEABLE_PROP) != KIND_SELF_DESTRUCT:
+            continue
+        world = obj.matrix_world.translation
+        rif_position = blender_to_rif_axis(world.x, world.y, world.z)
+        position = tuple(int(round(v * 1000.0)) for v in rif_position)
+        found.append(SelfDestruct(
+            name=obj.name,
+            position=position,
+            timer_seconds=int(obj.rif_placeable.self_destruct_timer),
+        ))
+    return found, problems
+
+
+def _collect_multi_switches(context, objs):
+    """Return (switches, problems) for the scene's MultiSwitch objects.
+
+    A marker rather than a volume, so its position comes from `matrix_world`.
+    The targets are shared with `_collect_area_switches`: a switch driving
+    another switch is what the type is for, so both kinds are addressable.
+    """
+    from .placeables import (KIND_AREA_SWITCH, KIND_DEATH_VOLUME,
+                             KIND_MISSION_OBJECTIVE, KIND_MULTI_SWITCH,
+                             KIND_SELF_DESTRUCT, KIND_MESSAGE,
+                             PLACEABLE_PROP)
+    from .rif.chunks.switch import (MultiSwitch, SwitchTarget, MODE_WAIT,
+                                    TIMED_MODES)
+    from .rif.chunks.trigger import virtual_object_id
+
+    addressable = set()
+    for obj in context.scene.objects:
+        if obj.get(PLACEABLE_PROP) in (KIND_DEATH_VOLUME,
+                                       KIND_MISSION_OBJECTIVE,
+                                       KIND_AREA_SWITCH, KIND_MULTI_SWITCH,
+                                       KIND_SELF_DESTRUCT, KIND_MESSAGE):
+            addressable.add(obj.name)
+
+    switches = []
+    problems = []
+    for obj in sorted(context.scene.objects, key=lambda o: o.name):
+        if obj.get(PLACEABLE_PROP) != KIND_MULTI_SWITCH:
+            continue
+        world = obj.matrix_world.translation
+        rif_position = blender_to_rif_axis(world.x, world.y, world.z)
+        position = tuple(int(round(v * 1000.0)) for v in rif_position)
+
+        settings = obj.rif_placeable
+        targets = []
+        for entry in settings.switch_targets:
+            name = entry.target_name.strip()
+            if not name:
+                problems.append(
+                    f"Multi switch {obj.name!r} has a target with no object "
+                    f"named, so there is nothing to send to")
+                continue
+            if name not in addressable:
+                problems.append(
+                    f"Multi switch {obj.name!r} sends to {name!r}, which is not "
+                    f"a kill volume, mission objective or switch in this scene. "
+                    f"The engine matches on an id derived from the name, so this "
+                    f"target would never be found")
+            targets.append(SwitchTarget(virtual_object_id(name),
+                                        int(entry.target_request)))
+
+        mode = int(settings.switch_mode)
+        switches.append(MultiSwitch(
+            name=obj.name,
+            position=position,
+            targets=targets,
+            mode=mode,
+            time_seconds=(float(settings.switch_time)
+                          if mode in TIMED_MODES else 0.0),
+            rest_state=1 if settings.switch_rest_on else 0,
+        ))
+
+    return switches, problems
+
+
 def _collect_area_switches(context, objs):
     """Return (switches, problems) for the scene's AreaSwitch objects.
 
@@ -1475,7 +1714,8 @@ def _collect_area_switches(context, objs):
     nothing at all -- silently, since the chunk is well formed either way.
     """
     from .placeables import (KIND_AREA_SWITCH, KIND_DEATH_VOLUME,
-                             KIND_MISSION_OBJECTIVE, KIND_AREA_SWITCH as _AS,
+                             KIND_MESSAGE, KIND_MISSION_OBJECTIVE,
+                             KIND_MULTI_SWITCH, KIND_SELF_DESTRUCT,
                              PLACEABLE_PROP)
     from .rif.chunks.switch import (AreaSwitch, SwitchTarget, REQUEST_OFF,
                                     MODE_WAIT, TIMED_MODES)
@@ -1485,7 +1725,9 @@ def _collect_area_switches(context, objs):
     addressable = {}
     for obj in context.scene.objects:
         kind = obj.get(PLACEABLE_PROP)
-        if kind in (KIND_DEATH_VOLUME, KIND_MISSION_OBJECTIVE, KIND_AREA_SWITCH):
+        if kind in (KIND_DEATH_VOLUME, KIND_MISSION_OBJECTIVE,
+                    KIND_AREA_SWITCH, KIND_MULTI_SWITCH, KIND_SELF_DESTRUCT,
+                    KIND_MESSAGE):
             addressable[obj.name] = kind
 
     switches = []
@@ -1782,6 +2024,48 @@ def _module_layout_problems(objs, hierarchy):
     return problems
 
 
+def _budget_layout_problems(context, spawns):
+    """Return what is wrong with how the level pays for its creatures.
+
+    Two faults stop spawning dead and neither looks like anything in game: a
+    rate of zero turns the whole system off (`BH_GENER.C:189`), and a maximum of
+    zero leaves no room for a creature to be alive. A missing budget is a third:
+    `GLOGENDC` is what gives a generator its limits, so without the marker there
+    is nothing to read.
+
+    `_collect_global_generator` returns None when the scene has no marker, which
+    is why the check for that comes first -- reaching into a missing budget
+    raised AttributeError and took the export down, a worse outcome than the
+    fault it was reporting.
+    """
+    from . import placeables
+
+    generators = [spec for spec in spawns
+                  if spec.get("kind") not in (
+                      placeables.KIND_PLAYER_START_MP,
+                      placeables.KIND_PLAYER_START_SP)]
+    if not generators:
+        return []
+
+    budget = _collect_global_generator(context)
+    if budget is None:
+        return [
+            "The scene has generators but no Global Generator Data. GLOGENDC "
+            "is what gives them a budget, so nothing would ever spawn"]
+
+    problems = []
+    if not budget.get("npcs_per_minute"):
+        problems.append(
+            "Global Generator Data has NPCSPerMinute = 0, which disables the "
+            "whole generator system silently (BH_GENER.C:189). No generator "
+            "will ever create an NPC")
+    if not budget.get("max_npcs"):
+        problems.append(
+            "Global Generator Data has MaxNPCS = 0, so no creature can be "
+            "alive at once and nothing will ever spawn")
+    return problems
+
+
 def _report_layout(operator, context, objs, hierarchy):
     """Warn about every layout problem the engine will not tolerate.
 
@@ -1795,6 +2079,11 @@ def _report_layout(operator, context, objs, hierarchy):
     for problem in _waypoint_layout_problems(context):
         _report(operator, {"WARNING"}, problem)
     for problem in _path_layout_problems(context, objs):
+        _report(operator, {"WARNING"}, problem)
+    # The budget rule was in the Debug command alone, so the export warned
+    # about everything except the fault that stops a level spawning at all.
+    spawns, _skipped = _collect_spawns(context, objs)
+    for problem in _budget_layout_problems(context, spawns):
         _report(operator, {"WARNING"}, problem)
 
 
@@ -1904,12 +2193,8 @@ class RIF_OT_validate_level(bpy.types.Operator):
                           placeables.KIND_PLAYER_START_MP,
                           placeables.KIND_PLAYER_START_SP)]
         notes.append(f"{len(generators)} generator(s)")
-        budget = _collect_global_generator(context)
-        if generators and not budget.get("npcs_per_minute"):
-            problems.append(
-                "Global Generator Data has NPCSPerMinute = 0, which disables "
-                "the whole generator system silently (BH_GENER.C:189). No "
-                "generator will ever create an NPC")
+        # One copy of the rule, shared with the export warnings.
+        problems.extend(_budget_layout_problems(context, spawns))
         if skipped:
             problems.append("Skipped objects: " + ", ".join(sorted(skipped)[:4]))
 

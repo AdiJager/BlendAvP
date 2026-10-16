@@ -34,6 +34,7 @@ import struct
 
 from ..chunk_writer import Chunk
 
+STRAT_MULTI_SWITCH = 66
 STRAT_AREA_SWITCH = 68
 
 # Switch modes, as the shipping data sorts them. The documentation names five
@@ -76,11 +77,13 @@ DEFAULT_SWITCH_FLAGS = MULTISWITCH_FLAG_SWITCH_UPDATED
 # One second in the fixed point the engine uses for Time.
 ONE_FIXED = 65536
 
-# Retail's switches carry between one and eighteen targets. An earlier reading
-# of a partial sample suggested three, which is why this is taken from the whole
-# set: Mode 1 alone reaches eighteen. The bound only exists to catch a runaway
-# list, not to describe the data.
-MAX_TARGETS = 64
+# Retail's switches carry anything from none to one hundred and sixty-three
+# targets: Invasion_A.RIF has a switch with 163, and its payload of 2008 bytes
+# is exactly 8 + 44 + 163 * 12. This bound has been wrong twice -- first three,
+# from a partial sample, then sixty-four, from a partial set -- so it is now set
+# well clear of the data and says so. It exists to catch a runaway list, not to
+# describe what retail does.
+MAX_TARGETS = 4096
 
 
 class SwitchTarget:
@@ -98,16 +101,19 @@ class SwitchTarget:
         return self.target_id + struct.pack("<i", self.request)
 
 
-class AreaSwitchStrategyChunk(Chunk):
-    """AVPSTRAT — a 68, with its trigger volume and target list."""
+class MultiSwitchStrategyChunk(Chunk):
+    """AVPSTRAT — a 66, with its target list and no volume.
+
+    This is the base `AreaSwitchStrategy` builds on, so its fields are the ones
+    a switch has whether or not it has a box to walk into.
+    """
 
     identifier = "AVPSTRAT"
+    strategy_type = STRAT_MULTI_SWITCH
 
-    def __init__(self, low, high, targets=(), mode=MODE_WAIT, time_seconds=0.0,
+    def __init__(self, targets=(), mode=MODE_WAIT, time_seconds=0.0,
                  rest_state=0, security=0,
                  flags=DEFAULT_SWITCH_FLAGS, links=()):
-        self.low = tuple(int(v) for v in low)
-        self.high = tuple(int(v) for v in high)
         self.targets = list(targets)
         self.mode = int(mode)
         self.time = int(round(float(time_seconds) * ONE_FIXED))
@@ -121,7 +127,7 @@ class AreaSwitchStrategyChunk(Chunk):
         """Serialise the strategy, whose length depends on the two lists."""
         buf = bytearray()
         buf += struct.pack("<2i", 0, 0)                     # index, spare2
-        buf += struct.pack("<i", STRAT_AREA_SWITCH)
+        buf += struct.pack("<i", self.strategy_type)
         buf += struct.pack("<2i", 0, 0)                     # Type, ExtraData
 
         buf += struct.pack("<4i", self.rest_state, self.mode, self.time,
@@ -140,13 +146,68 @@ class AreaSwitchStrategyChunk(Chunk):
         # and the reason this is packed as a bit mask rather than a number.
         buf += struct.pack("<iI", 0, self.flags)
 
-        # The box. Absolute world millimetres: `Objsetup.cpp:1560` scales it by
-        # `local_scale` and `BH_BINSW.C:320` compares it against a world
-        # position, so it is in the same frame as a death volume's.
+        return bytes(buf)
+
+
+class AreaSwitchStrategyChunk(MultiSwitchStrategyChunk):
+    """AVPSTRAT — a 68: the same switch, with a volume to walk into.
+
+    The engine tests this box against an object's world position, so the values
+    are absolute world millimetres scaled by `local_scale`
+    (`Objsetup.cpp:1560`), in the same frame as a death volume's.
+    """
+
+    strategy_type = STRAT_AREA_SWITCH
+
+    def __init__(self, low, high, targets=(), mode=MODE_WAIT, time_seconds=0.0,
+                 rest_state=0, security=0,
+                 flags=DEFAULT_SWITCH_FLAGS, links=()):
+        super().__init__(targets, mode, time_seconds, rest_state, security,
+                         flags, links)
+        self.low = tuple(int(v) for v in low)
+        self.high = tuple(int(v) for v in high)
+
+    def payload(self) -> bytes:
+        """Serialise the base, then the box and its two pads."""
+        buf = bytearray(super().payload())
         buf += struct.pack("<3i", *self.low)
         buf += struct.pack("<3i", *self.high)
         buf += struct.pack("<2i", 0, 0)                     # area_pad1, pad2
         return bytes(buf)
+
+
+class MultiSwitch:
+    """A switch with no volume: a condition or a delay in a chain.
+
+    `VirtualObjectChunk` carries it, and it is a marker rather than a box --
+    685 of its 843 retail instances carry the default `size` of 1000 -- because
+    nothing walks into it. Other switches drive it, which is how the game
+    expresses "only do this when every condition is met".
+    """
+
+    def __init__(self, name, position, targets=(), mode=MODE_WAIT,
+                 time_seconds=0.0, rest_state=0, flags=DEFAULT_SWITCH_FLAGS):
+        self.name = str(name)
+        self.position = tuple(int(v) for v in position)
+        self.targets = list(targets)
+        self.mode = int(mode)
+        self.time_seconds = float(time_seconds)
+        self.rest_state = int(rest_state)
+        self.flags = int(flags)
+
+    def chunk(self):
+        """Return the VIOBJECT to write into SPECLOBJ."""
+        from .objective import DEFAULT_OBJECTIVE_SIZE
+        from .trigger import VirtualObjectChunk
+
+        return VirtualObjectChunk(
+            self.name,
+            MultiSwitchStrategyChunk(
+                self.targets, self.mode, self.time_seconds, self.rest_state,
+                flags=self.flags),
+            location=self.position,
+            size=DEFAULT_OBJECTIVE_SIZE,
+        )
 
 
 class AreaSwitch:

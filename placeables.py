@@ -88,6 +88,10 @@ KIND_PLACEHOLDER = "PLACEHOLDER"
 KIND_DEATH_VOLUME = "DEATH_VOLUME"
 KIND_MISSION_OBJECTIVE = "MISSION_OBJECTIVE"
 KIND_AREA_SWITCH = "AREA_SWITCH"
+KIND_MULTI_SWITCH = "MULTI_SWITCH"
+KIND_SELF_DESTRUCT = "SELF_DESTRUCT"
+KIND_MESSAGE = "MESSAGE"
+KIND_PARTICLE_GENERATOR = "PARTICLE_GENERATOR"
 # A SOUNDOB2 emitter, drawn as a wireframe sphere whose size is its range.
 KIND_SOUND = "SOUND"
 
@@ -171,14 +175,32 @@ class RIF_SwitchTarget(bpy.types.PropertyGroup):
             "renaming that object breaks this link, because the engine matches "
             "on an id derived from the name"),
         default="")
+    # `request` is `(code << 1) | on`. The code is read by the target's own
+    # handler, and three kinds of target read it: a mission objective takes a
+    # bitmask, a message takes 1 to arm and 2 to arm and show, and a track takes
+    # 0, 1 and 2 for start, forward and backward. A death volume and the
+    # self destruct ignore it and only look at the on bit.
     target_request: bpy.props.EnumProperty(
         name="Message",
         description=(
-            "'on' starts the target, 'off' stops it. A mission objective is "
-            "completed by 'on'; a kill volume is armed by 'on' and disarmed by "
-            "'off'"),
-        items=[("1", "on", "Send an on message"),
-               ("0", "off", "Send an off message")],
+            "What to send. 'on' and 'off' are the whole vocabulary for a kill "
+            "volume; the numbered codes mean something to a mission objective, "
+            "a message or a track, and are ignored by a kill volume"),
+        items=[
+            ("1", "on", "Send on. Completes a mission objective, arms a kill "
+                        "volume or the self destruct, plays a sound"),
+            ("0", "off", "Send off. Disarms, or stops what was running"),
+            ("3", "on, code 1",
+             "Mission objective: make the objective visible. Message: arm it "
+             "without showing it. Track: start forwards"),
+            ("5", "on, code 2",
+             "Mission objective: make it possible. Message: arm it AND show "
+             "the text or the cutscene. Track: start backwards"),
+            ("2", "off, code 1",
+             "Off, with code 1: a mission objective stops being visible, a "
+             "message stops being armed"),
+            ("4", "off, code 2", "Off, with code 2"),
+        ],
         default="1")
 
 
@@ -300,6 +322,181 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         default=False)
     switch_targets: bpy.props.CollectionProperty(type=RIF_SwitchTarget)
     switch_target_index: bpy.props.IntProperty(default=-1)
+    self_destruct_timer: bpy.props.IntProperty(
+        name="Countdown (s)",
+        description=(
+            "Seconds from being armed to the level going up. Retail's five use "
+            "0, 62 and 70, so 0 is a legal value and means it fires at once"),
+        default=70, min=0, max=100000)
+    message_string: bpy.props.IntProperty(
+        name="Text number",
+        description=(
+            "Index into the game's own english.txt, counting from the level "
+            "messages, 1-based. The engine insists on 1 to 449, so 0 is not a "
+            "blank message here the way it is for a mission objective -- it is "
+            "an assertion. The game's text file lists what each number says"),
+        default=1, min=1, max=449)
+    message_shown_at_start: bpy.props.BoolProperty(
+        name="Armed at start",
+        description=(
+            "Whether the message starts active. This does NOT display it: a "
+            "message has no per-frame behaviour at all (it appears in "
+            "BH_TYPES.C only at init and in the request dispatch), so a switch "
+            "has to send it code 2 to show it. What this decides is whether a "
+            "switch using the plain code 0 will show it -- that branch tests "
+            "active && state, and with this off the message stays silent"),
+        default=False)
+    particle_type: bpy.props.EnumProperty(
+        name="Type",
+        description=(
+            "The four emitter types, in the engine's own order -- which is not "
+            "the obvious one. Spark and Flame light the room as well"),
+        items=[("0", "Spark", "Sparks, fifteen at a time, and a flash of light"),
+               ("1", "Steam", "Steam, no light"),
+               ("2", "Black smoke", "Black smoke, no light"),
+               ("3", "Flame", "A flame that lights the room")],
+        default="0")
+    particle_frequency: bpy.props.FloatProperty(
+        name="Frequency (s)",
+        description=(
+            "Seconds between emissions. SPARK ONLY: the other three take their "
+            "interval from Quantity instead, and ignore this"),
+        default=0.0, min=0.0, max=600.0)
+    particle_quantity: bpy.props.IntProperty(
+        name="Quantity",
+        description=(
+            "How many emissions per second, for Steam, Black smoke and Flame. "
+            "The engine divides by it, so it is a rate and not a count. Spark "
+            "ignores it and uses Frequency"),
+        default=50, min=0, max=65535)
+    particle_probability: bpy.props.IntProperty(
+        name="Probability (%)",
+        description=(
+            "Chance of emitting at all, 0 to 100. Retail's commonest value is "
+            "0, and the engine tests a random number against it, so 0 means "
+            "almost never rather than always"),
+        default=0, min=0, max=100)
+    particle_speed: bpy.props.FloatProperty(
+        name="Speed (m/s)",
+        description=(
+            "How fast the particles leave. Retail's sparks use 0.10 to 0.15, "
+            "steam rather more"),
+        default=0.0, min=0.0, max=600.0)
+    particle_active: bpy.props.BoolProperty(
+        name="Active",
+        description=(
+            "Emit from the start. All 570 of the game's generators are active, "
+            "and a switch can turn one on or off"),
+        default=True)
+    particle_sound: bpy.props.StringProperty(
+        name="Sound",
+        description=(
+            "A .wav file name from the level's Sound Directory, for instance "
+            "Ed_Spark05.wav. 444 of the game's 570 emitters have one. Leave it "
+            "empty for a silent emitter"),
+        default="")
+    particle_sound_inner: bpy.props.FloatProperty(
+        name="Sound inner (m)",
+        description=(
+            "Distance at which the sound is at full volume. Retail's sparks "
+            "use 1.25 m and its steam 0"),
+        default=0.0, min=0.0, max=600.0)
+    particle_sound_outer: bpy.props.FloatProperty(
+        name="Sound outer (m)",
+        description=(
+            "Distance at which it falls silent. Retail is consistent here: "
+            "18.75 m for every emitter in the game"),
+        default=18.75, min=0.0, max=600.0)
+    particle_sound_loop: bpy.props.BoolProperty(
+        name="Sound loops",
+        description=(
+            "Repeat while the emitter runs. 503 of the game's 1135 indexed "
+            "sounds loop -- steam, fans and lifts do, switches do not"),
+        default=True)
+    mix_pulse_marine: bpy.props.IntProperty(
+        name="Pulse rifle",
+        description=(
+            "Relative chance of a marine with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_flame_marine: bpy.props.IntProperty(
+        name="Flamethrower",
+        description=(
+            "Relative chance of a marine with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_smart_marine: bpy.props.IntProperty(
+        name="Smartgun",
+        description=(
+            "Relative chance of a marine with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_sadar_marine: bpy.props.IntProperty(
+        name="SADAR",
+        description=(
+            "Relative chance of a marine with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_grenade_marine: bpy.props.IntProperty(
+        name="Grenade launcher",
+        description=(
+            "Relative chance of a marine with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_minigun_marine: bpy.props.IntProperty(
+        name="Minigun",
+        description=(
+            "Relative chance of a marine with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_pistol_marine: bpy.props.IntProperty(
+        name="Pistol",
+        description=(
+            "Relative chance of a marine with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_shotgun_civilian: bpy.props.IntProperty(
+        name="Shotgun",
+        description=(
+            "Relative chance of a civilian with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_pistol_civilian: bpy.props.IntProperty(
+        name="Pistol",
+        description=(
+            "Relative chance of a civilian with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_flame_civilian: bpy.props.IntProperty(
+        name="Flamethrower",
+        description=(
+            "Relative chance of a civilian with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_unarmed_civilian: bpy.props.IntProperty(
+        name="Unarmed",
+        description=(
+            "Relative chance of a civilian with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
+    mix_molotov_civilian: bpy.props.IntProperty(
+        name="Molotov",
+        description=(
+            "Relative chance of a civilian with this weapon. The engine rolls "
+            "against the sum of all fifteen weights, so only the proportions "
+            "matter -- 1 and 2 behave like 10 and 20"),
+        default=0, min=0, max=10000)
     death_damage: bpy.props.IntProperty(
         name="Damage",
         description=(
@@ -682,6 +879,41 @@ PLACEABLES = (
         "MESH_CUBE", CAT_GAMEPLAY, KIND_AREA_SWITCH),
 
     _PlaceableSpec(
+        "multi_switch", "Multi Switch  (logic)", (
+            "A switch with no box: other switches drive it, and it drives the "
+            "objects named below. This is how a level says 'only do this when "
+            "every condition is met', and it is the second commonest trigger "
+            "in the game -- 1040 of them across 45 levels. Its usual mode is "
+            "Time Delay, because it is a step in a chain rather than "
+            "somewhere to walk"),
+        "EMPTY_SINGLE_ARROW", CAT_GAMEPLAY, KIND_MULTI_SWITCH),
+
+    _PlaceableSpec(
+        "self_destruct", "Self Destruct  (countdown)", (
+            "Arms a countdown that destroys the level -- the escape sequence. A "
+            "switch starts it, the same way a switch arms a kill volume, so "
+            "point one at this. The timer is how long the player has. A level "
+            "may carry more than one"),
+        "EMPTY_SINGLE_ARROW", CAT_GAMEPLAY, KIND_SELF_DESTRUCT),
+
+    _PlaceableSpec(
+        "message", "Message  (text or cutscene)", (
+            "Shows a line of the game's own text, and can start a cutscene -- "
+            "the storyline beats, and the mission briefing that appears as the "
+            "level loads. A switch sends it code 2 to arm it AND show it; "
+            "plain 'on' only arms it. 314 of them across 33 levels"),
+        "EMPTY_SINGLE_ARROW", CAT_GAMEPLAY, KIND_MESSAGE),
+
+    _PlaceableSpec(
+        "particle_generator", "Particle Generator  (spark, steam, smoke, "
+        "flame)", (
+            "An emitter. It runs only while its module is VISIBLE, which is the "
+            "opposite of an enemy generator -- one the player can never see does "
+            "nothing, silently. 570 of them across 44 levels. Spark and flame "
+            "also light the room; steam and black smoke only emit"),
+        "EMPTY_SINGLE_ARROW", CAT_EFFECTS, KIND_PARTICLE_GENERATOR),
+
+    _PlaceableSpec(
         "global_generator", "Global Generator Data", (
             "GLOGENDC: one per level. Sets the default enemy kind, the NPC "
             "limit, spawns per minute, and the hive state change time. Placing "
@@ -828,12 +1060,10 @@ PLACEABLES = (
             "in the panel - the folder it comes from is the level's Sound "
             "Directory, set once for the whole level"),
         "MESH_UVSPHERE", CAT_SOUND, KIND_SOUND),
-    _PlaceableSpec(
-        "placeholder_effect", "Particle Effect", (
-            "NOT IMPLEMENTED. One of the game's own particle systems, such as "
-            "sparks or smoke, attached to a point in the level. Placing one "
-            "exports nothing yet"),
-        "MESH_UVSPHERE", CAT_EFFECTS, KIND_PLACEHOLDER),
+    # The Effects category's particle entry used to be a placeholder here, so the
+    # menu offered two of them: a real emitter under Gameplay and one that
+    # exported nothing under Effects. The real one has moved into this category
+    # and the placeholder is gone.
     _PlaceableSpec(
         "placeholder_morph", "Morph", (
             "NOT IMPLEMENTED. Geometry that moves or changes shape: doors, "
@@ -1252,9 +1482,11 @@ class RIF_PT_placeable(bpy.types.Panel):
             # piece is a switch, which is not offered yet.
             box.label(text="Needs a switch to complete it", icon="ERROR")
 
-        if kind == KIND_AREA_SWITCH:
+        if kind in (KIND_AREA_SWITCH, KIND_MULTI_SWITCH):
             box = layout.box()
-            box.label(text="Area switch", icon="TRIA_RIGHT")
+            box.label(
+                text=("Area switch" if kind == KIND_AREA_SWITCH
+                      else "Multi switch"), icon="TRIA_RIGHT")
             box.prop(settings, "switch_mode")
             if settings.switch_mode in ("0", "4", "5"):
                 box.prop(settings, "switch_time")
@@ -1274,6 +1506,52 @@ class RIF_PT_placeable(bpy.types.Panel):
                 targets.label(text="A switch with no targets does nothing",
                               icon="INFO")
 
+        if kind == KIND_SELF_DESTRUCT:
+            box = layout.box()
+            box.label(text="Self destruct", icon="ERROR")
+            box.prop(settings, "self_destruct_timer")
+            box.label(text="Needs a switch to arm it", icon="INFO")
+
+        if kind == KIND_MESSAGE:
+            box = layout.box()
+            box.label(text="Message", icon="INFO")
+            box.prop(settings, "message_string")
+            box.prop(settings, "message_shown_at_start")
+            # Said in the panel, because the name of the field suggests the
+            # opposite and the engine will not show anything on its own.
+            box.label(text="A switch shows it, with code 2", icon="ERROR")
+
+
+        if kind == KIND_PARTICLE_GENERATOR:
+            box = layout.box()
+            box.label(text="Particle generator", icon="PARTICLES")
+            # The emitter is directional: the engine rotates every particle's
+            # velocity by this object's own rotation, so where the arrow points
+            # is where the sparks go. Said here because nothing on screen shows
+            # it and the field has no widget of its own.
+            box.label(text="Particles leave along the object's rotation",
+                      icon="ORIENTATION_GLOBAL")
+            box.prop(settings, "particle_type")
+            if settings.particle_type == "0":
+                box.prop(settings, "particle_frequency")
+            else:
+                box.prop(settings, "particle_quantity")
+            box.prop(settings, "particle_probability")
+            box.prop(settings, "particle_speed")
+            box.prop(settings, "particle_active")
+
+            sound = layout.box()
+            sound.label(text="Sound", icon="SPEAKER")
+            sound.prop(settings, "particle_sound")
+            if settings.particle_sound.strip():
+                sound.prop(settings, "particle_sound_inner")
+                sound.prop(settings, "particle_sound_outer")
+                sound.prop(settings, "particle_sound_loop")
+            if settings.particle_type in ("0", "3"):
+                box.label(text="This one lights the room", icon="INFO")
+            if settings.particle_probability == 0:
+                box.label(text="0% means almost never", icon="ERROR")
+
         if kind == KIND_DEATH_VOLUME:
             box = layout.box()
             box.label(text="Kill volume", icon="ERROR")
@@ -1289,8 +1567,36 @@ class RIF_PT_placeable(bpy.types.Panel):
             box.label(text="Spawning budget", icon="OPTIONS")
             box.prop(settings, "max_npcs")
             box.prop(settings, "npcs_per_minute")
+            # `BH_GENER.C:189` turns the whole generator system off when the
+            # rate is zero, and nothing in the game says so -- the level simply
+            # has no enemies. Said here, where the number is typed, as well as
+            # by the validator, which only speaks once the level is exported.
+            if settings.npcs_per_minute <= 0:
+                box.label(text="0 switches every generator off",
+                          icon="ERROR")
+            if settings.max_npcs <= 0:
+                box.label(text="0 lets nothing spawn at all", icon="ERROR")
             box.prop(settings, "npc_acceleration")
             box.prop(settings, "hive_state_change_time")
+            box = layout.box()
+            box.label(text="Weights (Mixed Enemy Generator)",
+                      icon="RNDCURVE")
+            box.label(text="The engine rolls against their sum", icon="INFO")
+            box.label(text="Aliens")
+            for field in ("mix_drone", "mix_predalien", "mix_praetorian"):
+                box.prop(settings, field)
+            box.label(text="Marines")
+            for field in ("mix_pulse_marine", "mix_flame_marine",
+                          "mix_smart_marine", "mix_sadar_marine",
+                          "mix_grenade_marine", "mix_minigun_marine",
+                          "mix_pistol_marine"):
+                box.prop(settings, field)
+            box.label(text="Civilians")
+            for field in ("mix_shotgun_civilian", "mix_pistol_civilian",
+                          "mix_flame_civilian", "mix_unarmed_civilian",
+                          "mix_molotov_civilian"):
+                box.prop(settings, field)
+
             box = layout.box()
             box.label(text="Creature for generators without weights",
                       icon="ARMATURE_DATA")

@@ -324,7 +324,11 @@ def build_rif_level(objects, level_name, texture_paths=None,
                     envir=None,
                     death_volumes=None,
                     mission_objective=None,
-                    area_switches=None) -> bytes:
+                    area_switches=None,
+                    multi_switches=None,
+                    self_destructs=None,
+                    messages=None,
+                    particles=None) -> bytes:
     """Assemble a level RIF: shapes + objects + MODULEDT + REBENVDT.
 
     Composition:
@@ -631,7 +635,25 @@ def build_rif_level(objects, level_name, texture_paths=None,
     if mission_objective is not None:
         speclobj_children.append(mission_objective.chunk())
 
+    # Emitters, which a switch turns on and off.
+    for emitter in (particles or []):
+        speclobj_children.append(
+            emitter.chunk() if hasattr(emitter, "chunk") else emitter)
+
+    # Messages, which a switch shows with code 2.
+    for message in (messages or []):
+        speclobj_children.append(message)
+
+    # The countdown, which a switch arms like a volume.
+    for target in (self_destructs or []):
+        speclobj_children.append(
+            target.chunk() if hasattr(target, "chunk") else target)
+
     # And the triggers, which are what finish an objective or arm a volume.
+    for switch in (multi_switches or []):
+        speclobj_children.append(
+            switch.chunk() if hasattr(switch, "chunk") else switch)
+
     for switch in (area_switches or []):
         speclobj_children.append(
             switch.chunk() if hasattr(switch, "chunk") else switch)
