@@ -1,4 +1,4 @@
-# RIF Exporter
+# Aliens vs Predator RIF Exporter
 
 A Blender extension that writes `.rif` levels for **Aliens versus Predator
 (1999)**, the original Rebellion game and its *Classic* re-release.
@@ -64,7 +64,7 @@ one that announces itself.
 1. Download `rif_exporter-<version>.zip`.
 2. In Blender: **`Edit > Preferences > Add-ons`**, then the dropdown in the
    top-right and **`Install from Disk…`**.
-3. Choose the zip. The add-on appears as **RIF Exporter**; tick it.
+3. Choose the zip. The add-on appears as **Aliens vs Predator RIF Exporter**; tick it.
 
 It installs into Blender's own extensions folder, and updates or removes the
 same way.
@@ -84,12 +84,12 @@ python avp_rif_exporter/tools/build_extension.py
 ### Pointing at the game
 
 Texture and sound loading both read from your game install, so tell the add-on
-where it is. In **`Edit > Preferences > Add-ons > RIF Exporter`**, set **Game
+where it is. In **`Edit > Preferences > Add-ons > Aliens vs Predator RIF Exporter`**, set **Game
 Directory** to the folder containing `avp_rifs` and `fastfile`.
 
 ### The settings in full
 
-Everything lives in **`Edit > Preferences > Add-ons > RIF Exporter`**.
+Everything lives in **`Edit > Preferences > Add-ons > Aliens vs Predator RIF Exporter`**.
 
 | | |
 |---|---|
@@ -231,7 +231,7 @@ sound.
   kept hidden until the player opens the door. Parent a room to the corridor it
   leads off.
 
-**4. Point at the game.** `Edit > Preferences > Add-ons > RIF Exporter > Game
+**4. Point at the game.** `Edit > Preferences > Add-ons > Aliens vs Predator RIF Exporter > Game
 Directory`, then **Load Game Textures** to bring the game's textures in.
 
 **5. Texture the walls.** Assign the imported materials as you would any other.

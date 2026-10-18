@@ -1,4 +1,4 @@
-"""RIF Exporter — Blender Extension entry point."""
+"""Aliens vs Predator RIF Exporter — Blender Extension entry point."""
 from . import operators
 
 

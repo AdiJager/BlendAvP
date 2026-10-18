@@ -185,7 +185,8 @@ class RIF_SwitchTarget(bpy.types.PropertyGroup):
         description=(
             "What to send. 'on' and 'off' are the whole vocabulary for a kill "
             "volume; the numbered codes mean something to a mission objective, "
-            "a message or a track, and are ignored by a kill volume"),
+            "a message or a track, and are ignored by a kill volume. The same "
+            "code can mean different things depending on what it is sent to"),
         items=[
             ("1", "on", "Send on. Completes a mission objective, arms a kill "
                         "volume or the self destruct, plays a sound"),
@@ -200,8 +201,40 @@ class RIF_SwitchTarget(bpy.types.PropertyGroup):
              "Off, with code 1: a mission objective stops being visible, a "
              "message stops being armed"),
             ("4", "off, code 2", "Off, with code 2"),
+            ("17", "on, code 8",
+             "On, with code 8. Vaults sends this from three of its multi "
+             "switches, so the code is real, but what it does depends on the "
+             "target and has not been traced for any of them"),
+            ("16", "off, code 8", "Off, with code 8"),
         ],
         default="1")
+
+
+# The four emitter types and the numbers retail uses for each, from a census
+# of all 570 generators in the 63 shipped levels. `probability` is 0 in every
+# one of them, so it is not listed.
+PARGEN_DEFAULTS = {
+    "0": {"frequency": 0.0, "rate": 80, "speed": 0.10},
+    "1": {"frequency": 0.0, "rate": 0, "speed": 0.0},
+    "2": {"frequency": 0.0, "rate": 0, "speed": 0.0},
+    "3": {"frequency": 0.0, "rate": 0, "speed": 0.0},
+}
+
+
+def _apply_particle_defaults(settings, _context):
+    """Write the numbers retail uses for the type just chosen.
+
+    A rate of 0 is the game's own value for steam, smoke and flame: the
+    engine divides by `max(quantity, 1)`, so it means one particle a second,
+    and with speed 0 that particle does not move. That is what the game's
+    steam looks like, and an artist who wants a plume has to raise both.
+    """
+    chosen = PARGEN_DEFAULTS.get(settings.particle_type)
+    if not chosen:
+        return
+    settings.particle_frequency = chosen["frequency"]
+    settings.particle_quantity = chosen["rate"]
+    settings.particle_speed = chosen["speed"]
 
 
 class RIF_PlaceableSettings(bpy.types.PropertyGroup):
@@ -355,7 +388,8 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
                ("1", "Steam", "Steam, no light"),
                ("2", "Black smoke", "Black smoke, no light"),
                ("3", "Flame", "A flame that lights the room")],
-        default="0")
+        default="0",
+        update=_apply_particle_defaults)
     particle_frequency: bpy.props.FloatProperty(
         name="Frequency (s)",
         description=(
@@ -363,12 +397,13 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
             "interval from Quantity instead, and ignore this"),
         default=0.0, min=0.0, max=600.0)
     particle_quantity: bpy.props.IntProperty(
-        name="Quantity",
+        name="Rate",
         description=(
-            "How many emissions per second, for Steam, Black smoke and Flame. "
-            "The engine divides by it, so it is a rate and not a count. Spark "
-            "ignores it and uses Frequency"),
-        default=50, min=0, max=65535)
+            "How many particles per second, for Steam, Black smoke and Flame. "
+            "The engine divides the frame by it, so it is a rate and not a "
+            "count: a bigger number means MORE particles, and 0 is treated as "
+            "1, which is one a second. Spark ignores it and uses Frequency"),
+        default=80, min=0, max=65535)
     particle_probability: bpy.props.IntProperty(
         name="Probability (%)",
         description=(
@@ -379,22 +414,26 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
     particle_speed: bpy.props.FloatProperty(
         name="Speed (m/s)",
         description=(
-            "How fast the particles leave. Retail's sparks use 0.10 to 0.15, "
-            "steam rather more"),
-        default=0.0, min=0.0, max=600.0)
+            "How fast the particles leave. At 0 they all stay at the emitter "
+            "and pile up on top of each other, which looks like a single "
+            "particle however many are being made -- retail writes 0 for "
+            "steam, smoke and flame and 0.10 for sparks. Raise this before "
+            "raising Rate"),
+        default=0.10, min=0.0, max=600.0)
     particle_active: bpy.props.BoolProperty(
         name="Active",
         description=(
             "Emit from the start. All 570 of the game's generators are active, "
             "and a switch can turn one on or off"),
         default=True)
-    particle_sound: bpy.props.StringProperty(
+    particle_sound: bpy.props.EnumProperty(
         name="Sound",
         description=(
-            "A .wav file name from the level's Sound Directory, for instance "
-            "Ed_Spark05.wav. 444 of the game's 570 emitters have one. Leave it "
-            "empty for a silent emitter"),
-        default="")
+            "A sound from the level's Sound Directory. 444 of the game's 570 "
+            "emitters have one; '(none)' is a silent emitter. The list is the "
+            "same one the Sound object offers, so a file that a placed sound "
+            "can play is a file an emitter can play"),
+        items=lambda self, context: _sound_items(self, context))
     particle_sound_inner: bpy.props.FloatProperty(
         name="Sound inner (m)",
         description=(
@@ -1463,12 +1502,32 @@ class RIF_PT_placeable(bpy.types.Panel):
             box.prop(settings, "excluded_hard")
 
         if kind == KIND_WEIGHTED:
+            # The fifteen weights belong to THIS object: it is the one that
+            # writes a GENEXSET. They were drawn under Global Generator Data,
+            # which carries the budget and no weights at all, so the panel was
+            # editing fields on a marker that the engine never reads them from.
             box = layout.box()
             box.label(text="What should spawn here?", icon="MESH_UVSPHERE")
-            box.prop(settings, "mix_drone")
-            box.prop(settings, "mix_predalien")
-            box.prop(settings, "mix_praetorian")
-            box.label(text="Values are relative to each other", icon="INFO")
+            box.label(text="The engine rolls against the sum", icon="INFO")
+            box.label(text="Aliens")
+            for field in ("mix_drone", "mix_predalien", "mix_praetorian"):
+                box.prop(settings, field)
+            box.label(text="Marines")
+            for field in ("mix_pulse_marine", "mix_flame_marine",
+                          "mix_smart_marine", "mix_sadar_marine",
+                          "mix_grenade_marine", "mix_minigun_marine",
+                          "mix_pistol_marine"):
+                box.prop(settings, field)
+            box.label(text="Civilians")
+            for field in ("mix_shotgun_civilian", "mix_pistol_civilian",
+                          "mix_flame_civilian", "mix_unarmed_civilian",
+                          "mix_molotov_civilian"):
+                box.prop(settings, field)
+            if not any(getattr(settings, f)
+                       for f in ("mix_drone", "mix_predalien",
+                                 "mix_praetorian", "mix_pulse_marine")):
+                box.label(text="No weights: the level's default creature", 
+                          icon="ERROR")
 
         if kind == KIND_MISSION_OBJECTIVE:
             box = layout.box()
@@ -1543,7 +1602,17 @@ class RIF_PT_placeable(bpy.types.Panel):
             sound = layout.box()
             sound.label(text="Sound", icon="SPEAKER")
             sound.prop(settings, "particle_sound")
-            if settings.particle_sound.strip():
+            # Imported here and not at the top of draw: an unconditional
+            # relative import runs for every kind of object, and the tests load
+            # this module standalone, where there is no package to be relative
+            # to. _sound_items has always imported it lazily for that reason.
+            from . import sounds
+
+            if settings.particle_sound != sounds.NONE_CHOICE:
+                # The same button a placed sound offers, and the same operator:
+                # it reads whichever field the object's kind uses.
+                sound.operator("object.rif_audition_sound",
+                               icon="PLAY", text="Play")
                 sound.prop(settings, "particle_sound_inner")
                 sound.prop(settings, "particle_sound_outer")
                 sound.prop(settings, "particle_sound_loop")
@@ -1551,6 +1620,11 @@ class RIF_PT_placeable(bpy.types.Panel):
                 box.label(text="This one lights the room", icon="INFO")
             if settings.particle_probability == 0:
                 box.label(text="0% means almost never", icon="ERROR")
+            if settings.particle_speed <= 0:
+                # Every particle stays put and they overlap, so the result reads
+                # as one particle no matter how many are made.
+                box.label(text="Speed 0 piles them up: looks like one",
+                          icon="ERROR")
 
         if kind == KIND_DEATH_VOLUME:
             box = layout.box()
@@ -1578,24 +1652,6 @@ class RIF_PT_placeable(bpy.types.Panel):
                 box.label(text="0 lets nothing spawn at all", icon="ERROR")
             box.prop(settings, "npc_acceleration")
             box.prop(settings, "hive_state_change_time")
-            box = layout.box()
-            box.label(text="Weights (Mixed Enemy Generator)",
-                      icon="RNDCURVE")
-            box.label(text="The engine rolls against their sum", icon="INFO")
-            box.label(text="Aliens")
-            for field in ("mix_drone", "mix_predalien", "mix_praetorian"):
-                box.prop(settings, field)
-            box.label(text="Marines")
-            for field in ("mix_pulse_marine", "mix_flame_marine",
-                          "mix_smart_marine", "mix_sadar_marine",
-                          "mix_grenade_marine", "mix_minigun_marine",
-                          "mix_pistol_marine"):
-                box.prop(settings, field)
-            box.label(text="Civilians")
-            for field in ("mix_shotgun_civilian", "mix_pistol_civilian",
-                          "mix_flame_civilian", "mix_unarmed_civilian",
-                          "mix_molotov_civilian"):
-                box.prop(settings, field)
 
             box = layout.box()
             box.label(text="Creature for generators without weights",

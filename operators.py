@@ -1521,6 +1521,7 @@ def _collect_particles(context, objs):
     in 444 of the 570 retail generators, but there is no writer for it yet, and
     a generator without its sound is a whole emitter rather than a broken one.
     """
+    from . import sounds
     from .placeables import KIND_PARTICLE_GENERATOR, PLACEABLE_PROP
     from .rif.chunks.particle import (ParticleGenerator,
                                       PARGEN_TYPE_SPARK)
@@ -1554,7 +1555,10 @@ def _collect_particles(context, objs):
             quantity=int(settings.particle_quantity),
             speed_metres=float(settings.particle_speed),
             active=bool(settings.particle_active),
-            sound_name=(settings.particle_sound.strip() or None),
+            # The list uses the same sentinel as the sound object's, which is a
+            # non-empty string and so cannot be tested for truth.
+            sound_name=(None if settings.particle_sound == sounds.NONE_CHOICE
+                        else settings.particle_sound or None),
             # Millimetres in the chunk, metres in the panel.
             sound_inner_mm=int(round(
                 float(settings.particle_sound_inner) * 1000.0)),
@@ -2100,16 +2104,23 @@ class RIF_OT_audition_sound(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        """Offer the button only for a placed sound emitter."""
+        """Offer the button for anything that carries a chosen sound.
+
+        A placed sound and a particle generator both name a file from the
+        level's Sound Directory, and both are worth hearing before the level is
+        exported -- an emitter whose sound is wrong is easier to notice here
+        than in game.
+        """
         from . import placeables
         obj = context.active_object
-        return (obj is not None
-                and obj.get(placeables.PLACEABLE_PROP)
-                == placeables.KIND_SOUND)
+        if obj is None:
+            return False
+        return obj.get(placeables.PLACEABLE_PROP) in (
+            placeables.KIND_SOUND, placeables.KIND_PARTICLE_GENERATOR)
 
     def execute(self, context):
         """Carve the sound out of the library and play it."""
-        from . import sounds
+        from . import placeables, sounds
 
         obj = context.active_object
         root = sounds.game_root(context)
@@ -2118,9 +2129,13 @@ class RIF_OT_audition_sound(bpy.types.Operator):
                         "Set the game directory in preferences first")
             return {"CANCELLED"}
 
-        name = obj.rif_placeable.sound_wav
+        kind = obj.get(placeables.PLACEABLE_PROP)
+        field = ("particle_sound"
+                 if kind == placeables.KIND_PARTICLE_GENERATOR
+                 else "sound_wav")
+        name = getattr(obj.rif_placeable, field)
         if not name or name == sounds.NONE_CHOICE:
-            self.report({"ERROR"}, "No sound chosen for this emitter")
+            self.report({"ERROR"}, "No sound chosen")
             return {"CANCELLED"}
 
         directory = sounds.directory_of(context)
