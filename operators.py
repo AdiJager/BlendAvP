@@ -2028,6 +2028,59 @@ def _module_layout_problems(objs, hierarchy):
     return problems
 
 
+def _door_layout_problems(context):
+    """Return what is wrong with the doors in the scene.
+
+    A door is a module plus a second shape the engine moves
+    (`introduction/glossary.htm`: doors are made by morphing between two
+    versions of the shape). Three arrangements export and do nothing, and
+    none of them looks wrong in Blender: a module ticked as a door with no
+    child mesh, a tick on the leaf rather than the module, and a child mesh
+    with no geometry.
+    """
+    problems = []
+    for obj in context.scene.objects:
+        if obj.type != "MESH":
+            continue
+        if not getattr(obj, "rif_module_door", False):
+            continue
+        # A leaf ticked instead of its module is reported below with the
+        # message that names the mistake; saying "no child mesh" about it too
+        # would bury the useful line under a redundant one.
+        parent = obj.parent
+        if (parent is not None and parent.type == "MESH"
+                and not getattr(parent, "rif_module_door", False)):
+            continue
+        leaves = [child for child in obj.children if child.type == "MESH"]
+        if not leaves:
+            problems.append(
+                f"Door {obj.name!r} has no child mesh, so there is no leaf "
+                "to write into SHPMORPH and nothing will move. Parent a "
+                "mesh to it and leave it where it is")
+        elif not leaves[0].data.polygons:
+            problems.append(
+                f"Door {obj.name!r}: its leaf {leaves[0].name!r} has no "
+                "faces, so the sub-shape would be empty")
+
+    # The leaf marked instead of the module: nothing above catches it,
+    # because such a mesh is a door with no child of its own, which the
+    # first check reports -- but the message would name the leaf rather than
+    # the mistake. Say the useful thing.
+    for obj in context.scene.objects:
+        if obj.type != "MESH" or not getattr(obj, "rif_module_door", False):
+            continue
+        parent = obj.parent
+        if parent is None or parent.type != "MESH":
+            continue
+        if getattr(parent, "rif_module_door", False):
+            continue
+        problems.append(
+            f"{obj.name!r} is ticked as a door but is a child of "
+            f"{parent.name!r}, which is not. The flag belongs on the "
+            "module and the leaf goes inside it as a child")
+    return problems
+
+
 def _budget_layout_problems(context, spawns):
     """Return what is wrong with how the level pays for its creatures.
 
@@ -2088,6 +2141,8 @@ def _report_layout(operator, context, objs, hierarchy):
     # about everything except the fault that stops a level spawning at all.
     spawns, _skipped = _collect_spawns(context, objs)
     for problem in _budget_layout_problems(context, spawns):
+        _report(operator, {"WARNING"}, problem)
+    for problem in _door_layout_problems(context):
         _report(operator, {"WARNING"}, problem)
 
 

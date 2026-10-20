@@ -155,7 +155,12 @@ SHAPE_FLAG_EXTERNALFILE = 0x00001000   # makes Projload.cpp:1974 misfire
 # Flags actually written into SHPHEAD1. Always 0 for our exports: prelight is
 # activated by the SHPVTINT chunk, and 0x1000 must stay clear to avoid the
 # SHAPE_FLAG_EXTERNALFILE collision above.
-SHAPE_FLAGS_DEFAULT = 0
+SHAPE_FLAG_RECENTRED = 0x00002000   # SHPCHUNK.HPP:16, set when the
+                                    # vertices have been moved to the
+                                    # origin and location carries the
+                                    # shift. 4554 of retail's 16653
+                                    # shapes carry it.
+SHAPE_FLAGS_DEFAULT = SHAPE_FLAG_RECENTRED
 
 # Prelight path: full white per vertex (packed 0x00RRGGBB).
 PRELIGHT_WHITE = 0x00FFFFFF
@@ -264,6 +269,7 @@ def build_rif_multi(objects, hierarchy=None,
         shape = _build_shape_chunk(
             obj.data, obj.name, file_id, slot_bitmaps,
             shape_flags=shape_flags, recentre=True,
+            matrix=_rotation_scale_matrix(obj),
         )
         shapes.append(shape)
 
@@ -439,6 +445,32 @@ def build_rif_level(objects, level_name, texture_paths=None,
     if not objects:
         raise ValueError("build_rif_level requires at least one object")
 
+    # A door leaf is a child mesh of a module marked as a door. Its geometry
+    # goes into SHPMORPH > SUBSHAPE, not into a shape and module of its own, so
+    # it leaves the module list here -- before anything is indexed. file ids,
+    # object indices, module origins and the hierarchy all derive from this
+    # list, and dropping a mesh later would shift every one of them.
+    door_leaves = {}
+    for candidate in objects:
+        if not getattr(candidate, "rif_module_door", False):
+            continue
+        for child in candidate.children:
+            if child.type == "MESH":
+                door_leaves[candidate.name] = child
+                break
+    if door_leaves:
+        leaves = {leaf.name for leaf in door_leaves.values()}
+        objects = [obj for obj in objects if obj.name not in leaves]
+        if not objects:
+            raise ValueError(
+                "the scene has only door leaves; a leaf needs its module")
+
+    # Indices of the modules that are doors. Their neighbours list them with a
+    # non-zero `branch_no`, and that entry is the only thing that makes the
+    # engine treat a module as a door at all (`Projload.cpp:2344`).
+    door_peers = {index for index, candidate in enumerate(objects)
+                  if getattr(candidate, "rif_module_door", False)}
+
     # Prelight is carried by SHPVTINT and activated by the loader itself
     # (Projload.cpp:1455/2067). SHPHEAD1.flags must stay 0: bit 0x1000 is
     # ALSO SHAPE_FLAG_EXTERNALFILE (SHPCHUNK.HPP:15) and triggers the
@@ -501,7 +533,11 @@ def build_rif_level(objects, level_name, texture_paths=None,
         shape = _build_shape_chunk(
             obj.data, obj.name, file_id, slot_bitmaps,
             shape_flags=shape_flags, recentre=True,
+            matrix=_rotation_scale_matrix(obj),
         )
+        leaf = door_leaves.get(obj.name)
+        if leaf is not None:
+            _attach_door_morph(shape, obj, leaf, texture_paths)
         shapes.append(shape)
 
         # `module_origins[i]` is the true world position, which the module box
@@ -529,13 +565,18 @@ def build_rif_level(objects, level_name, texture_paths=None,
             # actually meet. Without it NPCs have no path anywhere.
             module_data = {
                 "vmdarray": modules.build_vmdarray(
-                    i, modules.linked_modules(i, parents)),
+                    i, _linked_peers(i, parents, door_peers), door_peers),
                 "adjmdlep": modules.build_adjmdlep(
                     module_neighbours.get(i, []), module_origins),
                 "modacous": (-1, -1.0, 0),
                 "waypoints": (waypoints or {}).get(i),
                 # MODFLAGS, read off the object. Zero means no chunk: 12335 of
                 # retail's 12813 modules carry none.
+                # A door is a module with a strategy, not a kind of its
+                # own: `Objsetup.cpp` reads the strategy from OBJPRJDT and
+                # moves the shape the module already has.
+                "door": (None if not getattr(obj, "rif_module_door", False)
+                         else _build_door_strategy(obj)),
                 "module_flags": module_flags(
                     airduct=bool(getattr(obj, "rif_module_airduct", False)),
                     stairs=bool(getattr(obj, "rif_module_stairs", False)),
@@ -564,6 +605,7 @@ def build_rif_level(objects, level_name, texture_paths=None,
             num_vertices=num_vertices,
             module_data=module_data,
             prelight_intensities=prelight,
+            strategy=module_data.get("door"),
         ))
 
     # ---- placed objects -------------------------------------------------
@@ -761,8 +803,87 @@ def _build_hierarchy_node(name, children_of):
     return ObjectHierarchyChunk(node_children)
 
 
+def _attach_door_morph(shape, module, leaf, texture_paths):
+    """Append SHPMORPH for a door leaf to its module's REBSHAPE.
+
+    The leaf's geometry has to end up in the same frame as the module's, or the
+    engine draws the sub-shape at the module's origin instead of where the door
+    is. The module's shape is recentred, so its local vertices are the world
+    position minus `shape.origin_offset`; the leaf gets the same treatment plus
+    the distance between the two objects.
+
+    Only the translation is taken from the leaf's transform. A leaf that is also
+    rotated would need its normals turned as well, and the panel says so.
+
+    `SUBSHAPE` carries the same geometry chunks as `REBSHAPE`: a sub-shape is a
+    shape. Only the header differs, and it holds the counts, the radius and the
+    bounds that the shape header also has.
+    """
+    from .chunks.morph import build_morph_chunk
+
+    slots = _resolve_bitmap_indices(leaf.data, texture_paths)
+    verts, vert_normals, polys, poly_normals, uv_lists = \
+        _extract_geometry(leaf.data, slots, _rotation_scale_matrix(leaf))
+    if not verts or not polys:
+        raise ValueError(f"door leaf {leaf.name!r} has no geometry")
+
+    # The engine blends the two shapes VERTEX BY VERTEX: across all 35 morphed
+    # modules in retail, module_verts == sub_verts in every one. A leaf with a
+    # different count would be blended against unrelated vertices and collapse
+    # into a shape nobody authored, which reads in game as a door that is simply
+    # too small.
+    module_verts = shape.children[0].num_verts
+    if len(verts) != module_verts:
+        raise ValueError(
+            f"door leaf {leaf.name!r} has {len(verts)} vertices but its module "
+            f"{module.name!r} has {module_verts}; the engine blends them one "
+            f"for one, so the leaf must be a duplicate of the module")
+
+    # Where the leaf sits relative to its module, in RIF millimetres.
+    delta = leaf.matrix_world.translation - module.matrix_world.translation
+    dx, dy, dz = blender_to_rif_axis(delta.x, delta.y, delta.z)
+    shift = (meters_to_rif(dx) - shape.origin_offset[0],
+             meters_to_rif(dy) - shape.origin_offset[1],
+             meters_to_rif(dz) - shape.origin_offset[2])
+    verts = [(x + shift[0], y + shift[1], z + shift[2]) for x, y, z in verts]
+    bounds = _compute_bounds(verts)
+    centre = _compute_centre(bounds)
+    radius = _compute_radius(verts, centre)
+    uv_pixels = _uv_to_pixels(uv_lists)
+
+    geometry = [
+        ShapeCentreChunk(centre, radius),
+        ShapeVertexChunk(verts),
+        ShapeVertexNormalChunk(vert_normals),
+        ShapePolygonNormalChunk(poly_normals),
+        ShapePolygonChunk(polys),
+        ShapeUVCoordChunk(uv_pixels),
+    ]
+    shape.children.append(build_morph_chunk(
+        geometry,
+        num_verts=len(verts),
+        num_polys=len(polys),
+        radius=radius,
+        max_xyz=bounds["max"],
+        min_xyz=bounds["min"],
+    ))
+
+
+def _rotation_scale_matrix(obj):
+    """Return the object's rotation and scale, with translation removed.
+
+    The shape needs the transform so a scaled or rotated object draws what the
+    module bounds describe. The translation is left out on purpose: the
+    object's `location` already carries it, and applying it twice would
+    place the geometry at twice the distance from the origin.
+    """
+    matrix = obj.matrix_world.copy()
+    matrix.translation = (0.0, 0.0, 0.0)
+    return matrix
+
+
 def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
-                       shape_flags=None, recentre=False):
+                       shape_flags=None, recentre=False, matrix=None):
     """Return a fully assembled REBSHAPE chunk for one mesh.
 
     shape_flags : SHPHEAD1.flags value; defaults to SHAPE_FLAGS_DEFAULT.
@@ -783,7 +904,7 @@ def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
         shape_flags = SHAPE_FLAGS_DEFAULT
 
     verts_int, vert_normals, polys, poly_normals, uv_lists = \
-        _extract_geometry(mesh, slot_bitmaps)
+        _extract_geometry(mesh, slot_bitmaps, matrix)
     offset = (0, 0, 0)
     if recentre:
         offset = _compute_centre(_compute_bounds(verts_int))
@@ -844,8 +965,16 @@ def _build_object_chunk(name, location_rif, orientation_rif,
         num_vertices. The linked REBSHAPE must have ShapeFlag_PreLit
         set or the engine ignores this chunk (see Kshape.c).
     """
+    # PLACED_OBJECT_FLAGS is what makes the engine treat an object as a placed
+    # object instead of a module (Projload.cpp: the header flag decides which
+    # branch runs). A door is a MODULE that happens to carry a strategy, so the
+    # flag must follow module_data, not strategy: keying it on the strategy
+    # exported every door as a placed object, and the engine then never
+    # registered it as a module -- no geometry, no collision, no navigation.
     obj_header = ObjectHeaderChunk(
-        flags=(PLACED_OBJECT_FLAGS if strategy is not None else OBJ_FLAGS),
+        flags=(OBJ_FLAGS if module_data is not None
+               else PLACED_OBJECT_FLAGS if strategy is not None
+               else OBJ_FLAGS),
         lock_user=DEFAULT_LOCK_USER,
         location=location_rif,
         orientation=orientation_rif,
@@ -864,7 +993,13 @@ def _build_object_chunk(name, location_rif, orientation_rif,
         # The engine reaches the strategy as
         # `ob->lookup_single_child("OBJPRJDT")->lookup_single_child("AVPSTRAT")`,
         # so both levels are needed (Objsetup.cpp:2235).
-        children.append(ObjectProjectDataChunk([AVPStrategyChunk(**strategy)]))
+        # A dict is the SimpleObject record a placed object uses; a
+        # finished chunk is a strategy of its own, like a door.
+        if hasattr(strategy, "serialize"):
+            children.append(ObjectProjectDataChunk([strategy]))
+        else:
+            children.append(ObjectProjectDataChunk(
+                [AVPStrategyChunk(**strategy)]))
     if prelight_intensities:
         children.append(ShapeVertexIntensitiesChunk(
             light_set_name=DEFAULT_LIGHT_SET,
@@ -872,6 +1007,61 @@ def _build_object_chunk(name, location_rif, orientation_rif,
             intensities=prelight_intensities,
         ))
     return ObjectChunk(children)
+
+
+def _linked_peers(index, parents, door_peers):
+    """Return the modules visible from `index`, with doors joined to siblings.
+
+    Parenting declares two spaces connected, and that is enough for rooms.
+    A door is different: it sits between spaces and has a single parent, so
+    the room on its other side is a sibling and would never list it -- the
+    door then exists from one side only. A door is therefore linked to its
+    parent AND its siblings, and a sibling lists the door back.
+    """
+    from . import modules
+
+    peers = modules.linked_modules(index, parents)
+    parent = parents[index]
+
+    # Siblings: modules sharing this one's parent.
+    siblings = [other for other, other_parent in enumerate(parents)
+                if other != index and other_parent is not None
+                and other_parent == parent]
+
+    if index in door_peers:
+        # A door joins the spaces around it.
+        peers = peers + siblings
+    else:
+        # And a room lists the doorways it can reach through its parent.
+        peers = peers + [other for other in siblings if other in door_peers]
+
+    # The parent of a door is a room the door joins; keep it on both sides.
+    return list(dict.fromkeys(peers))
+
+
+def _build_door_strategy(obj):
+    """Return the DoorStrategyChunk for a module marked as a door."""
+    from .chunks.door import (
+        DoorStrategyChunk, DOOR_FLAG_HORIZONTAL, DOOR_FLAG_LIFT,
+        DOOR_FLAG_LOCKED, DOOR_FLAG_OPEN, DOOR_FLAG_PROXIMITY,
+    )
+
+    flags = 0
+    if getattr(obj, "rif_module_door_locked", True):
+        flags |= DOOR_FLAG_LOCKED
+    if getattr(obj, "rif_module_door_proximity", True):
+        flags |= DOOR_FLAG_PROXIMITY
+    if getattr(obj, "rif_module_door_open", False):
+        flags |= DOOR_FLAG_OPEN
+    if getattr(obj, "rif_module_door_lift", False):
+        flags |= DOOR_FLAG_LIFT
+    if getattr(obj, "rif_module_door_horizontal", False):
+        flags |= DOOR_FLAG_HORIZONTAL
+    return DoorStrategyChunk(
+        door_flags=flags,
+        open_seconds=float(getattr(obj, "rif_module_door_open_seconds", 1.0)),
+        close_seconds=float(getattr(obj, "rif_module_door_close_seconds", 0.5)),
+    )
 
 
 def _build_module_data(spec):
@@ -1160,12 +1350,25 @@ def _resolve_bitmap_indices(mesh, texture_paths=None):
     return result
 
 
-def _extract_geometry(mesh, slot_bitmaps):
-    """Return (verts_int, vert_normals, polys, poly_normals, uv_lists)."""
+def _extract_geometry(mesh, slot_bitmaps, matrix=None):
+    """Return (verts_int, vert_normals, polys, poly_normals, uv_lists).
+
+    `matrix` is the object's rotation and scale, without translation. It must be
+    applied here or the geometry ignores a scaled or rotated object while the
+    module bounds apply it -- the collision volume and the drawn shape then
+    disagree, and a door is walk-through while still triggering from inside the
+    volume nobody can see.
+    """
+    rotation = None
+    if matrix is not None:
+        rotation = matrix.to_3x3()
+
     verts_int = []
     vert_normals = []
     for vert in mesh.vertices:
         co = vert.co
+        if rotation is not None:
+            co = rotation @ co
         bx, by, bz = blender_to_rif_axis(co.x, co.y, co.z)
         verts_int.append((
             meters_to_rif(bx),
@@ -1173,6 +1376,8 @@ def _extract_geometry(mesh, slot_bitmaps):
             meters_to_rif(bz),
         ))
         n = vert.normal
+        if rotation is not None:
+            n = (rotation @ n).normalized()
         vert_normals.append(blender_to_rif_axis(n.x, n.y, n.z))
 
     uv_layer = mesh.uv_layers.active
@@ -1184,6 +1389,8 @@ def _extract_geometry(mesh, slot_bitmaps):
     for poly in mesh.polygons:
         indices = list(poly.vertices)
         n = poly.normal
+        if rotation is not None:
+            n = (rotation @ n).normalized()
         face_normal = blender_to_rif_axis(n.x, n.y, n.z)
 
         if uv_layer is not None:

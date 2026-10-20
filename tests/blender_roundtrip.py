@@ -1048,12 +1048,18 @@ def test_prelight_on_keeps_shape_flags_clear():
 
 @test
 def test_prelight_off_clears_shape_flags():
-    """With prelight disabled the shape flags must be exactly 0 (retail)."""
+    """Without prelight the only flag left is RECENTRED.
+
+    The shape is still recentred -- every module the exporter writes is -- so
+    SHAPE_FLAG_RECENTRED (0x2000) belongs on it whether or not prelight data is
+    written. What must never appear is the prelight/external-file bit 0x1000.
+    """
     obj = _make_cube()
     data = build_rif_level([obj], "lvl", include_prelight=False)
     idx, _size = _shphead1_of(data)
     flags = _read_i32(data, idx + 12)
-    assert flags == 0, f"flags = 0x{flags:08X}"
+    assert flags == 0x00002000, f"flags = 0x{flags:08X}"
+    assert flags & 0x00001000 == 0, f"flags = 0x{flags:08X}"
     assert _find_chunk(data, "SHPVTINT")[0] < 0, "SHPVTINT must be absent"
 
 

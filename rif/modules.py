@@ -211,13 +211,20 @@ def linked_modules(index, parents):
     return peers
 
 
-def build_vmdarray(self_index, visible_peers, door_branches=None):
+def build_vmdarray(self_index, visible_peers, door_peers=None):
     """Return the VMDARRAY entries for one module.
 
     Each entry is `(object_index, branch_no, flags, spare)`. `branch_no` is not
-    a boolean: a non-zero value marks a DOOR and is the index the visibility
-    script jumps to when that door is closed, so the exporter leaves every entry
-    at 0 until doors exist.
+    a boolean: a non-zero value is what tells the engine a module is a DOOR
+    (`Projload.cpp:2344` sets `MapStrategy = StrategyI_DoorPROX` when it is
+    non-zero, and `vmodi_null` when it is zero), and it doubles as the index the
+    visibility script jumps to while that door is closed (`MODULE.C:210`).
+
+    `door_peers` is the set of module indices that are doors. An entry naming
+    one gets `branch_no = len(entries)`, the terminator: closed, stop looking.
+    That is a valid index and what 1728 retail entries use. The others point at
+    a later entry, which encodes which rooms are seen only through that door --
+    a level-design decision, not something to guess.
 
     `visible_peers` is what the module can see, normally from
     `linked_modules`. **The module never lists itself**, and that is not a
@@ -237,11 +244,13 @@ def build_vmdarray(self_index, visible_peers, door_branches=None):
         if peer == self_index:
             continue
         entries.append([peer, 0, 0, 0])
-    if door_branches:
+    if door_peers:
+        # The terminator index: one past the last entry. Without a door in
+        # sight the list is unchanged and every branch stays zero.
+        terminator = len(entries)
         for entry in entries:
-            branch = door_branches.get(entry[0])
-            if branch:
-                entry[1] = branch
+            if entry[0] in door_peers:
+                entry[1] = terminator
     return [tuple(entry) for entry in entries]
 
 

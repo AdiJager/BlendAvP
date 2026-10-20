@@ -1195,6 +1195,19 @@ class RIF_PT_module(bpy.types.Panel):
         box.label(text="These change how bots move, not how it looks",
                   icon="INFO")
 
+        box = layout.box()
+        box.label(text="Door", icon="MODIFIER")
+        box.prop(obj, "rif_module_door")
+        if getattr(obj, "rif_module_door", False):
+            inner = box.box()
+            inner.prop(obj, "rif_module_door_locked")
+            inner.prop(obj, "rif_module_door_proximity")
+            inner.prop(obj, "rif_module_door_open")
+            inner.prop(obj, "rif_module_door_lift")
+            inner.prop(obj, "rif_module_door_horizontal")
+            inner.prop(obj, "rif_module_door_open_seconds")
+            inner.prop(obj, "rif_module_door_close_seconds")
+
 
 def _patrol_items(_self, context):
     """Return the scene's patrol routes, named, for the generator's list."""
@@ -1834,6 +1847,62 @@ def register_placeables():
             "polygons of a staircase. The engine's own comment calls this a "
             "hack, so mark only actual staircases"),
         default=False)
+    bpy.types.Object.rif_module_door = bpy.props.BoolProperty(
+        name="Door",
+        description=(
+            "This module is a door. The engine moves it along the shape it "
+            "already has, so the geometry is the door and the strategy only "
+            "says how it behaves"),
+        default=False)
+    bpy.types.Object.rif_module_door_locked = bpy.props.BoolProperty(
+        name="Locked",
+        description=(
+            "Takes the locked path (Objsetup.cpp:1831), so the door sits still "
+            "until a switch opens it. A locked door does not react to the player "
+            "walking up to it; that is what Proximity is for, and it only works "
+            "on an unlocked door"),
+        default=True)
+    bpy.types.Object.rif_module_door_proximity = bpy.props.BoolProperty(
+        name="Opens on approach",
+        description=(
+            "Opens when something comes near (Objsetup.cpp:1919). This is the "
+            "branch taken when Locked is OFF; a locked door ignores it. 136 of "
+            "the 417 retail doors carry this bit alongside Locked, where it "
+            "takes effect only once the door is unlocked"),
+        default=True)
+    bpy.types.Object.rif_module_door_open = bpy.props.BoolProperty(
+        name="Starts open",
+        description=(
+            "The door begins in the open state. Objsetup.cpp:1870 reads this "
+            "bit as exactly that: state = I_door_open when it is set, I_door "
+            "when it is not. Only 6 of the 417 retail doors set it"),
+        default=False)
+    bpy.types.Object.rif_module_door_lift = bpy.props.BoolProperty(
+        name="Lift door",
+        description=(
+            "Takes the lift path (Objsetup.cpp:1915): the door moves with the "
+            "car rather than on its own. 211 of the 417 retail doors carry "
+            "this, so more than half of them are lift doorways"),
+        default=False)
+    bpy.types.Object.rif_module_door_horizontal = bpy.props.BoolProperty(
+        name="Horizontal",
+        description=(
+            "The door lies flat, like a hatch (Objsetup.cpp:1836). Only 6 of "
+            "the 417 retail doors carry it"),
+        default=False)
+    bpy.types.Object.rif_module_door_open_seconds = bpy.props.FloatProperty(
+        name="Open time (s)",
+        description=(
+            "How long it takes to open. Retail uses 1.0 for 74 per cent of "
+            "its doors. The field is one byte of tenths, so 25.5 s is the "
+            "ceiling"),
+        default=1.0, min=0.0, max=25.5)
+    bpy.types.Object.rif_module_door_close_seconds = bpy.props.FloatProperty(
+        name="Close time (s)",
+        description=(
+            "How long it takes to close. Retail uses 0.5 for 89 per cent of "
+            "its doors"),
+        default=0.5, min=0.0, max=25.5)
     bpy.types.Object.rif_placeable = bpy.props.PointerProperty(
         type=RIF_PlaceableSettings)
 
@@ -1847,5 +1916,13 @@ def unregister_placeables():
     del bpy.types.Object.rif_module_fog
     del bpy.types.Object.rif_module_airduct
     del bpy.types.Object.rif_module_stairs
+    del bpy.types.Object.rif_module_door
+    del bpy.types.Object.rif_module_door_locked
+    del bpy.types.Object.rif_module_door_proximity
+    del bpy.types.Object.rif_module_door_open
+    del bpy.types.Object.rif_module_door_lift
+    del bpy.types.Object.rif_module_door_horizontal
+    del bpy.types.Object.rif_module_door_open_seconds
+    del bpy.types.Object.rif_module_door_close_seconds
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
