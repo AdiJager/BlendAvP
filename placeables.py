@@ -62,7 +62,6 @@ CATEGORY_LABELS = (
     (CAT_OBJECT, "Objects"),
     (CAT_SOUND, "Sound"),
     (CAT_EFFECTS, "Effects"),
-    (CAT_MORPH, "Morphs"),
     (CAT_NAVIGATION, "Navigation"),
     (CAT_GAMEPLAY, "Gameplay"),
 )
@@ -85,6 +84,9 @@ KIND_OBJECT = "OBJECT"
 # visible, but write nothing yet. They are reported as unsupported on
 # export rather than dropped in silence.
 KIND_PLACEHOLDER = "PLACEHOLDER"
+# The far end of an object's track (OBJTRAK2). An empty, not a mesh:
+# it marks where movement stops and never reaches the level.
+KIND_TRACK_END = "TRACK_END"
 KIND_DEATH_VOLUME = "DEATH_VOLUME"
 KIND_MISSION_OBJECTIVE = "MISSION_OBJECTIVE"
 KIND_AREA_SWITCH = "AREA_SWITCH"
@@ -105,6 +107,9 @@ DISPLAY_BY_KIND = {
     KIND_WAYPOINT: "CUBE",
     KIND_PATROL_PATH: "CIRCLE",
     KIND_GLOBAL_GENERATOR: "PLAIN_AXES",
+    # A sphere reads as "a point in space", which is what the far end of a
+    # track is. It has no volume and never reaches the level.
+    KIND_TRACK_END: "SPHERE",
 }
 
 # The ten `AVPGENER.type` values, with the network eligibility that decides
@@ -1104,13 +1109,13 @@ PLACEABLES = (
     # exported nothing under Effects. The real one has moved into this category
     # and the placeholder is gone.
     _PlaceableSpec(
-        "placeholder_morph", "Morph", (
-            "NOT IMPLEMENTED. Geometry that moves or changes shape: doors, "
-            "lifts, fans, platforms. Twelve retail strategies cover these "
-            "(StratDoor 50, StratTrack 72, StratFan 75, StratPlatLift 54 and "
-            "others), each with its own chunk layout. Placing one exports "
-            "nothing yet"),
-        "MESH_CUBE", CAT_MORPH, KIND_PLACEHOLDER),
+        "track_end", "End Point", (
+            "Marks where an object's track stops. Point rif_track_end at it and "
+            "the run is the distance between them; leave it unused and the "
+            "track stands still, which is what a fan wants because its "
+            "direction comes from the rotation. An empty, so it adds no "
+            "geometry to the level"),
+        "MESH_UVSPHERE", CAT_GAMEPLAY, KIND_TRACK_END),
     _PlaceableSpec(
         "pickup_security", "Security Pass", (
             "IOT_SpecialPickupObject (13). Models bypass and secpass01. Only "
@@ -1165,7 +1170,7 @@ def _make_waypoint_material():
 class RIF_PT_module(bpy.types.Panel):
     """Per-module flags, for any mesh in the level."""
 
-    bl_label = "RIF Module"
+    bl_label = "AvP Object"
     bl_idname = "RIF_PT_module"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -1181,33 +1186,429 @@ class RIF_PT_module(bpy.types.Panel):
     def draw(self, context):
         """Draw the appearance flags and the AI ones, kept apart."""
         obj = context.active_object
+
         layout = self.layout
 
+        # The type first: it decides which path the engine takes, and therefore
+        # which of the sections below can mean anything at all.
         box = layout.box()
-        box.label(text="Appearance", icon="WORLD")
-        box.prop(obj, "rif_module_sky")
-        box.prop(obj, "rif_module_fog")
+        box.label(text="AvP object", icon="OUTLINER_OB_EMPTY")
+        box.prop(obj, "rif_object_type")
 
-        box = layout.box()
-        box.label(text="AI navigation", icon="OUTLINER_OB_ARMATURE")
-        box.prop(obj, "rif_module_airduct")
-        box.prop(obj, "rif_module_stairs")
-        box.label(text="These change how bots move, not how it looks",
-                  icon="INFO")
+        object_type = getattr(obj, "rif_object_type", "MODULE")
 
-        box = layout.box()
-        box.label(text="Door", icon="MODIFIER")
-        box.prop(obj, "rif_module_door")
-        if getattr(obj, "rif_module_door", False):
-            inner = box.box()
-            inner.prop(obj, "rif_module_door_locked")
-            inner.prop(obj, "rif_module_door_proximity")
-            inner.prop(obj, "rif_module_door_open")
-            inner.prop(obj, "rif_module_door_lift")
-            inner.prop(obj, "rif_module_door_horizontal")
-            inner.prop(obj, "rif_module_door_open_seconds")
-            inner.prop(obj, "rif_module_door_close_seconds")
+        if object_type == "MODULE":
+            box = layout.box()
+            box.label(text="Appearance", icon="WORLD")
+            box.prop(obj, "rif_module_sky")
+            box.prop(obj, "rif_module_fog")
 
+            box = layout.box()
+            box.label(text="AI navigation", icon="OUTLINER_OB_ARMATURE")
+            box.prop(obj, "rif_module_airduct")
+            box.prop(obj, "rif_module_stairs")
+            box.label(text="These change how bots move, not how it looks",
+                      icon="INFO")
+
+            box = layout.box()
+            box.label(text="Door", icon="MODIFIER")
+            box.prop(obj, "rif_module_door")
+            if getattr(obj, "rif_module_door", False):
+                inner = box.box()
+                inner.prop(obj, "rif_module_door_locked")
+                inner.prop(obj, "rif_module_door_proximity")
+                inner.prop(obj, "rif_module_door_open")
+                inner.prop(obj, "rif_module_door_lift")
+                inner.prop(obj, "rif_module_door_horizontal")
+                inner.prop(obj, "rif_module_door_open_seconds")
+                inner.prop(obj, "rif_module_door_close_seconds")
+
+        elif object_type == "SIMPLE_OBJECT":
+            box = layout.box()
+            box.label(text="Fragments", icon="MOD_EXPLODE")
+            box.prop(obj, "rif_fragments")
+            if getattr(obj, "rif_fragments", False):
+                inner = box.box()
+                pieces = [child for child in obj.children
+                          if child.type == "MESH"]
+                inner.label(text=f"{len(pieces)} pieces", icon="MESH_DATA")
+                if not pieces:
+                    inner.label(text="No mesh children to break into",
+                                icon="ERROR")
+                for child in pieces[:8]:
+                    inner.prop(child, "rif_fragment_copies", text=child.name)
+                inner.label(text="A piece placed to one side flies that way",
+                            icon="INFO")
+
+            box = layout.box()
+            box.label(text="Platform lift", icon="SORT_ASC")
+            box.prop(obj, "rif_module_plat_lift")
+            if getattr(obj, "rif_module_plat_lift", False):
+                inner = box.box()
+                inner.prop(obj, "rif_plat_lift_disabled")
+                inner.prop(obj, "rif_plat_lift_one_use")
+                inner.prop(obj, "rif_track_enabled")
+                inner.prop(obj, "rif_track_end")
+                inner.prop(obj, "rif_track_seconds")
+
+
+            box = layout.box()
+            box.label(text="Light", icon="LIGHT_POINT")
+            box.prop(obj, "rif_placed_light")
+            if getattr(obj, "rif_placed_light", False):
+                inner = box.box()
+                inner.prop(obj, "rif_light_brightness")
+                inner.prop(obj, "rif_light_range")
+                inner.prop(obj, "rif_light_colour")
+                inner.prop(obj, "rif_light_off_colour")
+                inner.prop(obj, "rif_light_on_at_start")
+
+                shape = box.box()
+                shape.label(text="Behaviour", icon="PLAY")
+                shape.prop(obj, "rif_light_type")
+                shape.prop(obj, "rif_light_on_off_type")
+
+                timing = box.box()
+                timing.label(text="Timing", icon="TIME")
+                if obj.rif_light_on_off_type == "1":
+                    timing.prop(obj, "rif_light_fade_up_ms")
+                    timing.prop(obj, "rif_light_fade_down_ms")
+                if obj.rif_light_type in ("1", "2"):
+                    timing.prop(obj, "rif_light_on_ms")
+                    timing.prop(obj, "rif_light_off_ms")
+                timing.prop(obj, "rif_light_start_ms")
+
+                coronas = [material for material in obj.data.materials
+                           if material is not None
+                           and getattr(material,
+                                       "rif_material_light_corona", False)]
+                if coronas:
+                    box.label(text=f"{len(coronas)} corona material(s)",
+                              icon="LIGHT_SUN")
+            box = layout.box()
+            box.label(text="Fan", icon="FORCE_FORCE")
+            box.prop(obj, "rif_module_fan")
+            if getattr(obj, "rif_module_fan", False):
+                inner = box.box()
+                inner.prop(obj, "rif_fan_strength")
+                inner.prop(obj, "rif_fan_speed_seconds")
+                inner.prop(obj, "rif_fan_slow_seconds")
+                inner.prop(obj, "rif_track_enabled")
+                inner.prop(obj, "rif_track_end")
+
+        elif object_type == "TRACK":
+            box = layout.box()
+            box.label(text="Track", icon="CURVE_PATH")
+            box.prop(obj, "rif_track_enabled")
+            if getattr(obj, "rif_track_enabled", False):
+                inner = box.box()
+                inner.prop(obj, "rif_track_end")
+                inner.prop(obj, "rif_track_seconds")
+                if obj.rif_track_end is None:
+                    inner.label(text="No end point: the track stays put",
+                                icon="INFO")
+                flags = box.box()
+                flags.label(text="Behaviour", icon="PLAY")
+                flags.prop(obj, "rif_track_loop")
+                flags.prop(obj, "rif_track_playing_at_start")
+                flags.prop(obj, "rif_track_loop_back_forth")
+                flags.prop(obj, "rif_track_smoothing")
+                advanced = box.box()
+                advanced.label(text="Advanced", icon="PREFERENCES")
+                advanced.prop(obj, "rif_track_object_offset")
+                box.prop(obj, "rif_module_track")
+
+# ---- object type ----------------------------------------------------------
+# The one switch that decides which path the engine takes. It is authoritative:
+# changing it clears the switches that belong to the old type, because a door
+# flag on a placed object is not a door, it is a module flag on something the
+# module branch never sees.
+
+# `Projload.cpp:2078` picks the branch from the header flag, and every
+# strategy lives in exactly one branch (`Objsetup.cpp`):
+#   module   StratDoor (50), StratSwitchDoor (59), StratLift (51), Lighting
+#   placed   PlatLift (54), SimpleObject, NewSimpleObject (62),
+#            Track (72), TrackDestruct (80), Fan (75)
+# Track is placed, which is why it gets its own entry rather than living under
+# Module -- exported as a module its strategy would never be dispatched.
+OBJECT_TYPE_MODULE = "MODULE"
+OBJECT_TYPE_SIMPLE = "SIMPLE_OBJECT"
+OBJECT_TYPE_TRACK = "TRACK"
+
+TYPE_SWITCHES = {
+    OBJECT_TYPE_MODULE: (
+        "rif_module_sky", "rif_module_fog", "rif_module_airduct",
+        "rif_module_stairs", "rif_module_door",
+        "rif_module_door_locked", "rif_module_door_proximity",
+        "rif_module_door_open", "rif_module_door_lift",
+        "rif_module_door_horizontal",
+    ),
+    OBJECT_TYPE_SIMPLE: (
+        "rif_fragments", "rif_module_plat_lift", "rif_module_fan",
+        "rif_plat_lift_disabled", "rif_plat_lift_one_use",
+    ),
+    OBJECT_TYPE_TRACK: ("rif_module_track",),
+}
+
+
+def _on_object_type(self, context):
+    """Clear the switches that do not belong to the new type."""
+    keep = TYPE_SWITCHES.get(self.rif_object_type, ())
+    for group in TYPE_SWITCHES.values():
+        for name in group:
+            if name not in keep and hasattr(self, name):
+                try:
+                    setattr(self, name, False)
+                except (AttributeError, TypeError):
+                    pass
+
+
+bpy.types.Object.rif_placed_light = bpy.props.BoolProperty(
+    name="Emits light",
+    description=(
+        "The object is a lamp: it carries a PLOBJLIT record, and the light "
+        "comes out of the object's origin, so moving the object moves the "
+        "light. A light that has to go out when the lamp is shot must not be "
+        "baked into the vertices, which is why every retail lamp is marked "
+        "Runtime and NoPreLight"),
+    default=False)
+
+bpy.types.Object.rif_light_brightness = bpy.props.FloatProperty(
+    name="Brightness",
+    description=("Fraction of full brightness. Stored as 16.16, so 1.0 is "
+                 "65536 -- the value 461 of the retail lamps use"),
+    default=1.0, min=0.0, soft_max=4.0, precision=2)
+
+bpy.types.Object.rif_light_range = bpy.props.FloatProperty(
+    name="Range",
+    description="How far the light reaches, in metres",
+    default=10.0, min=0.1, soft_max=100.0, precision=2)
+
+bpy.types.Object.rif_light_colour = bpy.props.FloatVectorProperty(
+    name="Colour",
+    description="Colour while the light is on",
+    subtype="COLOR", default=(1.0, 1.0, 1.0), min=0.0, max=1.0, size=3)
+
+bpy.types.Object.rif_light_off_colour = bpy.props.FloatVectorProperty(
+    name="Off colour",
+    description=("Colour while the light is off. The engine fades between "
+                 "the two, so this is what a dying lamp cools to"),
+    subtype="COLOR", default=(0.0, 0.0, 0.0), min=0.0, max=1.0, size=3)
+
+bpy.types.Object.rif_light_type = bpy.props.EnumProperty(
+    name="Type",
+    description=("How the light behaves. Visible in game only -- the "
+                 "viewport shows a steady light"),
+    items=(
+        ("0", "Standard", "Steady light"),
+        ("1", "Strobe", "Blinks at a fixed rate"),
+        ("2", "Flicker", "Random, like a failing tube"),
+    ), default="0")
+
+bpy.types.Object.rif_light_on_off_type = bpy.props.EnumProperty(
+    name="Switching",
+    description="How the light turns on and off",
+    items=(
+        ("0", "Standard", "Snaps on and off"),
+        ("1", "Fade", "Ramps up and down over time"),
+        ("2", "Flicker", "Random switching"),
+    ), default="0")
+
+bpy.types.Object.rif_light_on_at_start = bpy.props.BoolProperty(
+    name="On at start",
+    description="The lamp is lit when the level loads", default=True)
+
+bpy.types.Object.rif_light_fade_up_ms = bpy.props.IntProperty(
+    name="Fade up",
+    description="Milliseconds to reach full brightness", default=0,
+    min=0, soft_max=10000)
+
+bpy.types.Object.rif_light_fade_down_ms = bpy.props.IntProperty(
+    name="Fade down",
+    description="Milliseconds to reach the off colour", default=0,
+    min=0, soft_max=10000)
+
+bpy.types.Object.rif_light_on_ms = bpy.props.IntProperty(
+    name="On for",
+    description="Milliseconds lit in a blink cycle", default=0,
+    min=0, soft_max=10000)
+
+bpy.types.Object.rif_light_off_ms = bpy.props.IntProperty(
+    name="Off for",
+    description="Milliseconds dark in a blink cycle", default=0,
+    min=0, soft_max=10000)
+
+bpy.types.Object.rif_light_start_ms = bpy.props.IntProperty(
+    name="Start delay",
+    description="Milliseconds before the light starts", default=0,
+    min=0, soft_max=10000)
+
+# ---- the corona is a surface, not an object ----------------------------
+bpy.types.Material.rif_material_light_corona = bpy.props.BoolProperty(
+    name="Light corona",
+    description=(
+        "Draw the polygons using this material as a light flare: a billboard "
+        "that turns to face the camera and scales with distance. Its position "
+        "is the centre of its polygon, so it can sit away from the lamp's "
+        "origin. Only one corona per object takes effect, and it does nothing "
+        "unless the object is a light"),
+    default=False)
+
+bpy.types.Object.rif_object_type = bpy.props.EnumProperty(
+    name="Type",
+    description="What this object is to the engine",
+    items=(
+        (OBJECT_TYPE_MODULE, "Module",
+         "Part of the level's shell: rooms, walls and doors. Loaded down the "
+         "module path, so it reaches the visibility and AI graphs"),
+        (OBJECT_TYPE_SIMPLE, "Simple Object",
+         "A placed object: detail, a pickup, something that breaks, a lift or "
+         "a fan. Not part of the shell, so it has no visibility list and no "
+         "AI adjacency. With every option off it is plain decoration, which "
+         "is the commonest placed object in the shipped levels"),
+        (OBJECT_TYPE_TRACK, "Track",
+         "An object that runs along its track. A placed object like a simple "
+         "one, with the Track strategy attached, so it needs an end point to "
+         "have somewhere to go"),
+    ),
+    default=OBJECT_TYPE_MODULE,
+    update=_on_object_type,
+)
+
+
+# ---- track (OBJTRAK2) ----------------------------------------------------
+# Four strategies read this chunk: Track (72), TrackDestruct (80), Fan (75)
+# and PlatLift (54). It belongs to the object rather than to the strategy, so
+# the panel groups it with the object instead of with a behaviour.
+bpy.types.Object.rif_track_enabled = bpy.props.BoolProperty(
+    name="Has a track",
+    description=(
+        "Give this object a track. Track, TrackDestruct, Fan and PlatLift "
+        "all read it, and Fan does not merely misbehave without one: "
+        "Objsetup.cpp:1159 asserts and the level will not load"),
+    default=False)
+
+bpy.types.Object.rif_track_end = bpy.props.PointerProperty(
+    name="End point",
+    description=(
+        "An empty marking where the movement stops. Leave it unset and the "
+        "track does not move -- which is what 481 of the 1312 retail "
+        "sections do, and what a fan wants: its direction comes from the "
+        "rotation, not from the distance"),
+    type=bpy.types.Object)
+
+bpy.types.Object.rif_track_seconds = bpy.props.FloatProperty(
+    name="Seconds",
+    description=(
+        "How long the run takes. Stored as 16.16 seconds, the same unit as "
+        "the fan's spin-up time. Retail uses 0.25, 0.5, 1, 2, 3, 5, 7 and "
+        "10 seconds"),
+    default=1.0, min=0.01, soft_max=30.0, precision=2)
+
+bpy.types.Object.rif_module_track = bpy.props.BoolProperty(
+    name="Moves along its track",
+    description=(
+        "Attach a Track strategy (72) so the engine runs this module along "
+        "its track. 224 of the 232 retail tracks carry no point effects, so "
+        "the switch alone is the usual case; a door and a track on one "
+        "module is not something any retail level does"),
+    default=False)
+
+bpy.types.Object.rif_module_fan = bpy.props.BoolProperty(
+    name="Fan",
+    description=(
+        "Push things away along its track. A fan is a placed object with no "
+        "geometry of its own; the direction comes from the first section of "
+        "its track, so Has a track is required as well -- without one the "
+        "engine asserts at Objsetup.cpp:1159 and the level will not load"),
+    default=False)
+
+bpy.types.Object.rif_fan_strength = bpy.props.FloatProperty(
+    name="Strength",
+    description=(
+        "Wind strength as a fraction of full, so 1.0 is full and -0.5 blows "
+        "the other way. Retail runs between 0 and +-10. Stored in per mille, "
+        "and the engine replaces anything outside +-10 with full strength"),
+    default=1.0, min=-10.0, max=10.0, precision=2)
+
+bpy.types.Object.rif_fan_speed_seconds = bpy.props.FloatProperty(
+    name="Spin up",
+    description=(
+        "Seconds to reach full speed. Every retail fan uses 10. Stored as "
+        "16.16 seconds, which is why the file holds 655360 for this value"),
+    default=10.0, min=0.1, soft_max=60.0, precision=2)
+
+bpy.types.Object.rif_fan_slow_seconds = bpy.props.FloatProperty(
+    name="Spin down",
+    description="Seconds to come to rest. Every retail fan uses 10",
+    default=10.0, min=0.1, soft_max=60.0, precision=2)
+
+bpy.types.Object.rif_module_plat_lift = bpy.props.BoolProperty(
+    name="Platform lift",
+    description=(
+        "Rise and fall along its track on demand. Needs Has a track like a "
+        "fan does: the movement comes from the track, and the lift only "
+        "needs its endpoint"),
+    default=False)
+
+bpy.types.Object.rif_plat_lift_disabled = bpy.props.BoolProperty(
+    name="Starts disabled",
+    description=(
+        "PlatformLiftFlags_Disabled (0x1). 22 of the 74 retail lifts carry "
+        "it, so a lift that waits to be switched on is the commoner case"),
+    default=False)
+
+bpy.types.Object.rif_plat_lift_one_use = bpy.props.BoolProperty(
+    name="One use",
+    description=(
+        "PlatformLiftFlags_OneUse (0x2): the lift makes one trip and stops. "
+        "Only 2 of the 74 retail lifts set it"),
+    default=False)
+
+bpy.types.Object.rif_fragments = bpy.props.BoolProperty(
+    name="Breaks into pieces",
+    description=(
+        "The object shatters, and its mesh children are the pieces. This "
+        "is what the player sees and shoots; it is replaced by the pieces "
+        "only when destroyed. Exported as a placed object, because 6575 of "
+        "the 6582 fragmenting objects in the shipped levels are placed and "
+        "only seven are modules"),
+    default=False)
+
+bpy.types.Object.rif_fragment_copies = bpy.props.IntProperty(
+    name="Copies",
+    description=(
+        "How many times this piece appears in the break (FRAGDATA). One is "
+        "the default and what the engine assumes when the count is absent"),
+    default=1, min=1, soft_max=20)
+
+bpy.types.Object.rif_track_loop = bpy.props.BoolProperty(
+    name="Loop",
+    description="Start again from the beginning when the end is reached",
+    default=False)
+
+bpy.types.Object.rif_track_playing_at_start = bpy.props.BoolProperty(
+    name="Moving at start",
+    description="Begin moving as soon as the level loads",
+    default=False)
+
+bpy.types.Object.rif_track_loop_back_forth = bpy.props.BoolProperty(
+    name="Loop back and forth",
+    description="Reverse at the end instead of jumping back to the start",
+    default=False)
+
+bpy.types.Object.rif_track_smoothing = bpy.props.BoolProperty(
+    name="Smooth",
+    description="Ease in and out rather than moving at a constant speed",
+    default=False)
+
+bpy.types.Object.rif_track_object_offset = bpy.props.IntVectorProperty(
+    name="Object offset",
+    description=(
+        "Shift the object relative to its track, in millimetres. 615 of "
+        "retail's 663 tracks leave this at zero, so it is a correction "
+        "rather than part of the design"),
+    default=(0, 0, 0), subtype="XYZ", size=3)
 
 def _patrol_items(_self, context):
     """Return the scene's patrol routes, named, for the generator's list."""
@@ -1718,6 +2119,42 @@ def menu_draw(self, context):
                     icon="COLLECTION_NEW")
 
 
+class RIF_PT_material_avp(bpy.types.Panel):
+    """AvP properties of a material, on the Material tab.
+
+    Kept separate from the object panel because the corona is a property of the
+    surface, not of the object: one mesh can be part housing and part glow, and
+    the engine asks the polygon, not the object, which it is.
+    """
+
+    bl_label = "AvP Material"
+    bl_idname = "RIF_PT_material_avp"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "material"
+
+    @classmethod
+    def poll(cls, context):
+        """Only shown when a material is being edited."""
+        return context.material is not None
+
+    def draw(self, context):
+        """Draw the surface flags this format understands."""
+        material = context.material
+        layout = self.layout
+
+        box = layout.box()
+        box.label(text="Light corona", icon="LIGHT_SUN")
+        box.prop(material, "rif_material_light_corona")
+        if getattr(material, "rif_material_light_corona", False):
+            box.label(text="Drawn as a flare that faces the camera",
+                      icon="INFO")
+            box.label(text="Its position is the centre of its polygon",
+                      icon="INFO")
+            box.label(text="Needs a light on the object to do anything",
+                      icon="INFO")
+
+
 class RIF_PT_world_audio(bpy.types.Panel):
     """Audio settings for the current level, kept on the scene's World.
 
@@ -1775,6 +2212,8 @@ CLASSES = (
     *PLACEABLE_OPERATORS.values(),
     *CATEGORY_MENUS.values(),
     RIF_PT_world_audio,
+    # The corona is a surface, so it lives on the Material tab.
+    RIF_PT_material_avp,
 )
 
 

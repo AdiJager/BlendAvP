@@ -78,6 +78,8 @@ from pathlib import Path
 import math
 import traceback
 
+import pathlib
+
 import bpy
 from bpy.props import (
     StringProperty, FloatProperty, IntProperty, EnumProperty, BoolProperty,
@@ -2696,6 +2698,52 @@ class RIF_PT_light(bpy.types.Panel):
         layout.separator()
     
 
+class RIF_OT_launch_game(bpy.types.Operator):
+    """Start Aliens versus Predator from the configured game folder."""
+
+    bl_idname = "object.rif_launch_game"
+    bl_label = "Launch Game"
+    bl_description = (
+        "Start the game so the exported level can be tested. Uses the "
+        "game directory set in preferences and prefers the bin_Crossplay "
+        "build, which is the one the game ships and runs")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        """Find the executable and launch it detached."""
+        import subprocess
+
+        from . import sounds
+
+        root = sounds.game_root(context)
+        if not root:
+            self.report({"ERROR"},
+                        "Set the game directory in preferences first")
+            return {"CANCELLED"}
+
+        found = sorted(pathlib.Path(root).rglob("AvP_Classic.exe"))
+        if not found:
+            self.report({"ERROR"},
+                        f"No AvP_Classic.exe under {root}")
+            return {"CANCELLED"}
+        # Prefer the Crossplay build. It is the one the game ships and runs
+        # today; the plain bin build beside it is the older executable.
+        found.sort(key=lambda path: ("Crossplay" not in str(path), str(path)))
+
+        executable = found[0]
+        try:
+            # Detached: the editor must not wait for the game, and the game
+            # must outlive the operator.
+            subprocess.Popen([str(executable)], cwd=str(executable.parent))
+        except OSError as error:
+            self.report({"ERROR"}, f"Could not start {executable.name}: {error}")
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"Launched {executable}")
+        print(f"[RIF] launched {executable}")
+        return {"FINISHED"}
+
+
 class RIF_MT_add_avp(bpy.types.Menu):
     """AvP submenu inside Object > Add."""
 
@@ -2716,6 +2764,10 @@ class RIF_MT_add_avp(bpy.types.Menu):
         from . import placeables
 
         placeables.menu_draw(self, context)
+        # Testing is what this menu is used for most, so the round trip to the
+        # game gets a place here rather than in the Debug submenu.
+        self.layout.separator()
+        self.layout.operator(RIF_OT_launch_game.bl_idname, icon="PLAY")
 
 
 class RIF_MT_debug_avp(bpy.types.Menu):
@@ -2756,6 +2808,7 @@ _CLASSES = (
     RIF_OT_build_texture_gallery,
     RIF_OT_clear_texture_library,
     RIF_OT_audition_sound,
+    RIF_OT_launch_game,
     RIF_OT_validate_level,
     RIF_MT_add_avp,
     RIF_MT_debug_avp,

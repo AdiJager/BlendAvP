@@ -190,6 +190,23 @@ OBJ_FLAGS = 0x00000200
 PLACED_OBJECT_FLAGS = 0x0000FC00
 OBJ_VERSION_NO = 1
 
+# `shape.h:625` -- the polygon is drawn as a light flare, and its centre
+# becomes the flare's position (`bh_light.c:193`).
+POLY_FLAG_LIGHT_CORONA = 0x20000000
+
+
+def _slot_flags(mesh):
+    """Return the polygon flags each material slot asks for."""
+    flags = []
+    for material in mesh.materials:
+        value = POLY_FLAGS
+        if material is not None and getattr(
+                material, "rif_material_light_corona", False):
+            value |= POLY_FLAG_LIGHT_CORONA
+        flags.append(value)
+    return flags
+
+
 POLY_BITMAP_MASK = 0x00000FFF
 POLY_UV_HI_MASK  = 0x0000F000
 BITMAP_IDX_PROP = "rif_bitmap_idx"
@@ -530,11 +547,18 @@ def build_rif_level(objects, level_name, texture_paths=None,
             raise ValueError(f"Object {obj.name!r} is not a mesh")
         file_id = i + 1
         slot_bitmaps = _resolve_bitmap_indices(obj.data, texture_paths)
+        fragments = _fragments_for(obj)
         shape = _build_shape_chunk(
             obj.data, obj.name, file_id, slot_bitmaps,
-            shape_flags=shape_flags, recentre=True,
+            shape_flags=shape_flags,
+            # A fragmenting object keeps its vertices where the artist put them:
+            # its pieces are offset from the object's origin, and recentring
+            # would shift the geometry while the offsets stayed put.
+            recentre=fragments is None,
             matrix=_rotation_scale_matrix(obj),
         )
+        if fragments is not None:
+            shape.children.append(fragments)
         leaf = door_leaves.get(obj.name)
         if leaf is not None:
             _attach_door_morph(shape, obj, leaf, texture_paths)
@@ -554,7 +578,29 @@ def build_rif_level(objects, level_name, texture_paths=None,
         orient_rif = _convert_orientation(rot_q)
 
         module_data = None
-        if include_module_data:
+        # A platform lift and a fan are placed objects, not part of the level's
+        # shell. It is not a matter of taste: `Projload.cpp:2078` sends an
+        # object down `deal_with_placed_object` or `deal_with_module_object`
+        # based on this flag, and BOTH `case StratFan` and `case StratPlatLift`
+        # live in the former (`Objsetup.cpp:2273`, `:2307`). Exported as a
+        # module, the strategy would be written and never dispatched.
+        # The object type is the one switch that decides the path, and it is what
+        # the panel shows. The switch checks stay as a fallback for scenes built
+        # before the enum existed -- without them an old scene would silently
+        # export as a module again.
+        object_type = getattr(obj, "rif_object_type", "MODULE")
+        as_placed = bool(object_type != "MODULE"
+                         or getattr(obj, "rif_module_plat_lift", False)
+                         or getattr(obj, "rif_module_fan", False)
+                         or getattr(obj, "rif_module_track", False)
+                         # A fragmenting object is placed as well: 6575 of the
+                         # 6582 in the shipped levels are, and only seven are
+                         # modules. Its pieces hang off its shape, not the level.
+                         or getattr(obj, "rif_fragments", False)
+                         # A lamp is a placed object too, and it must carry its
+                         # strategy: the loader takes the hit points from it.
+                         or getattr(obj, "rif_placed_light", False))
+        if include_module_data and not as_placed:
             # VMDARRAY is a VISIBILITY SCRIPT, not a graph (MODULE.C:190): the
             # engine walks it and marks every module it reaches as visible.
             # It comes from the outliner hierarchy — parent and children — and
@@ -577,6 +623,11 @@ def build_rif_level(objects, level_name, texture_paths=None,
                 # moves the shape the module already has.
                 "door": (None if not getattr(obj, "rif_module_door", False)
                          else _build_door_strategy(obj)),
+                # A track is the other module strategy that moves geometry.
+                # Both at once would leave the engine with two behaviours on
+                # one module, which no retail level does.
+                "track": (None if not getattr(obj, "rif_module_track", False)
+                          else _build_track_strategy_chunk(obj)),
                 "module_flags": module_flags(
                     airduct=bool(getattr(obj, "rif_module_airduct", False)),
                     stairs=bool(getattr(obj, "rif_module_stairs", False)),
@@ -605,7 +656,16 @@ def build_rif_level(objects, level_name, texture_paths=None,
             num_vertices=num_vertices,
             module_data=module_data,
             prelight_intensities=prelight,
-            strategy=module_data.get("door"),
+            # Placed even without a strategy: a fragmenting object has none.
+            placed=as_placed,
+            # A lamp, a lift, a fan and a track have no module data, so their
+            # strategy comes straight from the object. Written as an if-chain
+            # rather than an `or` chain of conditionals: `A or B if C else D`
+            # parses as `(A or B) if C else D`, which silently skipped the lamp.
+            strategy=_placed_object_strategy(obj)
+                     or (module_data or {}).get("door"),
+            track=_track_for(obj),
+            light=_placed_light_for(obj),
         ))
 
     # ---- placed objects -------------------------------------------------
@@ -883,7 +943,8 @@ def _rotation_scale_matrix(obj):
 
 
 def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
-                       shape_flags=None, recentre=False, matrix=None):
+                       shape_flags=None, recentre=False, matrix=None,
+                       slot_flags=None):
     """Return a fully assembled REBSHAPE chunk for one mesh.
 
     shape_flags : SHPHEAD1.flags value; defaults to SHAPE_FLAGS_DEFAULT.
@@ -904,7 +965,9 @@ def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
         shape_flags = SHAPE_FLAGS_DEFAULT
 
     verts_int, vert_normals, polys, poly_normals, uv_lists = \
-        _extract_geometry(mesh, slot_bitmaps, matrix)
+        _extract_geometry(mesh, slot_bitmaps, matrix,
+                          slot_flags if slot_flags is not None
+                          else _slot_flags(mesh))
     offset = (0, 0, 0)
     if recentre:
         offset = _compute_centre(_compute_bounds(verts_int))
@@ -940,10 +1003,183 @@ def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
     return chunk
 
 
+def _placed_light_strategy(obj):
+    """Return the NewSimpleObject strategy a lamp needs, or None."""
+    if not getattr(obj, "rif_placed_light", False):
+        return None
+
+    from .chunks.strategy import AVPStrategyChunk
+
+    # `integrity` is the lamp's hit points, one byte in the loader.
+    return AVPStrategyChunk(
+        type_id=0,
+        integrity=int(getattr(obj, "rif_light_integrity", 1)) & 0xFF,
+        mass=int(getattr(obj, "rif_light_mass", 10)),
+    )
+
+
+def _placed_object_strategy(obj):
+    """Return the strategy for a placed object, or None.
+
+    One object carries at most one: a lamp, a lift, a fan and a track are
+    different things, and the panel's type keeps them from overlapping.
+    """
+    strategy = _placed_light_strategy(obj)
+    if strategy is not None:
+        return strategy
+    if getattr(obj, "rif_module_plat_lift", False):
+        return _build_plat_lift_strategy_chunk(obj)
+    if getattr(obj, "rif_module_fan", False):
+        return _build_fan_strategy_chunk(obj)
+    if getattr(obj, "rif_module_track", False):
+        return _build_track_strategy_chunk(obj)
+    return None
+
+
+def _placed_light_for(obj):
+    """Return the PLOBJLIT chunk for an object, or None.
+
+    The light comes out of the object's origin (`Objsetup.cpp:1734`), so no
+    position is stored here -- the lamp is the object, and moving the object
+    moves the light.
+    """
+    if not getattr(obj, "rif_placed_light", False):
+        return None
+
+    from .chunks.light import PlacedLightChunk, pack_colour
+
+    up = getattr(obj, "rif_light_colour", (1.0, 1.0, 1.0))
+    down = getattr(obj, "rif_light_off_colour", (0.0, 0.0, 0.0))
+    flags = 0
+    if getattr(obj, "rif_light_on_at_start", True):
+        flags |= 0x1
+    return PlacedLightChunk(
+        brightness=getattr(obj, "rif_light_brightness", 1.0),
+        range_mm=int(round(getattr(obj, "rif_light_range", 10.0) * 1000.0)),
+        up_colour=pack_colour(*(int(round(c * 255)) for c in up)),
+        down_colour=pack_colour(*(int(round(c * 255)) for c in down)),
+        fade_up_ms=getattr(obj, "rif_light_fade_up_ms", 0),
+        fade_down_ms=getattr(obj, "rif_light_fade_down_ms", 0),
+        up_ms=getattr(obj, "rif_light_on_ms", 0),
+        down_ms=getattr(obj, "rif_light_off_ms", 0),
+        start_ms=getattr(obj, "rif_light_start_ms", 0),
+        light_type=int(getattr(obj, "rif_light_type", "0")),
+        on_off_type=int(getattr(obj, "rif_light_on_off_type", "0")),
+        flags=flags,
+    )
+
+
+def _fragments_for(obj):
+    """Return the SHPFRAGS chunk for an object, or None.
+
+    Each mesh child becomes a piece. Its position relative to the parent is
+    the offset the engine uses as the scatter direction (`Bh_debri.c:800`),
+    so a piece modelled to the left flies left. A child that is not a mesh is
+    skipped: an empty has no geometry to break into.
+    """
+    if not getattr(obj, "rif_fragments", False):
+        return None
+
+    from .chunks.fragments import build_fragments_chunk, build_piece
+
+    pieces = []
+    for child in obj.children:
+        mesh = getattr(child, "data", None)
+        if mesh is None or getattr(mesh, "vertices", None) is None:
+            continue
+
+        verts, _normals, polys, _pn, _uv = _extract_geometry(
+            mesh, _resolve_bitmap_indices(mesh),
+            _rotation_scale_matrix(child))
+        if not verts:
+            continue
+        bounds = _compute_bounds(verts)
+        centre = _compute_centre(bounds)
+        radius = _compute_radius(verts, centre)
+
+        # Where the piece sits relative to the parent, in RIF millimetres.
+        delta = (child.matrix_world.translation
+                 - obj.matrix_world.translation)
+        dx, dy, dz = blender_to_rif_axis(delta.x, delta.y, delta.z)
+        location = (meters_to_rif(dx), meters_to_rif(dy), meters_to_rif(dz))
+
+        pieces.append(build_piece(
+            name=child.name,
+            file_id_num=len(pieces) + 1,
+            num_verts=len(verts),
+            num_polys=len(polys),
+            radius=radius,
+            maximum=bounds["max"],
+            minimum=bounds["min"],
+            location=location,
+            copies=getattr(child, "rif_fragment_copies", 1),
+        ))
+
+    if not pieces:
+        return None
+    return build_fragments_chunk(pieces)
+
+
+def _track_for(obj):
+    """Return an OBJTRAK2 for this object, or None when it has no track.
+
+    The object marks the start of the track and a child empty marks the end,
+    which is the one-section case that 415 of retail's 663 tracks use. With no
+    empty the run is zero, so the track stands where it is -- what 481 of the
+    1312 sections do, and what a fan needs: its direction comes from the
+    rotation, not from the distance.
+    """
+    if not getattr(obj, "rif_track_enabled", False):
+        return None
+
+    from .chunks.track import (
+        TRACK_FLAG_LOOP, TRACK_FLAG_LOOP_BACK_AND_FORTH,
+        TRACK_FLAG_PLAYING_AT_START, TRACK_FLAG_USE_TRACK_SMOOTHING,
+        TrackSection, build_track_chunk, quaternion_payload,
+    )
+
+    start = obj.matrix_world.translation
+    end = None
+    marker = getattr(obj, "rif_track_end", None)
+    if marker is not None:
+        # A deleted empty leaves a pointer that still resolves for a moment, so
+        # the name is checked against the data rather than trusted.
+        end = marker.matrix_world.translation
+
+    def to_rif(vector):
+        """Convert a Blender position to RIF millimetres."""
+        rx, ry, rz = blender_to_rif_axis(vector.x, vector.y, vector.z)
+        return (meters_to_rif(rx), meters_to_rif(ry), meters_to_rif(rz))
+
+    pivot_start = to_rif(start)
+    pivot_end = to_rif(end) if end is not None else pivot_start
+
+    offset = getattr(obj, "rif_track_object_offset", (0, 0, 0))
+    flags = 0
+    if getattr(obj, "rif_track_loop", False):
+        flags |= TRACK_FLAG_LOOP
+    if getattr(obj, "rif_track_playing_at_start", False):
+        flags |= TRACK_FLAG_PLAYING_AT_START
+    if getattr(obj, "rif_track_loop_back_forth", False):
+        flags |= TRACK_FLAG_LOOP_BACK_AND_FORTH
+    if getattr(obj, "rif_track_smoothing", False):
+        flags |= TRACK_FLAG_USE_TRACK_SMOOTHING
+
+    section = TrackSection(
+        pivot_start=pivot_start,
+        pivot_end=pivot_end,
+        object_offset=(int(offset[0]), int(offset[1]), int(offset[2])),
+        seconds=getattr(obj, "rif_track_seconds", 1.0),
+        quat_start=quaternion_payload(obj.matrix_world),
+    )
+    return build_track_chunk([section], flags=flags)
+
+
 def _build_object_chunk(name, location_rif, orientation_rif,
                         index_num, shape_id_no, num_vertices=0,
                         module_data=None, prelight_intensities=None,
-                        strategy=None):
+                        strategy=None, track=None, placed=None,
+                        light=None):
     """Return a fully assembled RBOBJECT chunk.
 
     Children order matches battle.rif:
@@ -964,6 +1200,11 @@ def _build_object_chunk(name, location_rif, orientation_rif,
         non-empty), a SHPVTINT child is emitted. Length must match
         num_vertices. The linked REBSHAPE must have ShapeFlag_PreLit
         set or the engine ignores this chunk (see Kshape.c).
+
+    track : ObjectTrackChunk or None. When provided, an OBJTRAK2 child is
+        emitted. Four strategies read it -- Track (72), TrackDestruct (80),
+        Fan (75) and PlatLift (54) -- and it belongs to the object rather than
+        to the strategy, so it is emitted for modules and placed objects alike.
     """
     # PLACED_OBJECT_FLAGS is what makes the engine treat an object as a placed
     # object instead of a module (Projload.cpp: the header flag decides which
@@ -972,7 +1213,8 @@ def _build_object_chunk(name, location_rif, orientation_rif,
     # exported every door as a placed object, and the engine then never
     # registered it as a module -- no geometry, no collision, no navigation.
     obj_header = ObjectHeaderChunk(
-        flags=(OBJ_FLAGS if module_data is not None
+        flags=(PLACED_OBJECT_FLAGS if placed
+               else OBJ_FLAGS if module_data is not None
                else PLACED_OBJECT_FLAGS if strategy is not None
                else OBJ_FLAGS),
         lock_user=DEFAULT_LOCK_USER,
@@ -1000,6 +1242,14 @@ def _build_object_chunk(name, location_rif, orientation_rif,
         else:
             children.append(ObjectProjectDataChunk(
                 [AVPStrategyChunk(**strategy)]))
+    if light is not None:
+        # A placed light belongs to the object: it lives and dies with it, which
+        # is why shooting the lamp makes the light go out.
+        children.append(light)
+    if track is not None:
+        # Read by the strategy's behaviour, not by the strategy itself, so it
+        # sits on the object next to MODULEDT rather than inside AVPSTRAT.
+        children.append(track)
     if prelight_intensities:
         children.append(ShapeVertexIntensitiesChunk(
             light_set_name=DEFAULT_LIGHT_SET,
@@ -1037,6 +1287,42 @@ def _linked_peers(index, parents, door_peers):
 
     # The parent of a door is a room the door joins; keep it on both sides.
     return list(dict.fromkeys(peers))
+
+
+def _build_fan_strategy_chunk(obj):
+    """Return the AVPSTRAT for a `Fan` strategy on this object."""
+    from .chunks.fan import FanStrategyChunk
+
+    return FanStrategyChunk(
+        speed_up_seconds=getattr(obj, "rif_fan_speed_seconds", 10.0),
+        slow_down_seconds=getattr(obj, "rif_fan_slow_seconds", 10.0),
+        # The property is a fraction of full; the file holds per mille.
+        strength=int(round(
+            getattr(obj, "rif_fan_strength", 1.0) * 100.0)),
+    )
+
+
+def _build_plat_lift_strategy_chunk(obj):
+    """Return the AVPSTRAT for a `PlatLift` strategy on this object."""
+    from .chunks.plat_lift import (
+        PLAT_LIFT_FLAG_DISABLED, PLAT_LIFT_FLAG_ONE_USE,
+        PlatLiftStrategyChunk,
+    )
+
+    flags = 0
+    if getattr(obj, "rif_plat_lift_disabled", False):
+        flags |= PLAT_LIFT_FLAG_DISABLED
+    if getattr(obj, "rif_plat_lift_one_use", False):
+        flags |= PLAT_LIFT_FLAG_ONE_USE
+    # All 74 retail lifts leave the five spare words at zero.
+    return PlatLiftStrategyChunk(flags=flags)
+
+
+def _build_track_strategy_chunk(obj):
+    """Return the AVPSTRAT for a `Track` strategy on this module."""
+    from .chunks.track import build_track_strategy
+
+    return build_track_strategy()
 
 
 def _build_door_strategy(obj):
@@ -1350,7 +1636,7 @@ def _resolve_bitmap_indices(mesh, texture_paths=None):
     return result
 
 
-def _extract_geometry(mesh, slot_bitmaps, matrix=None):
+def _extract_geometry(mesh, slot_bitmaps, matrix=None, slot_flags=None):
     """Return (verts_int, vert_normals, polys, poly_normals, uv_lists).
 
     `matrix` is the object's rotation and scale, without translation. It must be
@@ -1406,12 +1692,18 @@ def _extract_geometry(mesh, slot_bitmaps, matrix=None):
             for i in range(1, len(indices) - 1):
                 tri = [indices[0], indices[i], indices[i + 1]]
                 tri_uvs = [loop_uvs[0], loop_uvs[i], loop_uvs[i + 1]]
-                polys.append(_make_poly_record(tri, poly_index, bitmap_idx))
+                polys.append(_make_poly_record(
+            tri, poly_index, bitmap_idx,
+            slot_flags[slot] if slot_flags and slot < len(slot_flags)
+            else None))
                 poly_normals.append(face_normal)
                 uv_lists.append(tri_uvs)
                 poly_index += 1
         else:
-            polys.append(_make_poly_record(indices, poly_index, bitmap_idx))
+            polys.append(_make_poly_record(
+                indices, poly_index, bitmap_idx,
+                slot_flags[slot] if slot_flags and slot < len(slot_flags)
+                else None))
             poly_normals.append(face_normal)
             uv_lists.append(loop_uvs)
             poly_index += 1
@@ -1419,8 +1711,14 @@ def _extract_geometry(mesh, slot_bitmaps, matrix=None):
     return verts_int, vert_normals, polys, poly_normals, uv_lists
 
 
-def _make_poly_record(vert_indices, poly_index, bitmap_idx=0):
-    """Build a polygon record dict, padding vertex list with -1."""
+def _make_poly_record(vert_indices, poly_index, bitmap_idx=0, flags=None):
+    """Build a polygon record dict, padding vertex list with -1.
+
+    `flags` is `POLY_FLAGS` plus whatever the surface asked for. A lamp's flare
+    is one of those bits: `iflag_light_corona` (`shape.h:625`) marks the polygons
+    the engine draws as a billboard, and it lives on the polygon rather than the
+    shape so one mesh can be part housing and part glow.
+    """
     count = len(vert_indices)
     if count < 3 or count > 4:
         raise ValueError(f"Polygon must have 3 or 4 verts, got {count}")
@@ -1429,7 +1727,7 @@ def _make_poly_record(vert_indices, poly_index, bitmap_idx=0):
     return {
         "engine_type": POLY_ENGINE_TYPE,
         "normal_index": poly_index,
-        "flags": POLY_FLAGS,
+        "flags": POLY_FLAGS if flags is None else int(flags),
         "colour": colour,
         "vert_ind": tuple(padded[:5]),
     }
