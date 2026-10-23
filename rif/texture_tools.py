@@ -151,16 +151,38 @@ def convert_tree(unpacked_root, progress=None, force=False):
     return report
 
 
-def unpacked_root_for(game_dir):
-    """Return ``<game>/fastfile/_ffl_unpacked``."""
-    return Path(game_dir) / "fastfile" / UNPACKED_DIRNAME
+# Where the unpacked textures go. The names match the add-on preference enum.
+UNPACK_IN_FFL_DIR = "FFL"
+UNPACK_IN_GAME_DIR = "GAME"
+UNPACK_IN_CUSTOM_DIR = "CUSTOM"
 
 
-def load_game_textures(game_dir, progress=None, force=False):
+def unpacked_root_for(game_dir, mode=UNPACK_IN_FFL_DIR, custom_dir=""):
+    """Return the folder the unpacked textures live in.
+
+    `mode` is one of the UNPACK_IN_* constants. The default keeps the old
+    location, so an existing installation finds its textures where it left them.
+    """
+    game_dir = Path(game_dir)
+    # Only the original location gets a subfolder: the game root and a folder
+    # the author picked are used as they are, because the author already chose
+    # where the textures should go and a wrapper only hides them.
+    if mode == UNPACK_IN_GAME_DIR:
+        return game_dir
+    if mode == UNPACK_IN_CUSTOM_DIR:
+        if not str(custom_dir).strip():
+            return game_dir / "fastfile" / UNPACKED_DIRNAME
+        return Path(custom_dir)
+    return game_dir / "fastfile" / UNPACKED_DIRNAME
+
+
+def load_game_textures(game_dir, progress=None, force=False,
+                       mode=UNPACK_IN_FFL_DIR, custom_dir=""):
     """Unpack every texture archive and convert the result to PNG.
 
     Returns ``(extraction, conversion)``. ``force`` re-does work that already
-    exists on disk.
+    exists on disk. `mode` and `custom_dir` choose the destination, and the
+    caller must pass the same pair to `unpacked_root_for` when importing.
     """
     game_dir = Path(game_dir)
     archives, skipped_names = fastfile.find_texture_archives(
@@ -169,7 +191,7 @@ def load_game_textures(game_dir, progress=None, force=False):
         raise fastfile.FastFileError(
             f"no Tex<n>.FFL archives in {game_dir / 'fastfile'}")
 
-    destination = unpacked_root_for(game_dir)
+    destination = unpacked_root_for(game_dir, mode, custom_dir)
     extraction = fastfile.extract_all(
         archives, destination, progress=progress, force=force)
     extraction.skipped_archives = skipped_names

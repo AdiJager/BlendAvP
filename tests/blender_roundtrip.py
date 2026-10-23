@@ -2279,8 +2279,10 @@ class _FakeExportSettings:
     module-level function precisely so it can be exercised with this stand-in.
     """
 
-    def __init__(self, mode="LEVEL"):
+    def __init__(self, mode="LEVEL", custom_name=False):
         self.export_mode = mode
+        self.link_mode = "OUTLINER"
+        self.use_custom_name = custom_name
         self.level_name = "custom"
         self.global_scale = 1.0
         self.override_shape_flags = False
@@ -2288,10 +2290,11 @@ class _FakeExportSettings:
         self.export_selected_only = False
 
 
-def _draw_export(module, mode):
+def _draw_export(module, mode, custom_name=False):
     """Return the property names the export layout draws for one mode."""
     layout = _RecordingLayout(record_icons=True)
-    module._draw_export_settings(layout, _FakeExportSettings(mode))
+    module._draw_export_settings(
+        layout, _FakeExportSettings(mode, custom_name=custom_name))
     return [name for kind, name in layout.calls if kind == "prop"]
 
 
@@ -2330,11 +2333,25 @@ def test_export_panel_is_sectioned_and_mode_aware():
         assert drawn, f"nothing drawn for mode {mode}"
         assert "export_mode" in drawn, drawn
         if mode == "LEVEL":
-            assert "level_name" in drawn, f"Level mode must offer the name: {drawn}"
+            # The name follows the scene by default, so the switch is always
+            # there and the field only when it is turned on.
+            assert "link_mode" in drawn, (
+                f"Level mode must offer the link mode: {drawn}")
+            assert "use_custom_name" in drawn, (
+                f"Level mode must offer the custom-name switch: {drawn}")
+            assert "level_name" not in drawn, (
+                f"Level Name must stay hidden until Custom Name is on: {drawn}")
         else:
+            assert "use_custom_name" not in drawn, (
+                f"{mode} does not write an environment, so Custom Name must "
+                f"not be offered: {drawn}")
             assert "level_name" not in drawn, (
                 f"{mode} does not write an environment, so Level Name must "
                 f"not be offered: {drawn}")
+
+    custom = _draw_export(operators, "LEVEL", custom_name=True)
+    assert "level_name" in custom, (
+        f"Custom Name must reveal the field: {custom}")
 
     # Every name the layout uses has to be a real property of the operator, or
     # the panel raises on draw and Blender swallows the exception.

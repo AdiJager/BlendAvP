@@ -95,6 +95,9 @@ from .rif import lighting as rif_lighting
 from .rif.types import blender_to_rif_axis, meters_to_rif
 from .rif.texture_library import RIM_LIBRARY_PROP, rim_name_for_material
 
+# The engine works in millimetres; Blender works in metres.
+MM = 0.001
+
 
 MARKER_PROP = "rif_marker_type"
 PLAYER_START_MARKER = "PLAYER_START"
@@ -160,10 +163,25 @@ def _draw_export_settings(layout, settings):
 
     layout.label(text="Level", icon="SCENE_DATA")
     box = layout.box()
-    box.prop(settings, "export_selected_only")
+    # The mode first: it decides what the rest of the panel can offer, so it
+    # should be the thing the eye lands on.
     box.prop(settings, "export_mode")
+    box.prop(settings, "export_selected_only")
     if settings.export_mode == "LEVEL":
-        box.prop(settings, "level_name")
+        box.prop(settings, "link_mode")
+        if settings.link_mode == "LIST":
+            box.label(text="Fill the Links list on each module",
+                      icon="INFO")
+        elif settings.link_mode == "AUTO":
+            box.label(text="Modules link to whatever they touch",
+                      icon="INFO")
+        box.prop(settings, "use_custom_name")
+        if settings.use_custom_name:
+            box.prop(settings, "level_name")
+        else:
+            scene = bpy.context.scene
+            box.label(text=f"Named after the scene: {scene.name}",
+                      icon="INFO")
     else:
         note = box.row()
         note.label(text="No environment is written in this mode",
@@ -202,6 +220,34 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
              "Selected meshes + REBENVDT environment skeleton"),
         ],
         default="LEVEL",
+    )
+
+    link_mode: EnumProperty(
+        name="Link Mode",
+        description=(
+            "Where the module tree comes from. The tree is written as OBJCHIER "
+            "and also feeds the visibility graph"),
+        items=(
+            ("OUTLINER", "By Outliner",
+             "A module is linked to its parent and children, as arranged in "
+             "the Outliner. The original behaviour"),
+            ("AUTO", "Auto",
+             "Link each module to the nearest one it touches, worked out from "
+             "the bounding boxes. Needs no parenting and no list"),
+            ("LIST", "By List",
+             "Link each module to the modules named on its own panel. Use "
+             "when the shape of the tree matters"),
+        ),
+        default="OUTLINER",
+    )
+
+    use_custom_name: BoolProperty(
+        name="Custom Name",
+        description=(
+            "Use a name other than the scene. Off by default: a scene is what "
+            "a level is, so the name follows it and one .blend can hold "
+            "several levels without renaming anything"),
+        default=False,
     )
 
     level_name: StringProperty(
@@ -351,9 +397,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         # the same list, so the polygon indices and the chunk can never disagree.
         tex_paths, bitmap_mapping = _build_bitmap_mapping(objs)
 
-        hierarchy = {
-            o.name: o.parent.name for o in objs if o.parent is not None
-        } or None
+        hierarchy = _build_hierarchy(objs, self.link_mode)
         _report_layout(self, context, objs, hierarchy)
 
         originals = _apply_bitmap_indices(objs, bitmap_mapping)
@@ -427,7 +471,9 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                     "not match the rotated cube on screen: "
                     + ", ".join(rotated_waypoints[:4]))
             return build_rif_level(
-                objs, self.level_name,
+                objs,
+                (self.level_name if self.use_custom_name
+                 else context.scene.name),
                 texture_paths=tex_paths,
                 player_start=player_start,
                 hierarchy=hierarchy,
@@ -551,6 +597,34 @@ class RIF_AddonPreferences(bpy.types.AddonPreferences):
         default="",
     )
 
+    unpack_mode: EnumProperty(
+        name="FFL's Unpack Directory",
+        description=(
+            "Where the texture archives are unpacked to, and where the texture "
+            "import reads them back from. One setting, so the two cannot "
+            "disagree"),
+        items=(
+            ("FFL", "FFL Dir",
+             "fastfile/_ffl_unpacked inside the game folder. What the add-on "
+             "did before, and the default"),
+            ("GAME", "Game Dir",
+             "The game folder itself, one level up from fastfile"),
+            ("CUSTOM", "Custom Dir",
+             "A folder of your own. Use this when the game folder is read-only "
+             "or shared"),
+        ),
+        default="FFL",
+    )
+
+    custom_unpack_directory: StringProperty(
+        name="Custom Directory",
+        description=(
+            "Where to put the unpacked textures. The archives are unpacked "
+            "into an _ffl_unpacked subfolder here"),
+        subtype="DIR_PATH",
+        default="",
+    )
+
     keep_packed: BoolProperty(
         name="Pack Images Into .blend",
         description=(
@@ -568,12 +642,19 @@ class RIF_AddonPreferences(bpy.types.AddonPreferences):
         layout.use_property_split = True
 
         layout.prop(self, "game_directory")
+        layout.prop(self, "unpack_mode")
+        if self.unpack_mode == "CUSTOM":
+            layout.prop(self, "custom_unpack_directory")
+            if not self.custom_unpack_directory.strip():
+                layout.label(text="Pick a folder, or the game's default is used",
+                             icon="INFO")
         layout.prop(self, "keep_packed")
 
 
 
         row = layout.row()
         row.operator(RIF_OT_load_game_textures.bl_idname, icon="FILE_FOLDER")
+        row.operator(RIF_OT_load_shapes.bl_idname, icon="MESH_MONKEY")
 
         if not self.game_directory:
             layout.label(text="Point this at the game folder first",
@@ -633,7 +714,9 @@ class RIF_OT_load_game_textures(bpy.types.Operator):
         try:
             window_manager.progress_begin(0, 100)
             extraction, conversion = texture_tools.load_game_textures(
-                game_path, progress=progress)
+                game_path, progress=progress,
+                mode=preferences.unpack_mode,
+                custom_dir=preferences.custom_unpack_directory)
         except fastfile.FastFileError as exc:
             window_manager.progress_end()
             _report(self, {"ERROR"}, f"Texture archives: {exc}")
@@ -644,7 +727,10 @@ class RIF_OT_load_game_textures(bpy.types.Operator):
             return {"CANCELLED"}
 
         report, materials = texture_import.import_texture_library(
-            texture_tools.unpacked_root_for(game_path), progress=progress)
+            texture_tools.unpacked_root_for(
+                game_path, preferences.unpack_mode,
+                preferences.custom_unpack_directory),
+            progress=progress)
         window_manager.progress_end()
 
         if preferences.keep_packed:
@@ -668,6 +754,144 @@ class RIF_OT_load_game_textures(bpy.types.Operator):
             _report(self, {"WARNING"},
                         f"{len(extraction.duplicates)} duplicate name(s) "
                         "between archives")
+        return {"FINISHED"}
+
+
+def _apply_shape_smoothing(mesh, shape):
+    """Smooth the faces whose vertices disagree about which way is out.
+
+    SHPVNORM carries a normal per vertex, and a face whose corners all share
+    one normal is a flat surface; where they differ, the surface is meant to be
+    curved. Without this every shape is faceted, which is what makes a chair look
+    carved from blocks instead of moulded.
+    """
+    normals = shape.vertex_normals
+    if not normals:
+        return
+    for polygon in mesh.polygons:
+        shared = [normals[i] for i in polygon.vertices if i < len(normals)]
+        if len(shared) < 3:
+            continue
+        first = shared[0]
+        # Same direction to within a degree: the face is flat and stays flat.
+        smooth = any(first[0] * other[0] + first[1] * other[1]
+                     + first[2] * other[2] < 0.9998 for other in shared[1:])
+        polygon.use_smooth = smooth
+    mesh.update()
+
+
+def _fix_shape_winding(mesh, shape):
+    """Turn each face so its normal agrees with the one the engine stored.
+
+    SHPPNORM holds a real normal per polygon, and the engine's winding does not
+    have to match Blender's -- it does not, and the result is meshes that are lit
+    from behind and look unshaded. Reading the stored normal is cheaper and more
+    reliable than guessing a global rule, because a shape can mix both.
+    """
+    for face_index, wanted in enumerate(shape.polygon_normals):
+        if wanted is None or face_index >= len(mesh.polygons):
+            continue
+        polygon = mesh.polygons[face_index]
+        current = polygon.normal
+        if (current.x * wanted[0] + current.y * wanted[1]
+                + current.z * wanted[2]) < 0.0:
+            polygon.flip()
+    mesh.update()
+
+
+def _assign_shape_materials(mesh, shape, stem, number):
+    """Give the mesh its materials; the reader owns the rule."""
+    shape_reader.assign_materials(mesh, shape, stem, number)
+
+
+class RIF_OT_load_shapes(bpy.types.Operator):
+    """Import the game's model library into a scene of its own.
+
+    The game keeps its models in shape_rifs, one file per model. They go into
+    a scene named after the folder so they never mix with a level: a level is
+    what you export, these are what you place in one.
+    """
+
+    bl_idname = "object.rif_load_shapes"
+    bl_label = "Load Shapes"
+    bl_description = (
+        "Import every model from the game's shape_rifs folder into a scene of "
+        "its own")
+
+    def execute(self, context):
+        """Import the shape library, one scene per call."""
+        from .rif import shape_reader
+
+        preferences = context.preferences.addons[__package__].preferences
+        game_directory = preferences.game_directory.strip()
+        if not game_directory:
+            _report(self, {"ERROR"},
+                    "Set Game Directory in the add-on preferences first")
+            return {"CANCELLED"}
+
+        folder = Path(game_directory) / "shape_rifs"
+        if not folder.is_dir():
+            _report(self, {"WARNING"},
+                    f"No shape_rifs folder in {Path(game_directory)}")
+            return {"CANCELLED"}
+
+        files = sorted(set(folder.glob("*.rif")) | set(folder.glob("*.RIF")))
+        if not files:
+            _report(self, {"WARNING"}, f"No .rif files in {folder}")
+            return {"CANCELLED"}
+
+        scene_name = "shape_rifs"
+        scene = bpy.data.scenes.get(scene_name)
+        if scene is None:
+            scene = bpy.data.scenes.new(scene_name)
+        scene["rif_shape_import"] = True
+
+        window_manager = context.window_manager
+        window_manager.progress_begin(0, len(files))
+        imported = 0
+        skipped = []
+        try:
+            for index, path in enumerate(files):
+                window_manager.progress_update(index)
+                try:
+                    shapes = shape_reader.read_shapes(path)
+                except (OSError, ValueError, struct.error):
+                    skipped.append(path.name)
+                    continue
+                for number, shape in enumerate(shapes):
+                    # One call builds geometry, winding, smoothing, UVs and
+                    # materials together: doing only some of it is what made
+                    # pickups arrive flat while this path looked right.
+                    mesh = shape_reader.build_mesh(
+                        shape, f"{path.stem}_{number}",
+                        stem=path.stem, number=number)
+                    # Zero-fill rather than skip: a shape whose UV list is one
+                    # short is still mostly right, and dropping all of it makes
+                    # the whole model use one texel.
+                    if shape.uvs:
+                        layer = mesh.uv_layers.new(name="UVMap")
+                        for face_index, corners in enumerate(shape.uvs):
+                            if face_index >= len(faces):
+                                break
+                            for corner_index, (u, v) in enumerate(corners):
+                                if corner_index >= len(faces[face_index]):
+                                    break
+                                loop_index = mesh.polygons[face_index].loop_start \
+                                    + corner_index
+                                if loop_index < len(mesh.loops):
+                                    layer.data[loop_index].uv = (u, v)
+
+                    obj = bpy.data.objects.new(mesh.name, mesh)
+                    scene.collection.objects.link(obj)
+                    imported += 1
+        finally:
+            window_manager.progress_end()
+
+        message = (f"Imported {imported} shape(s) from {len(files)} file(s) "
+                   f"into '{scene_name}'")
+        if skipped:
+            message += f"; skipped {len(skipped)}: " + ", ".join(skipped[:3])
+        _report(self, {"INFO"}, message)
         return {"FINISHED"}
 
 
@@ -2125,6 +2349,59 @@ def _budget_layout_problems(context, spawns):
     return problems
 
 
+def _build_hierarchy(objs, mode):
+    """Return {child_name: parent_name} for the chosen link mode.
+
+    The tree has one parent per module, so adjacency -- a graph -- has to be
+    reduced to one. `Auto` picks the nearest module that is close enough to
+    touch and has a lower index, which also makes a cycle impossible.
+    """
+    if mode == "LIST":
+        pairs = {}
+        for obj in objs:
+            links = getattr(obj, "rif_module_links", ())
+            for link in links:
+                name = (link.target_name or "").strip()
+                if name:
+                    pairs[obj.name] = name
+                    break
+        return pairs or None
+
+    if mode == "AUTO":
+        from mathutils import Vector
+        bounds = {}
+        for obj in objs:
+            corners = [obj.matrix_world @ Vector(c)
+                       for c in obj.bound_box]
+            bounds[obj.name] = (
+                Vector((min(v.x for v in corners), min(v.y for v in corners),
+                        min(v.z for v in corners))),
+                Vector((max(v.x for v in corners), max(v.y for v in corners),
+                        max(v.z for v in corners))))
+        pairs = {}
+        order = [obj.name for obj in objs]
+        for index, name in enumerate(order):
+            low, high = bounds[name]
+            best = None
+            best_gap = None
+            for other_index in range(index):
+                other = order[other_index]
+                olow, ohigh = bounds[other]
+                gap = max(low.x - ohigh.x, olow.x - high.x,
+                          low.y - ohigh.y, olow.y - high.y,
+                          low.z - ohigh.z, olow.z - high.z)
+                if gap > 0:
+                    continue
+                if best_gap is None or gap < best_gap:
+                    best_gap = gap
+                    best = other
+            if best is not None:
+                pairs[name] = best
+        return pairs or None
+
+    return {o.name: o.parent.name for o in objs if o.parent is not None} or None
+
+
 def _report_layout(operator, context, objs, hierarchy):
     """Warn about every layout problem the engine will not tolerate.
 
@@ -2241,9 +2518,9 @@ class RIF_OT_validate_level(bpy.types.Operator):
             return {"CANCELLED"}
         notes.append(f"{len(objs)} module(s)")
 
-        hierarchy = {
-            o.name: o.parent.name for o in objs if o.parent is not None
-        } or None
+        # The validator has no Link Mode of its own: it checks the layout
+        # that the Outliner produces, which is the original one.
+        hierarchy = _build_hierarchy(objs, "OUTLINER")
         problems.extend(_module_layout_problems(objs, hierarchy))
         problems.extend(_sound_layout_problems(context))
         problems.extend(_waypoint_layout_problems(context))
@@ -2802,6 +3079,7 @@ def _menu_func_export(self, context):
 _CLASSES = (
     RIF_LightSettings,
     RIF_AddonPreferences,
+    RIF_OT_load_shapes,
     RIF_PT_light,
     RIF_OT_export,
     RIF_OT_load_game_textures,

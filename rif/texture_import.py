@@ -87,8 +87,11 @@ def build_material(name, image, rim_path):
     texture = tree.nodes.new("ShaderNodeTexImage")
     texture.location = (-400, 0)
     texture.image = image
-    # Indexed art must not be smoothed, or the palette edges bleed.
-    texture.interpolation = "Closest"
+    # Linear, not Closest. The art is indexed and only 128 pixels square, and
+    # Closest was chosen to stop palette edges bleeding -- but the engine filters
+    # bilinearly, so Closest shows the texels as hard blocks that the game never
+    # does. A texture magnified across a wall is where that is most obvious.
+    texture.interpolation = "Linear"
 
     # The engine has no specular and no roughness: a surface is lit diffusely
     # and nothing reflects. Setting these to the values a mirror-free surface

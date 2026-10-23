@@ -592,14 +592,17 @@ def build_rif_level(objects, level_name, texture_paths=None,
         as_placed = bool(object_type != "MODULE"
                          or getattr(obj, "rif_module_plat_lift", False)
                          or getattr(obj, "rif_module_fan", False)
-                         or getattr(obj, "rif_module_track", False)
+                         or getattr(obj, "rif_track_enabled", False)
                          # A fragmenting object is placed as well: 6575 of the
                          # 6582 in the shipped levels are, and only seven are
                          # modules. Its pieces hang off its shape, not the level.
                          or getattr(obj, "rif_fragments", False)
                          # A lamp is a placed object too, and it must carry its
                          # strategy: the loader takes the hit points from it.
-                         or getattr(obj, "rif_placed_light", False))
+                         or getattr(obj, "rif_placed_light", False)
+                         # A lever is placed too, and needs its strategy for
+                         # the operate key to find it.
+                         or getattr(obj, "rif_placed_switch", False))
         if include_module_data and not as_placed:
             # VMDARRAY is a VISIBILITY SCRIPT, not a graph (MODULE.C:190): the
             # engine walks it and marks every module it reaches as visible.
@@ -626,7 +629,7 @@ def build_rif_level(objects, level_name, texture_paths=None,
                 # A track is the other module strategy that moves geometry.
                 # Both at once would leave the engine with two behaviours on
                 # one module, which no retail level does.
-                "track": (None if not getattr(obj, "rif_module_track", False)
+                "track": (None if not getattr(obj, "rif_track_enabled", False)
                           else _build_track_strategy_chunk(obj)),
                 "module_flags": module_flags(
                     airduct=bool(getattr(obj, "rif_module_airduct", False)),
@@ -1018,6 +1021,95 @@ def _placed_light_strategy(obj):
     )
 
 
+def _pickup_strategy(obj):
+    """Return a SimpleObject strategy carrying what this object is.
+
+    Only when the object is a pickup: an object with no type is scenery, and
+    MaintainPlayersInventory ignores anything whose 	ypeId is not one of the
+    pickup kinds (Inventry.c:77).
+    """
+    if not getattr(obj, "rif_pickup", False):
+        return None
+    from .chunks.strategy import AVPStrategyChunk
+    return AVPStrategyChunk(
+        type_id=int(getattr(obj, "rif_pickup_kind", "2")),
+        sub_type=int(getattr(obj, "rif_pickup_subtype", "0")),
+    )
+
+
+def _trigger_strategy(obj):
+    """Return a SimpleObject strategy carrying this object's trigger.
+
+    Only when something would actually be sent: a strategy with no target and
+    no flags is dead weight, and 6987 of the shipped objects carry exactly
+    that.
+    """
+    on_destroy = bool(getattr(obj, "rif_trigger_on_destroy", False))
+    on_pickup = bool(getattr(obj, "rif_trigger_on_pickup", False))
+    if not (on_destroy or on_pickup):
+        return None
+
+    target = getattr(obj, "rif_trigger_target", None)
+    if target is None:
+        return None
+
+    from .chunks.strategy import AVPStrategyChunk, trigger_flags
+    from .chunks.trigger import virtual_object_id
+
+    integrity = (int(getattr(obj, "rif_integrity", 1))
+                 if getattr(obj, "rif_destructible", False) else 0)
+    return AVPStrategyChunk(
+        type_id=0,
+        integrity=integrity,
+        flags=trigger_flags(
+            on_destroy, on_pickup,
+            int(getattr(obj, "rif_trigger_explosion", "0"))),
+        target_request=1 if getattr(obj, "rif_trigger_state", False) else 0,
+        # The chunk stores the id as one 64-bit word, so the bytes the
+        # trigger writer produces are packed little-endian.
+        target_id=int.from_bytes(virtual_object_id(target.name), "little"),
+    )
+
+
+def _bin_switch_strategy(obj):
+    """Return the BinSwitch strategy for a lever, or None."""
+    if not getattr(obj, "rif_placed_switch", False):
+        return None
+
+    from .chunks.bin_switch import (
+        BIN_SWITCH_FLAG_OFF_MESSAGE_NONE, BIN_SWITCH_FLAG_OFF_MESSAGE_SAME,
+        BIN_SWITCH_FLAG_STARTS_ON, BinSwitchStrategyChunk, encode_request,
+    )
+
+    flags = 0
+    if getattr(obj, "rif_switch_starts_on", False):
+        flags |= BIN_SWITCH_FLAG_STARTS_ON
+    if getattr(obj, "rif_switch_off_same", False):
+        flags |= BIN_SWITCH_FLAG_OFF_MESSAGE_SAME
+    if getattr(obj, "rif_switch_off_none", False):
+        flags |= BIN_SWITCH_FLAG_OFF_MESSAGE_NONE
+
+    target = getattr(obj, "rif_switch_target", None)
+    target_id = b"\x00" * 8
+    if target is not None:
+        # The same object id the target itself carries.
+        # The id the target itself will carry: the engine matches by it,
+        # and the virtual-object scheme is the one the trigger writer uses.
+        from .chunks.trigger import virtual_object_id
+        target_id = virtual_object_id(target.name)
+
+    return BinSwitchStrategyChunk(
+        flags=flags,
+        mode=int(getattr(obj, "rif_switch_mode", "1")),
+        time=getattr(obj, "rif_switch_time", 0),
+        security=getattr(obj, "rif_switch_security", 0),
+        target_id=target_id,
+        request=encode_request(
+            getattr(obj, "rif_switch_press_state", False),
+            getattr(obj, "rif_switch_extra", 0)),
+    )
+
+
 def _placed_object_strategy(obj):
     """Return the strategy for a placed object, or None.
 
@@ -1027,11 +1119,23 @@ def _placed_object_strategy(obj):
     strategy = _placed_light_strategy(obj)
     if strategy is not None:
         return strategy
+    strategy = _bin_switch_strategy(obj)
+    if strategy is not None:
+        return strategy
+    strategy = _trigger_strategy(obj)
+    if strategy is not None:
+        return strategy
+    strategy = _pickup_strategy(obj)
+    if strategy is not None:
+        return strategy
     if getattr(obj, "rif_module_plat_lift", False):
         return _build_plat_lift_strategy_chunk(obj)
     if getattr(obj, "rif_module_fan", False):
         return _build_fan_strategy_chunk(obj)
-    if getattr(obj, "rif_module_track", False):
+    # A track with nothing else attached is a track object: it moves and does
+    # no more. A fan, a lift or a lever have already returned above and read
+    # the same track from their own tools data.
+    if getattr(obj, "rif_track_enabled", False):
         return _build_track_strategy_chunk(obj)
     return None
 

@@ -45,6 +45,7 @@ MARKER_PROP = "rif_marker_type"
 PLAYER_START_MARKER = "PLAYER_START"
 
 # Categories, in menu order.
+CAT_MODULE = "MODULE"
 CAT_PLAYER_START = "PLAYER_START"
 CAT_GENERATOR = "GENERATOR"
 CAT_NAVIGATION = "NAVIGATION"
@@ -56,6 +57,7 @@ CAT_EFFECTS = "EFFECTS"
 CAT_MORPH = "MORPH"
 
 CATEGORY_LABELS = (
+    (CAT_MODULE, "Modules"),
     (CAT_PLAYER_START, "Player Start"),
     (CAT_GENERATOR, "NPC Generator"),
     (CAT_PICKUP, "Pickups"),
@@ -80,6 +82,16 @@ KIND_PICKUP = "PICKUP"
 # Scenery and lights: same strategy 62, same placed-object path, a
 # different INANIMATEOBJECT_TYPE.
 KIND_OBJECT = "OBJECT"
+# A mesh cube with the AvP Object switches preset, so the author starts from
+# something that already behaves instead of from a cube with a label.
+KIND_SIMPLE_OBJECT = "SIMPLE_OBJECT"
+# Shell geometry: a room wound inward, and a door with its module flags on.
+KIND_MODULE_ROOM = "MODULE_ROOM"
+KIND_MODULE_DOOR = "MODULE_DOOR"
+# Presets that make ordinary geometry rather than a placeholder marker.
+# They must not carry PLACEABLE_PROP: the AvP Object panel polls on its
+# absence, so setting it would hide the panel the author needs.
+GEOMETRY_KINDS = (KIND_SIMPLE_OBJECT, KIND_MODULE_ROOM, KIND_MODULE_DOOR)
 # Entries that exist so the menu is complete and the shape of the tool is
 # visible, but write nothing yet. They are reported as unsupported on
 # export rather than dropped in silence.
@@ -166,6 +178,52 @@ class RIF_OT_switch_target_remove(bpy.types.Operator):
             return {"CANCELLED"}
         targets.remove(len(targets) - 1)
         obj.rif_placeable.switch_target_index = len(targets) - 1
+        return {"FINISHED"}
+
+
+class RIF_ModuleLink(bpy.types.PropertyGroup):
+    """One module this module is linked to, by name."""
+
+    target_name: bpy.props.StringProperty(
+        name="Module",
+        description=(
+            "Name of the module to link to. The engine matches on an id "
+            "derived from the name, so renaming that object breaks the link"),
+        default="")
+
+
+class RIF_OT_module_link_add(bpy.types.Operator):
+    """Append an empty link row to the active module."""
+
+    bl_idname = "rif.module_link_add"
+    bl_label = "Add link"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        """Add one row and leave the cursor on it."""
+        obj = context.active_object
+        if obj is None or not hasattr(obj, "rif_module_links"):
+            return {"CANCELLED"}
+        obj.rif_module_links.add()
+        return {"FINISHED"}
+
+
+class RIF_OT_module_link_remove(bpy.types.Operator):
+    """Drop the last link row from the active module."""
+
+    bl_idname = "rif.module_link_remove"
+    bl_label = "Remove link"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        """Remove the last row, so the panel and the file stay in step."""
+        obj = context.active_object
+        if obj is None or not hasattr(obj, "rif_module_links"):
+            return {"CANCELLED"}
+        links = obj.rif_module_links
+        if not len(links):
+            return {"CANCELLED"}
+        links.remove(len(links) - 1)
         return {"FINISHED"}
 
 
@@ -772,7 +830,8 @@ class _PlaceableSpec:
 
     def __init__(self, key, label, description, icon, category, kind,
                  npc_type=0, display=None, flags=None, legacy_marker=None,
-                 pickup_type=None):
+                 pickup_type=None, object_flags=None, pieces=0,
+                 shape_file=None):
         self.key = key
         self.label = label
         self.description = description
@@ -783,6 +842,15 @@ class _PlaceableSpec:
         self.pickup_type = pickup_type
         self.display = display or DISPLAY_BY_KIND.get(kind, "PLAIN_AXES")
         self.flags = dict(flags or {})
+        # Switches on the Object rather than on rif_placeable: the object
+        # type, the behaviour, the track. Set on the created object.
+        self.object_flags = dict(object_flags or {})
+        # Mesh children to give a fragmenting preset something to break
+        # into. Zero means the object stands alone.
+        self.pieces = int(pieces)
+        # Model to read from shape_rifs when this entry is used. None
+        # means the entry has no model of its own and stays a cube.
+        self.shape_file = shape_file
         # Set on objects the existing export path finds by marker rather than
         # by the new `rif_placeable` property.
         self.legacy_marker = legacy_marker
@@ -794,7 +862,48 @@ class _PlaceableSpec:
 
 
 # The whole menu, as data: one row per entry, each with its own tooltip.
+# Retail pickup name -> shape_rifs file, keyed by (INANIMATEOBJECT_TYPE,
+# sub_type). Read from every pickup placed in the 63 shipped levels; the file is
+# the object name with its trailing digits trimmed, ignoring case.
+PICKUP_SHAPES = {
+    (2, 0): "Pulse",
+    (2, 2): "Smart",
+    (2, 3): "flame",
+    (2, 5): "SADAR",
+    (2, 6): "Grenade",
+    (2, 7): "Minigun",
+    (2, 22): "Pistol",
+    (2, 23): "Skeeter",
+    (3, 0): "Pulam",
+    (3, 2): "Smrtam01",
+    (3, 3): "FLAM01",
+    (3, 5): "Rocam01",
+    (3, 6): "Grenbx01",
+    (3, 7): "Miniamo",
+    (3, 8): "Grenband",
+    (4, 0): "Medbox01",
+    (5, 0): "Armour01",
+    (13, 0): "secpass",
+    (15, 0): "Pboost",
+}
+
+
 PLACEABLES = (
+    _PlaceableSpec(
+        "module_room", "Room", (
+            "A room as a module: a box with its faces pointing inward, so you "
+            "stand inside it. Two materials, floor and the one shared by the "
+            "walls and ceiling. Scale it to the size of the space"),
+        "MESH_CUBE", CAT_MODULE, KIND_MODULE_ROOM,
+        object_flags={"rif_object_type": "MODULE"}),
+    _PlaceableSpec(
+        "module_door", "Door", (
+            "A door module with its door flags on. It morphs open rather than "
+            "sliding, so it deforms in place: give it the thickness of the "
+            "wall it sits in and shape it as the doorway"),
+        "MESH_CUBE", CAT_MODULE, KIND_MODULE_DOOR,
+        object_flags={"rif_object_type": "MODULE",
+                      "rif_module_door": True}),
     # -- Player Start ------------------------------------------------------
     _PlaceableSpec(
         "player_start_sp", "Single Player", (
@@ -975,128 +1084,161 @@ PLACEABLES = (
             "appear in retail - the Predator and Alien start armed, so no "
             "level places a pickup for them"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
-        flags={"sub_type": 0}),
+        flags={"sub_type": 0}, shape_file="Pulse"),
     _PlaceableSpec(
         "pickup_weapon_smartgun", "Weapon: Smartgun", (
             "IOT_Weapon (2), sub_type 2. Only the eight marine weapons "
             "appear in retail - the Predator and Alien start armed, so no "
             "level places a pickup for them"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
-        flags={"sub_type": 2}),
+        flags={"sub_type": 2}, shape_file="Smart"),
     _PlaceableSpec(
         "pickup_weapon_flamethrower", "Weapon: Flamethrower", (
             "IOT_Weapon (2), sub_type 3. Only the eight marine weapons "
             "appear in retail - the Predator and Alien start armed, so no "
             "level places a pickup for them"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
-        flags={"sub_type": 3}),
+        flags={"sub_type": 3}, shape_file="flame"),
     _PlaceableSpec(
         "pickup_weapon_sadar", "Weapon: SADAR", (
             "IOT_Weapon (2), sub_type 5. Only the eight marine weapons "
             "appear in retail - the Predator and Alien start armed, so no "
             "level places a pickup for them"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
-        flags={"sub_type": 5}),
+        flags={"sub_type": 5}, shape_file="SADAR"),
     _PlaceableSpec(
         "pickup_weapon_grenadelauncher", "Weapon: Grenade Launcher", (
             "IOT_Weapon (2), sub_type 6. Only the eight marine weapons "
             "appear in retail - the Predator and Alien start armed, so no "
             "level places a pickup for them"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
-        flags={"sub_type": 6}),
+        flags={"sub_type": 6}, shape_file="Grenade"),
     _PlaceableSpec(
         "pickup_weapon_minigun", "Weapon: Minigun", (
             "IOT_Weapon (2), sub_type 7. Only the eight marine weapons "
             "appear in retail - the Predator and Alien start armed, so no "
             "level places a pickup for them"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
-        flags={"sub_type": 7}),
+        flags={"sub_type": 7}, shape_file="Minigun"),
     _PlaceableSpec(
         "pickup_weapon_marinepistol", "Weapon: Marine Pistol", (
             "IOT_Weapon (2), sub_type 22. Only the eight marine weapons "
             "appear in retail - the Predator and Alien start armed, so no "
             "level places a pickup for them"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
-        flags={"sub_type": 22}),
+        flags={"sub_type": 22}, shape_file="Pistol"),
     _PlaceableSpec(
         "pickup_weapon_frisbee", "Weapon: Frisbee Launcher", (
             "IOT_Weapon (2), sub_type 23. Only the eight marine weapons "
             "appear in retail - the Predator and Alien start armed, so no "
             "level places a pickup for them"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=2,
-        flags={"sub_type": 23}),
+        flags={"sub_type": 23}, shape_file="Skeeter"),
     _PlaceableSpec(
         "pickup_ammo_10mm", "Ammo: 10mm Ammo", (
             "IOT_Ammo (3), sub_type 0. 10mm rounds, the commonest ammo retail places"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
-        flags={"sub_type": 0}),
+        flags={"sub_type": 0}, shape_file="Pulam"),
     _PlaceableSpec(
         "pickup_ammo_smartgun", "Ammo: Smartgun Ammo", (
             "IOT_Ammo (3), sub_type 2. Smartgun rounds for the smartgun"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
-        flags={"sub_type": 2}),
+        flags={"sub_type": 2}, shape_file="Smrtam01"),
     _PlaceableSpec(
         "pickup_ammo_flamethrower", "Ammo: Flamethrower Fuel", (
             "IOT_Ammo (3), sub_type 3. Fuel canisters for the flamethrower"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
-        flags={"sub_type": 3}),
+        flags={"sub_type": 3}, shape_file="FLAM01"),
     _PlaceableSpec(
         "pickup_ammo_sadar", "Ammo: SADAR Rockets", (
             "IOT_Ammo (3), sub_type 5. Rockets for the SADAR launcher"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
-        flags={"sub_type": 5}),
+        flags={"sub_type": 5}, shape_file="Rocam01"),
     _PlaceableSpec(
         "pickup_ammo_grenade", "Ammo: Grenades", (
             "IOT_Ammo (3), sub_type 6. Grenades for the grenade launcher"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
-        flags={"sub_type": 6}),
+        flags={"sub_type": 6}, shape_file="Grenbx01"),
     _PlaceableSpec(
         "pickup_ammo_minigun", "Ammo: Minigun Ammo", (
             "IOT_Ammo (3), sub_type 7. Minigun rounds for the minigun"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
-        flags={"sub_type": 7}),
+        flags={"sub_type": 7}, shape_file="Miniamo"),
     _PlaceableSpec(
         "pickup_ammo_pulsegrenade", "Ammo: Pulse Grenades", (
             "IOT_Ammo (3), sub_type 8. Pulse grenades for the pulse rifle"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=3,
-        flags={"sub_type": 8}),
+        flags={"sub_type": 8}, shape_file="Grenband"),
     _PlaceableSpec(
         "pickup_health", "Medkit", (
             "IOT_Health (4). sub_type is always 0 in retail - the category "
             "holds a single item"),
-        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=4),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=4, shape_file="Medbox01"),
     _PlaceableSpec(
         "pickup_armour", "Armour", (
             "IOT_Armour (5). sub_type is always 0 in retail"),
-        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=5),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=5, shape_file="Armour01"),
     _PlaceableSpec(
         "pickup_fieldcharge", "Energy Orb", (
             "IOT_FieldCharge (15) - the Predator's energy pickup. sub_type is "
             "always 0 in retail"),
-        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=15),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=15, shape_file="Pboost"),
     _PlaceableSpec(
-        "object_static", "Static", (
-            "IOT_Static (0). Scenery the player cannot interact with: tanks, "
-            "TVs, grills. 2453 of them in retail, the second largest category. "
-            "Pick the model from the panel"),
-        "MESH_CUBE", CAT_OBJECT, KIND_OBJECT, pickup_type=0),
+        "object_simple", "Simple Object", (
+            "A placed object with every option off: plain decoration, which "
+            "is the commonest placed object in the shipped levels. Put the "
+            "mesh in the shape you want and switch on what it should do"),
+        "MESH_CUBE", CAT_OBJECT, KIND_SIMPLE_OBJECT,
+        object_flags={"rif_object_type": "SIMPLE_OBJECT"}),
     _PlaceableSpec(
-        "object_furniture", "Furniture", (
-            "IOT_Furniture (1). Crates, drums, seats - scenery that can be "
-            "pushed. 922 in retail, mass 40-2000 g"),
-        "MESH_CUBE", CAT_OBJECT, KIND_OBJECT, pickup_type=1),
+        "object_lift", "Platform Lift", (
+            "A platform lift with a track. Add an End Point and set the "
+            "Movement section to it, and the platform travels between the "
+            "two"),
+        "SORT_ASC", CAT_OBJECT, KIND_SIMPLE_OBJECT,
+        object_flags={"rif_object_type": "SIMPLE_OBJECT",
+                      "rif_module_plat_lift": True,
+                      "rif_track_enabled": True}),
     _PlaceableSpec(
-        "object_screen", "Screens", (
-            "IOT_ReservedForJohn (9) despite the placeholder-sounding name: "
-            "the video screens, models screen1, screen2 and so on. 196 in "
-            "retail"),
-        "MESH_CUBE", CAT_OBJECT, KIND_OBJECT, pickup_type=9),
+        "object_fan", "Fan", (
+            "A fan with a track. It pushes the player away from itself, and "
+            "with an End Point it moves along the way as well"),
+        "FORCE_FORCE", CAT_OBJECT, KIND_SIMPLE_OBJECT,
+        object_flags={"rif_object_type": "SIMPLE_OBJECT",
+                      "rif_module_fan": True,
+                      "rif_track_enabled": True}),
     _PlaceableSpec(
-        "object_light", "Lights", (
-            "Placed light objects, 2846 in retail - the largest category, all "
-            "named light*. They need a PLOBJLIT chunk, which is not written "
-            "yet, so for now a light here is scenery with no glow"),
-        "MESH_CUBE", CAT_OBJECT, KIND_OBJECT, pickup_type=16),
+        "object_lever", "Lever", (
+            "A lever with a track: aim at it and press the operate key. Give "
+            "it an End Point so the handle moves, and set its Target in the "
+            "Switch section to what it should work"),
+        "HAND", CAT_OBJECT, KIND_SIMPLE_OBJECT,
+        object_flags={"rif_object_type": "SIMPLE_OBJECT",
+                      "rif_placed_switch": True,
+                      "rif_track_enabled": True}),
+    _PlaceableSpec(
+        "object_lamp", "Lamp", (
+            "A lamp that emits light, with the pieces its housing breaks into "
+            "already set up. Turn on Light and mark a material as a corona to "
+            "give it a flare"),
+        "LIGHT_POINT", CAT_OBJECT, KIND_SIMPLE_OBJECT,
+        object_flags={"rif_object_type": "SIMPLE_OBJECT",
+                      "rif_placed_light": True,
+                      "rif_fragments": True,
+                      "rif_destructible": True,
+                      "rif_integrity": 16},
+        pieces=2),
+    _PlaceableSpec(
+        "object_destructible", "Destructible", (
+            "An object that breaks into pieces, with the pieces already there "
+            "as children. Set Integrity and an Explosion in the Trigger "
+            "section, and a Target if breaking it should do something"),
+        "MOD_EXPLODE", CAT_OBJECT, KIND_SIMPLE_OBJECT,
+        object_flags={"rif_object_type": "SIMPLE_OBJECT",
+                      "rif_fragments": True,
+                      "rif_destructible": True,
+                      "rif_integrity": 3},
+        pieces=3),
     _PlaceableSpec(
         "sound", "Sound", (
             "SOUNDOB2: one emitter. inner_range is at full volume, outer_range "
@@ -1120,7 +1262,7 @@ PLACEABLES = (
         "pickup_security", "Security Pass", (
             "IOT_SpecialPickupObject (13). Models bypass and secpass01. Only "
             "two in retail, but a working pickup"),
-        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=13),
+        "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=13, shape_file="secpass"),
 )
 
 
@@ -1211,6 +1353,18 @@ class RIF_PT_module(bpy.types.Panel):
                       icon="INFO")
 
             box = layout.box()
+            box.label(text="Links", icon="LINKED")
+            for index, link in enumerate(obj.rif_module_links):
+                row = box.row(align=True)
+                row.prop(link, "target_name", text=f"Module {index + 1}")
+            row = box.row(align=True)
+            row.operator("rif.module_link_add", icon="ADD")
+            row.operator("rif.module_link_remove", icon="REMOVE")
+            if not len(obj.rif_module_links):
+                box.label(text="Used when Link Mode is By List", icon="INFO")
+
+
+            box = layout.box()
             box.label(text="Door", icon="MODIFIER")
             box.prop(obj, "rif_module_door")
             if getattr(obj, "rif_module_door", False):
@@ -1224,6 +1378,49 @@ class RIF_PT_module(bpy.types.Panel):
                 inner.prop(obj, "rif_module_door_close_seconds")
 
         elif object_type == "SIMPLE_OBJECT":
+
+            box = layout.box()
+            box.label(text="Switch", icon="HAND")
+            box.prop(obj, "rif_placed_switch")
+            if getattr(obj, "rif_placed_switch", False):
+                target = obj.rif_switch_target
+                pressed, released = switch_action_names(target)
+
+                inner = box.box()
+                inner.prop(obj, "rif_switch_target")
+                if target is None:
+                    inner.label(text="No target: nothing to send to",
+                                icon="ERROR")
+                else:
+                    inner.label(text=f"Target: {target.name}",
+                                icon="OBJECT_DATA")
+
+                # The two actions are always opposites; only the pressed
+                # one is chosen, so the panel names the state instead of
+                # showing a bit.
+                acts = box.box()
+                acts.label(text="When operated", icon="PLAY")
+                state_one = obj.rif_switch_press_state
+                first, second = (pressed, released) if state_one \
+                    else (released, pressed)
+                acts.label(text=f"Press sends:   {first}", icon="FORWARD")
+                acts.label(text=f"Release sends: {second}", icon="BACK")
+                acts.prop(obj, "rif_switch_press_state",
+                          text=f"Press sends state 1 ({pressed})")
+                acts.prop(obj, "rif_switch_extra")
+
+                timing = box.box()
+                timing.label(text="Behaviour", icon="TIME")
+                timing.prop(obj, "rif_switch_mode")
+                if obj.rif_switch_mode != "1":
+                    timing.prop(obj, "rif_switch_time")
+                timing.prop(obj, "rif_switch_security")
+
+                flags = box.box()
+                flags.label(text="Flags", icon="OPTIONS")
+                flags.prop(obj, "rif_switch_starts_on")
+                flags.prop(obj, "rif_switch_off_same")
+                flags.prop(obj, "rif_switch_off_none")
             box = layout.box()
             box.label(text="Fragments", icon="MOD_EXPLODE")
             box.prop(obj, "rif_fragments")
@@ -1240,6 +1437,49 @@ class RIF_PT_module(bpy.types.Panel):
                 inner.label(text="A piece placed to one side flies that way",
                             icon="INFO")
 
+
+
+            box = layout.box()
+            box.label(text="Pickup", icon="PACKAGE")
+            box.prop(obj, "rif_pickup")
+            if getattr(obj, "rif_pickup", False):
+                inner = box.box()
+                inner.prop(obj, "rif_pickup_kind")
+                inner.prop(obj, "rif_pickup_subtype")
+                if obj.rif_pickup_kind == "3":
+                    # The amount is not in the file: the engine takes it from
+                    # TemplateAmmo[ammo].AmmoPerMagazine (Inventry.c:1200), so
+                    # one pickup is always one magazine's worth.
+                    inner.label(text="Gives one magazine, as fixed by the ammo",
+                                icon="INFO")
+                elif obj.rif_pickup_kind == "6":
+                    inner.label(text="Sets the clearance for switches "
+                                "at or below this level", icon="INFO")
+            box = layout.box()
+            box.label(text="Trigger", icon="FORWARD")
+            box.prop(obj, "rif_destructible")
+            if getattr(obj, "rif_destructible", False):
+                # Destruction is the event these three belong to, so they live
+                # with the switch that makes the object destructible at all.
+                box.prop(obj, "rif_integrity")
+                box.prop(obj, "rif_trigger_explosion")
+                box.prop(obj, "rif_trigger_on_destroy")
+            box.prop(obj, "rif_trigger_on_pickup")
+            if (getattr(obj, "rif_trigger_on_destroy", False)
+                    or getattr(obj, "rif_trigger_on_pickup", False)):
+                inner = box.box()
+                inner.prop(obj, "rif_trigger_target")
+                target = obj.rif_trigger_target
+                if target is None:
+                    inner.label(text="No target: nothing to send to",
+                                icon="ERROR")
+                else:
+                    pressed, released = switch_action_names(target)
+                    first, second = (pressed, released) \
+                        if obj.rif_trigger_state else (released, pressed)
+                    inner.label(text=f"Sends: {first}", icon="FORWARD")
+                    inner.prop(obj, "rif_trigger_state",
+                               text=f"Send state 1 ({pressed})")
             box = layout.box()
             box.label(text="Platform lift", icon="SORT_ASC")
             box.prop(obj, "rif_module_plat_lift")
@@ -1247,9 +1487,6 @@ class RIF_PT_module(bpy.types.Panel):
                 inner = box.box()
                 inner.prop(obj, "rif_plat_lift_disabled")
                 inner.prop(obj, "rif_plat_lift_one_use")
-                inner.prop(obj, "rif_track_enabled")
-                inner.prop(obj, "rif_track_end")
-                inner.prop(obj, "rif_track_seconds")
 
 
             box = layout.box()
@@ -1293,30 +1530,101 @@ class RIF_PT_module(bpy.types.Panel):
                 inner.prop(obj, "rif_fan_strength")
                 inner.prop(obj, "rif_fan_speed_seconds")
                 inner.prop(obj, "rif_fan_slow_seconds")
-                inner.prop(obj, "rif_track_enabled")
-                inner.prop(obj, "rif_track_end")
 
-        elif object_type == "TRACK":
-            box = layout.box()
-            box.label(text="Track", icon="CURVE_PATH")
-            box.prop(obj, "rif_track_enabled")
-            if getattr(obj, "rif_track_enabled", False):
-                inner = box.box()
-                inner.prop(obj, "rif_track_end")
-                inner.prop(obj, "rif_track_seconds")
-                if obj.rif_track_end is None:
-                    inner.label(text="No end point: the track stays put",
-                                icon="INFO")
-                flags = box.box()
-                flags.label(text="Behaviour", icon="PLAY")
-                flags.prop(obj, "rif_track_loop")
-                flags.prop(obj, "rif_track_playing_at_start")
-                flags.prop(obj, "rif_track_loop_back_forth")
-                flags.prop(obj, "rif_track_smoothing")
-                advanced = box.box()
-                advanced.label(text="Advanced", icon="PREFERENCES")
-                advanced.prop(obj, "rif_track_object_offset")
-                box.prop(obj, "rif_module_track")
+            # A track is not a kind of object, it is a way of carrying one, so
+            # every Simple Object may have one. Only when nothing else claims
+            # the object does it become a StratTrack; a fan or a lever read
+            # the same track from their own tools data.
+            _draw_movement(layout, obj)
+
+
+
+# `EQUIPMNT.H:57` and `:116`, both numbered from zero with no gaps.
+PICKUP_WEAPONS = (
+    "Pulse rifle",
+    "Auto shotgun",
+    "Smartgun",
+    "Flamethrower",
+    "Plasma gun",
+    "SADAR",
+    "Grenade launcher",
+    "Minigun",
+    "Sonic cannon",
+    "Beam cannon",
+    "Mystery gun",
+    "Predator wristblade",
+    "Predator pistol",
+    "Predator rifle",
+    "Predator shoulder cannon",
+    "Predator disc",
+    "Predator medicomp",
+    "Predator staff",
+    "Alien claw",
+    "Alien grab",
+    "Alien spit",
+    "Cudgel",
+    "Marine pistol",
+    "Frisbee launcher",
+    "Two pistols",
+)
+
+PICKUP_AMMO = (
+    "10mm",
+    "Shotgun",
+    "Smartgun",
+    "Flamethrower",
+    "Plasma",
+    "SADAR",
+    "Grenade",
+    "Minigun",
+    "Pulse grenade",
+    "Flare",
+    "Fragmentation grenade",
+    "Proximity grenade",
+    "Particle beam",
+    "Sonic pulse",
+    "Predator wristblade",
+    "Predator pistol",
+    "Predator rifle",
+    "Predator energy bolt",
+    "Predator disc",
+    "Alien claw",
+    "Alien tail",
+    "Alien spit",
+    "Autogun",
+    "Xenoborg",
+    "Facehugger",
+)
+
+PICKUP_CLEARANCES = (
+    "None",
+    "Level 1",
+    "Level 2",
+    "Level 3",
+    "Level 4",
+    "Level 5",
+)
+
+
+def pickup_subtype_items(self, context):
+    """Return the subtype list for the kind this object is.
+
+    Blender calls this on every draw, so the list follows the Kind without
+    anything having to be reset by hand.
+    """
+    kind = str(getattr(self, "rif_pickup_kind", "2"))
+
+    if kind == "2":
+        names = PICKUP_WEAPONS
+    elif kind == "3":
+        names = PICKUP_AMMO
+    elif kind == "6":
+        names = PICKUP_CLEARANCES
+    else:
+        # The kind has nothing to choose between.
+        return [("0", "- none -", "This kind has one variant")]
+
+    return [(str(index), name, "") for index, name in enumerate(names)]
 
 # ---- object type ----------------------------------------------------------
 # The one switch that decides which path the engine takes. It is authoritative:
@@ -1333,7 +1641,6 @@ class RIF_PT_module(bpy.types.Panel):
 # Module -- exported as a module its strategy would never be dispatched.
 OBJECT_TYPE_MODULE = "MODULE"
 OBJECT_TYPE_SIMPLE = "SIMPLE_OBJECT"
-OBJECT_TYPE_TRACK = "TRACK"
 
 TYPE_SWITCHES = {
     OBJECT_TYPE_MODULE: (
@@ -1347,7 +1654,6 @@ TYPE_SWITCHES = {
         "rif_fragments", "rif_module_plat_lift", "rif_module_fan",
         "rif_plat_lift_disabled", "rif_plat_lift_one_use",
     ),
-    OBJECT_TYPE_TRACK: ("rif_module_track",),
 }
 
 
@@ -1454,6 +1760,152 @@ bpy.types.Material.rif_material_light_corona = bpy.props.BoolProperty(
         "unless the object is a light"),
     default=False)
 
+bpy.types.Object.rif_placed_switch = bpy.props.BoolProperty(
+    name="Lever",
+    description=(
+        "A switch the player operates: aim at it and press the operate key. "
+        "The engine takes the nearest operable object in front within three "
+        "metres and with a clear line of sight (TRIGGERS.C:20-22). Give it a "
+        "track and the lever itself moves when pulled"),
+    default=False)
+
+bpy.types.Object.rif_switch_target = bpy.props.PointerProperty(
+    name="Target",
+    description=("What the switch sends its request to. A pointer rather "
+                 "than a name, so deleting the target clears the link"),
+    type=bpy.types.Object)
+
+bpy.types.Object.rif_switch_press_state = bpy.props.BoolProperty(
+    name="Press sends state 1",
+    description=(
+        "The state bit sent when the lever is pressed. The release always "
+        "sends the opposite. 0 and 1 are not off and on: each target reads "
+        "them its own way, so the labels above are what matters"),
+    default=False)
+
+bpy.types.Object.rif_switch_extra = bpy.props.IntProperty(
+    name="Extra info",
+    description=("The bits above the state bit. Carried to the target "
+                 "unchanged; 0 in every retail switch"),
+    default=0, min=0, soft_max=255)
+
+bpy.types.Object.rif_switch_mode = bpy.props.EnumProperty(
+    name="Mode",
+    description="How the switch responds to being operated",
+    items=(
+        ("1", "Wait", "Wait for a request, then act -- what all four retail "
+               "switches do"),
+        ("0", "Timer", "Fire once a timer expires"),
+        ("2", "Toggle", "Flip state on every press"),
+        ("4", "Time delay", "Act after a delay"),
+        ("5", "Time delay, autoexec", "The delay starts when the level loads"),
+    ), default="1")
+
+bpy.types.Object.rif_switch_time = bpy.props.IntProperty(
+    name="Time",
+    description=("Milliseconds, used by the timer modes. Zero in a timed "
+                 "mode means it never fires"),
+    default=0, min=0, soft_max=60000)
+
+bpy.types.Object.rif_switch_security = bpy.props.IntProperty(
+    name="Security",
+    description=("Clearance needed to operate it. Zero means anyone can; "
+                 "the clearance comes from the Security Pass pickup"),
+    default=0, min=0, max=255)
+
+bpy.types.Object.rif_switch_starts_on = bpy.props.BoolProperty(
+    name="Starts on",
+    description="The switch begins in its unusual state", default=False)
+
+bpy.types.Object.rif_switch_off_same = bpy.props.BoolProperty(
+    name="Release sends the same",
+    description=("Send the same request on release instead of the opposite. "
+                 "BinSwitchFlag_OffMessageSame"),
+    default=False)
+
+bpy.types.Object.rif_switch_off_none = bpy.props.BoolProperty(
+    name="Release sends nothing",
+    description="Send no request on release. BinSwitchFlag_OffMessageNone",
+    default=False)
+
+bpy.types.Object.rif_destructible = bpy.props.BoolProperty(
+    name="Destructible",
+    description=(
+        "The object can be destroyed. Off means it takes no damage at all, "
+        "which is what 2453 of the shipped objects are"),
+    default=False)
+
+bpy.types.Object.rif_integrity = bpy.props.IntProperty(
+    name="Integrity",
+    description=("How many hits it takes. 16 is what every lamp in the "
+                 "shipped levels uses"),
+    default=1, min=1, soft_max=100)
+
+bpy.types.Object.rif_trigger_on_destroy = bpy.props.BoolProperty(
+    name="Notify when destroyed",
+    description=("Send the request below once the object is destroyed. "
+                 "1388 shipped objects do"),
+    default=False)
+
+bpy.types.Object.rif_trigger_on_pickup = bpy.props.BoolProperty(
+    name="Notify when picked up",
+    description=("Send the request below when the object is picked up. "
+                 "703 shipped objects do"),
+    default=False)
+
+bpy.types.Object.rif_trigger_explosion = bpy.props.EnumProperty(
+    name="Explosion",
+    description="What it looks like when it goes",
+    items=(
+        ("0", "None", "No explosion"),
+        ("1", "Small", "A barrel going up -- what the retail lamps use"),
+        ("2", "Big", "A large blast"),
+        ("3", "Molotov", "A burning pool"),
+    ), default="0")
+
+bpy.types.Object.rif_trigger_target = bpy.props.PointerProperty(
+    name="Target",
+    description="What receives the request",
+    type=bpy.types.Object)
+
+bpy.types.Object.rif_trigger_state = bpy.props.BoolProperty(
+    name="Send state 1",
+    description=("The state bit of the request. Its meaning depends on the "
+                 "target, so the panel names the action instead"),
+    default=False)
+
+bpy.types.Object.rif_pickup = bpy.props.BoolProperty(
+    name="Is a pickup",
+    description=(
+        "The player can pick this up by touching it. What happens then is "
+        "decided by the kind and subtype, not by the trigger"),
+    default=False)
+
+bpy.types.Object.rif_pickup_kind = bpy.props.EnumProperty(
+    name="Kind",
+    description="What the object is (INANIMATEOBJECT_TYPE, PVISIBLE.H:16)",
+    items=(
+        ("2", "Weapon", "A weapon, with the subtype choosing which"),
+        ("3", "Ammo", "Ammunition"),
+        ("4", "Health", "A medkit"),
+        ("5", "Armour", "Armour"),
+        ("6", "Key", "A key card, which sets the security clearance"),
+        ("7", "Boxed sentry gun", "A sentry gun in a box"),
+        ("8", "IR goggles", "The infrared goggles"),
+        ("10", "Data tape", "A mission data tape"),
+        ("11", "Motion tracker upgrade", "Upgrades the tracker"),
+        ("12", "Pheromone pod", "Lets the Alien command drones"),
+        ("13", "Special pickup", "The catch-all used for the security pass"),
+        ("14", "Destroy base", "Touching it destroys the base"),
+        ("15", "Field charge", "The field charge"),
+    ), default="2")
+
+bpy.types.Object.rif_pickup_subtype = bpy.props.EnumProperty(
+    name="Subtype",
+    description=("Which one of that kind. The list follows the kind, so a "
+                 "weapon number never appears for a piece of ammo"),
+    items=pickup_subtype_items)
+
 bpy.types.Object.rif_object_type = bpy.props.EnumProperty(
     name="Type",
     description="What this object is to the engine",
@@ -1465,11 +1917,8 @@ bpy.types.Object.rif_object_type = bpy.props.EnumProperty(
          "A placed object: detail, a pickup, something that breaks, a lift or "
          "a fan. Not part of the shell, so it has no visibility list and no "
          "AI adjacency. With every option off it is plain decoration, which "
-         "is the commonest placed object in the shipped levels"),
-        (OBJECT_TYPE_TRACK, "Track",
-         "An object that runs along its track. A placed object like a simple "
-         "one, with the Track strategy attached, so it needs an end point to "
-         "have somewhere to go"),
+         "is the commonest placed object in the shipped levels. Give it a "
+         "track and it also moves, which is all the old Track type ever meant"),
     ),
     default=OBJECT_TYPE_MODULE,
     update=_on_object_type,
@@ -1505,14 +1954,6 @@ bpy.types.Object.rif_track_seconds = bpy.props.FloatProperty(
         "10 seconds"),
     default=1.0, min=0.01, soft_max=30.0, precision=2)
 
-bpy.types.Object.rif_module_track = bpy.props.BoolProperty(
-    name="Moves along its track",
-    description=(
-        "Attach a Track strategy (72) so the engine runs this module along "
-        "its track. 224 of the 232 retail tracks carry no point effects, so "
-        "the switch alone is the usual case; a door and a track on one "
-        "module is not something any retail level does"),
-    default=False)
 
 bpy.types.Object.rif_module_fan = bpy.props.BoolProperty(
     name="Fan",
@@ -1610,6 +2051,56 @@ bpy.types.Object.rif_track_object_offset = bpy.props.IntVectorProperty(
         "rather than part of the design"),
     default=(0, 0, 0), subtype="XYZ", size=3)
 
+def _draw_movement(layout, obj):
+    """Draw the track a moving object reads.
+
+    Shared by the lever, the fan, the lift and the Track type: all four store the
+    same OBJTRAK2, so all four show the same fields in the same order.
+    """
+    box = layout.box()
+    box.label(text="Movement", icon="CURVE_PATH")
+    box.prop(obj, "rif_track_enabled")
+    if not getattr(obj, "rif_track_enabled", False):
+        return
+    inner = box.box()
+    inner.prop(obj, "rif_track_end")
+    inner.prop(obj, "rif_track_seconds")
+    if obj.rif_track_end is None:
+        inner.label(text="No end point: the track stays put", icon="INFO")
+    flags = box.box()
+    flags.label(text="Behaviour", icon="PLAY")
+    flags.prop(obj, "rif_track_loop")
+    flags.prop(obj, "rif_track_playing_at_start")
+    flags.prop(obj, "rif_track_loop_back_forth")
+    flags.prop(obj, "rif_track_smoothing")
+    advanced = box.box()
+    advanced.label(text="Advanced", icon="PREFERENCES")
+    advanced.prop(obj, "rif_track_object_offset")
+
+
+def switch_action_names(target):
+    """Return (state 1 label, state 0 label) for what this target does.
+
+    `RequestState` reads the low bit of a request as a state and lets each
+    target interpret it (`BH_TYPES.C:2180-2400`): a proximity door unlocks on
+    1, a platform lift enables on 1, a switch calls it the unusual state. The
+    labels here are that table, chosen from what the target object is.
+    """
+    if target is None:
+        return ("State 1", "State 0")
+    if getattr(target, "rif_module_door", False):
+        if getattr(target, "rif_module_door_lift", False):
+            return ("Open", "Close")
+        return ("Unlock", "Lock")
+    if getattr(target, "rif_module_plat_lift", False):
+        return ("Enable", "Disable")
+    if getattr(target, "rif_placed_light", False):
+        return ("Brighten", "Dim")
+    if getattr(target, "rif_placed_switch", False):
+        return ("Unusual state", "Rest state")
+    return ("State 1", "State 0")
+
+
 def _patrol_items(_self, context):
     """Return the scene's patrol routes, named, for the generator's list."""
     # A non-empty identifier: Blender discards an enum row whose id is "".
@@ -1668,6 +2159,77 @@ def _sound_items(_self, context):
     return entries
 
 
+def _warn_shape(operator, spec, reason):
+    """Report that an entry could not build its model.
+
+    `operator` is optional, so this can be called from a place that has none;
+    the caller still gets its cube either way.
+    """
+    message = (f"{spec.label}: {reason}. A plain box was placed instead -- set "
+               "the Game Directory in the add-on preferences")
+    if operator is not None and hasattr(operator, "report"):
+        operator.report({"WARNING"}, message)
+    else:
+        print(f"[RIF] WARNING: {message}")
+
+
+def _shape_mesh_for(spec, context, operator=None):
+    """Return a mesh read from shape_rifs for this entry, or None.
+
+    `None` means the entry has no model or the file could not be read; the
+    caller then keeps the cube. A missing model is reported rather than passed
+    over, because the entry still says "Pulse Rifle" and the cube that appears
+    instead looks like a bug in the menu rather than a missing file.
+    """
+    if not spec.shape_file:
+        return None
+    preferences = context.preferences.addons.get(__package__)
+    if preferences is None:
+        return None
+    game_directory = preferences.preferences.game_directory.strip()
+    if not game_directory:
+        _warn_shape(operator, spec,
+                    "no Game Directory is set, so the model could not be read")
+        return None
+
+    from pathlib import Path
+    import struct
+
+    from .rif import shape_reader
+
+    path = Path(game_directory) / "shape_rifs" / f"{spec.shape_file}.rif"
+    if not path.is_file():
+        # Windows does not care about case, so one more try costs nothing.
+        folder = path.parent
+        if folder.is_dir():
+            wanted = path.name.lower()
+            for candidate in folder.iterdir():
+                if candidate.name.lower() == wanted:
+                    path = candidate
+                    break
+    if not path.is_file():
+        folder = Path(game_directory) / "shape_rifs"
+        if not folder.is_dir():
+            _warn_shape(operator, spec, f"no shape_rifs folder in {game_directory}")
+        else:
+            _warn_shape(operator, spec, f"{spec.shape_file}.rif is not in {folder}")
+        return None
+
+    try:
+        shapes = shape_reader.read_shapes(path)
+    except (OSError, ValueError, struct.error) as exc:
+        _warn_shape(operator, spec, f"{path.name} could not be read: {exc}")
+        return None
+    if not shapes:
+        _warn_shape(operator, spec, f"{path.name} holds no usable shape")
+        return None
+
+    shape = shapes[0]
+    # One call builds geometry, winding, smoothing, UVs and materials together:
+    # doing only the geometry here is what made pickups arrive flat.
+    return shape_reader.build_mesh(shape, spec.shape_file)
+
+
 def _make_operator(spec):
     """Build the operator class for one menu entry.
 
@@ -1686,6 +2248,22 @@ def _make_operator(spec):
         empty it still has a real `bound_box`, so the exported size needs no
         guesswork about how Blender interprets a display size.
         """
+        shape_mesh = _shape_mesh_for(spec, context, self)
+        if shape_mesh is not None:
+            # A pickup with a model is just that mesh: everything below -- the
+            # type, the switches, the panel -- is the same as for any object.
+            obj = bpy.data.objects.new(spec.shape_file, shape_mesh)
+            context.collection.objects.link(obj)
+            for key, value in spec.object_flags.items():
+                setattr(obj, key, value)
+            if spec.pickup_type is not None:
+                obj.rif_placeable.pickup_type = spec.pickup_type
+            for other in context.selected_objects:
+                other.select_set(False)
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            return {"FINISHED"}
+
         if spec.kind == KIND_SOUND:
             # A sphere reads as "a radius", which is what the object is, so the
             # mesh is generated rather than fetched from a Blender operator:
@@ -1785,19 +2363,90 @@ def _make_operator(spec):
             # connected and too sparse to travel along -- the bots stand in it
             # and never leave, which looks like a broken exporter and is not.
             obj.scale = (4.25, 4.25, 4.25)
+        elif spec.kind in (KIND_MODULE_ROOM, KIND_MODULE_DOOR):
+            mesh = bpy.data.meshes.new(spec.label)
+            half = 1.0
+            verts = [(x * half, y * half, z * half)
+                     for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+            faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
+                     (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+            mesh.from_pydata(verts, [], faces)
+            mesh.update()
+            # A room's faces look at whoever stands inside it. Flipping is
+            # clearer than reversing six winding orders by hand, and it cannot
+            # be got wrong one face at a time.
+            mesh.flip_normals()
+            if spec.kind == KIND_MODULE_ROOM:
+                # Three surfaces, because a ceiling is not a wall: it is lit
+                # from below, it is never walked on, and the levels give it its
+                # own material. Backface culling is on for all three, matching
+                # the rest of the exporter -- the engine draws single-sided
+                # polygons with no culling, so leaving it off would show the
+                # author the inside of the walls from outside.
+                for slot, name in enumerate(("Floor", "Walls", "Ceiling")):
+                    material = bpy.data.materials.new(name)
+                    material.use_backface_culling = True
+                    mesh.materials.append(material)
+                # Chosen by position rather than by index: flipping the normals
+                # may renumber the faces.
+                for polygon in mesh.polygons:
+                    height = polygon.center.z
+                    if height < 0:
+                        polygon.material_index = 0
+                    elif height > 0:
+                        polygon.material_index = 2
+                    else:
+                        polygon.material_index = 1
+            obj = bpy.data.objects.new(spec.label, mesh)
+        elif spec.kind == KIND_SIMPLE_OBJECT:
+            mesh = _shape_mesh_for(spec, context)
+            if mesh is not None:
+                obj = bpy.data.objects.new(spec.shape_file, mesh)
+                context.collection.objects.link(obj)
+                for key, value in spec.object_flags.items():
+                    setattr(obj, key, value)
+                for other in context.selected_objects:
+                    other.select_set(False)
+                obj.select_set(True)
+                context.view_layer.objects.active = obj
+                return {"FINISHED"}
+            mesh = bpy.data.meshes.new(spec.label)
+            half = 0.5
+            verts = [(x * half, y * half, z * half)
+                     for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+            faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
+                     (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+            mesh.from_pydata(verts, [], faces)
+            mesh.update()
+            obj = bpy.data.objects.new(spec.label, mesh)
+            for index in range(spec.pieces):
+                # Pieces are children, which is how the exporter reads them:
+                # the parent is what the player shoots, they are what is left.
+                piece = bpy.data.objects.new(
+                    f"{spec.label} piece {index + 1}", mesh.copy())
+                piece.parent = obj
+                piece.location = ((index - 1) * 0.6, 0.3, 0.0)
+                piece.scale = (0.35, 0.35, 0.35)
+                context.collection.objects.link(piece)
         else:
             obj = bpy.data.objects.new(spec.label.split("  (")[0], None)
             obj.empty_display_type = spec.display
             obj.empty_display_size = 1.0
-        obj[PLACEABLE_PROP] = spec.kind
+        # A preset makes an ordinary object with the switches already set, not
+        # a placeable marker: the AvP Object panel polls on PLACEABLE_PROP being
+        # absent, so setting it here would hide the very panel the author needs.
+        if spec.kind not in GEOMETRY_KINDS:
+            obj[PLACEABLE_PROP] = spec.kind
+            obj.rif_placeable.kind = spec.kind
         if spec.legacy_marker is not None:
             obj[MARKER_PROP] = spec.legacy_marker
-        obj.rif_placeable.kind = spec.kind
         obj.rif_placeable.npc_type = spec.npc_type
         if spec.pickup_type is not None:
             obj.rif_placeable.pickup_type = spec.pickup_type
         for key, value in spec.flags.items():
             setattr(obj.rif_placeable, key, value)
+        for key, value in spec.object_flags.items():
+            setattr(obj, key, value)
         context.collection.objects.link(obj)
 
         for other in context.selected_objects:
@@ -1826,7 +2475,8 @@ PLACEABLE_OPERATORS = {spec.key: _make_operator(spec) for spec in PLACEABLES}
 
 def _draw_category(layout, category):
     """Draw every entry of one category into a submenu layout."""
-    entries = [spec for spec in PLACEABLES if spec.category == category]
+    entries = sorted((spec for spec in PLACEABLES if spec.category == category),
+                     key=lambda spec: spec.label.lower())
     previous_group = None
     for spec in entries:
         # Separate the network-legal generators from the single-player ones,
@@ -2114,7 +2764,9 @@ class RIF_PT_placeable(bpy.types.Panel):
 def menu_draw(self, context):
     """Draw the AvP submenu: categories, then the existing helper entries."""
     layout = self.layout
-    for category, label in CATEGORY_LABELS:
+    # Alphabetical, because a menu is looked at far more often than it is
+    # reasoned about, and a fixed order means the eye can learn where things are.
+    for category, label in sorted(CATEGORY_LABELS, key=lambda row: row[1]):
         layout.menu(CATEGORY_MENUS[category].bl_idname, text=label,
                     icon="COLLECTION_NEW")
 
@@ -2205,6 +2857,9 @@ CLASSES = (
     RIF_PT_module,
     # Before the settings that carry a collection of them.
     RIF_SwitchTarget,
+    RIF_ModuleLink,
+    RIF_OT_module_link_add,
+    RIF_OT_module_link_remove,
     RIF_OT_switch_target_add,
     RIF_OT_switch_target_remove,
     RIF_PlaceableSettings,
@@ -2221,6 +2876,16 @@ def register_placeables():
     """Register the placeable objects, their menus and their properties."""
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    # Registered here rather than at module scope: the collection needs
+    # RIF_ModuleLink to have an rna type, which only exists once the class
+    # above has been registered. At module scope it fails to register and every
+    # following test sees an Object without the property.
+    bpy.types.Object.rif_module_links = bpy.props.CollectionProperty(
+        type=RIF_ModuleLink,
+        description=(
+            "Modules this one is linked to, used when Link Mode is By List. A "
+            "link is mutual: the engine derives the visibility graph from the "
+            "tree, so a one-sided entry still joins both ways"))
     # The sound folder belongs to the level, and a .blend holds several scenes,
     # so it lives on the World rather than in the addon preferences.
     bpy.types.World.rif_sky_colour = bpy.props.FloatVectorProperty(

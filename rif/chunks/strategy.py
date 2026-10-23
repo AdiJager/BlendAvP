@@ -96,6 +96,33 @@ DEFAULT_MASS = 50
 DEFAULT_INTEGRITY = 0x80000002
 DEFAULT_FLAGS = 1
 
+# `Strachnk.hpp:172-180`. The low two bits are the events that notify the
+# target; bits 4-5 are the explosion. Bit 0x4 is used in retail but nothing
+# in the game reads it -- `ObjectEventFlag` defines only 0x1 and 0x2, and
+# `PVISIBLE.C` tests only those -- so it is not offered.
+SIM_FLAG_NOTIFY_ON_DESTRUCTION = 0x00000001
+SIM_FLAG_NOTIFY_ON_PICKUP = 0x00000002
+SIM_FLAG_EXPLOSION_MASK = 0x00000030
+SIM_FLAG_EXPLOSION_SHIFT = 4
+
+# `SimStratFlag_ExplosionMask >> SimStratFlag_ExplosionShift`.
+EXPLOSION_NONE = 0
+EXPLOSION_SMALL = 1
+EXPLOSION_BIG = 2
+EXPLOSION_MOLOTOV = 3
+
+
+def trigger_flags(on_destroy, on_pickup, explosion):
+    """Return the SimpleStrategy flags for these trigger settings."""
+    flags = 0
+    if on_destroy:
+        flags |= SIM_FLAG_NOTIFY_ON_DESTRUCTION
+    if on_pickup:
+        flags |= SIM_FLAG_NOTIFY_ON_PICKUP
+    flags |= ((int(explosion) << SIM_FLAG_EXPLOSION_SHIFT)
+              & SIM_FLAG_EXPLOSION_MASK)
+    return flags
+
 
 class AVPStrategyChunk(Chunk):
     """AVPSTRAT — the strategy attached to a placed object."""
