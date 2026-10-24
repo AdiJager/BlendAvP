@@ -29,14 +29,17 @@ def rif_to_meters(rif_int: int) -> float:
 
 def uv_to_rif_pixels(u: float, v: float,
                      pixels: float = DEFAULT_UV_PIXELS):
-    """Map normalised Blender UV to RIF pixel space with V-flip (Y-down).
+    """Map normalised Blender UV to RIF pixel space.
 
-    The community importer scales by 1/pixels (see UV_SCALES[0] = 1/128),
-    so we must write u*pixels (NOT u*(pixels-1)) to make the round-trip
-    lossless at u=1.0. V-flip is intentional for game compatibility: the
-    importer does NOT flip, so its preview appears vertically mirrored.
+    No V-flip. It used to flip, on the assumption that the game is Y-down and
+    the importer is not -- but the importer this add-on ships reads V unchanged,
+    so the two disagreed and every textured surface was mirrored in game while
+    looking right in Blender. Writing V as it is keeps a round trip identical.
+
+    Scaling is by pixels, not pixels - 1: the reader multiplies back by
+    1/128, so u=1.0 has to come back as 128 to be lossless.
     """
-    return (u * pixels, (1.0 - v) * pixels)
+    return (u * pixels, v * pixels)
 
 
 def blender_to_rif_axis(x: float, y: float, z: float):

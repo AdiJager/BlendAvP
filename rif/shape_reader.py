@@ -287,6 +287,52 @@ def normalise_rim(path):
     return text
 
 
+def _winded_faces(shape):
+    """Return the faces and their UVs, each reversed where the normal is flipped.
+
+    A shape mixes the two orientations, and the engine's stored polygon normal is
+    what says which. Reversing the vertices and the UV corners in the same step
+    keeps them matched -- flipping the polygon after the mesh exists does not
+    carry the UV layer with it.
+    """
+    faces = []
+    uvs = []
+    for face_index, corners in enumerate(shape.polygons):
+        corners = list(corners)
+        wanted = (shape.polygon_normals[face_index]
+                  if face_index < len(shape.polygon_normals) else None)
+        corner_uvs = (list(shape.uvs[face_index])
+                      if face_index < len(shape.uvs) else [])
+        if wanted is not None and len(corners) >= 3:
+            if _needs_reverse(shape, corners, wanted):
+                corners.reverse()
+                if corner_uvs:
+                    corner_uvs.reverse()
+        faces.append(tuple(corners))
+        uvs.append(corner_uvs)
+    return faces, uvs
+
+
+def _needs_reverse(shape, corners, wanted):
+    """True when this face's winding disagrees with the stored normal."""
+    if len(corners) < 3:
+        return False
+    try:
+        a = shape.vertices[corners[0]]
+        b = shape.vertices[corners[1]]
+        c = shape.vertices[corners[2]]
+    except IndexError:
+        return False
+    ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+    vx, vy, vz = c[0] - a[0], c[1] - a[1], c[2] - a[2]
+    # RIF geometry is already in the exporter's axes, so the cross product is
+    # comparable with the stored normal without another rotation.
+    nx = uy * vz - uz * vy
+    ny = uz * vx - ux * vz
+    nz = ux * vy - uy * vx
+    return nx * wanted[0] + ny * wanted[1] + nz * wanted[2] < 0.0
+
+
 def build_mesh(shape, name, stem=None, number=0):
     """Return a finished Blender mesh for one Shape.
 
@@ -299,7 +345,7 @@ def build_mesh(shape, name, stem=None, number=0):
     import bpy
 
     mesh = bpy.data.meshes.new(name)
-    faces = [tuple(corners) for corners in shape.polygons]
+    faces, uvs = _winded_faces(shape)
     mesh.from_pydata([(x * 0.001, y * 0.001, z * 0.001)
                       for x, y, z in shape.vertices], [], faces)
     mesh.update()
@@ -308,9 +354,9 @@ def build_mesh(shape, name, stem=None, number=0):
     # writing UVs afterwards by loop position put them on the wrong corners and
     # those faces sampled the wrong part of the atlas -- which is what made part
     # of a medkit grey instead of its green.
-    if shape.uvs:
+    if uvs:
         layer = mesh.uv_layers.new(name="UVMap")
-        for face_index, corners in enumerate(shape.uvs):
+        for face_index, corners in enumerate(uvs):
             if face_index >= len(faces):
                 break
             start = mesh.polygons[face_index].loop_start
@@ -321,7 +367,6 @@ def build_mesh(shape, name, stem=None, number=0):
                 if loop_index < len(layer.data):
                     layer.data[loop_index].uv = (u, v)
 
-    fix_winding(mesh, shape)
     apply_smoothing(mesh, shape)
 
     try:
