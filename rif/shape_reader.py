@@ -304,9 +304,10 @@ def build_mesh(shape, name, stem=None, number=0):
                       for x, y, z in shape.vertices], [], faces)
     mesh.update()
 
-    fix_winding(mesh, shape)
-    apply_smoothing(mesh, shape)
-
+    # UVs first, then the winding. Flipping reverses a polygon's loops, so
+    # writing UVs afterwards by loop position put them on the wrong corners and
+    # those faces sampled the wrong part of the atlas -- which is what made part
+    # of a medkit grey instead of its green.
     if shape.uvs:
         layer = mesh.uv_layers.new(name="UVMap")
         for face_index, corners in enumerate(shape.uvs):
@@ -319,6 +320,9 @@ def build_mesh(shape, name, stem=None, number=0):
                 loop_index = start + corner_index
                 if loop_index < len(layer.data):
                     layer.data[loop_index].uv = (u, v)
+
+    fix_winding(mesh, shape)
+    apply_smoothing(mesh, shape)
 
     try:
         assign_materials(mesh, shape, stem or name, number)

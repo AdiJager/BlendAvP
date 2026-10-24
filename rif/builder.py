@@ -261,7 +261,7 @@ def build_rif_bytes(mesh, object_name: str = None,
     return root.serialize()
 
 
-def build_rif_multi(objects, hierarchy=None,
+def build_rif_multi(objects, hierarchy=None, visibility=None,
                     include_prelight: bool = True) -> bytes:
     """Serialise a list of Blender mesh objects into one REBINFF2 buffer.
 
@@ -325,7 +325,7 @@ def build_rif_multi(objects, hierarchy=None,
 
 def build_rif_level(objects, level_name, texture_paths=None,
                     player_start=None, player_orientation=None,
-                    hierarchy=None, global_scale=None,
+                    hierarchy=None, visibility=None, global_scale=None,
                     lights=None, ambient=255,
                     light_set_name=DEFAULT_LIGHT_SET,
                     include_litscale=True,
@@ -614,7 +614,8 @@ def build_rif_level(objects, level_name, texture_paths=None,
             # actually meet. Without it NPCs have no path anywhere.
             module_data = {
                 "vmdarray": modules.build_vmdarray(
-                    i, _linked_peers(i, parents, door_peers), door_peers),
+                    i, _visibility_peers(obj, visibility, name_to_index, i,
+                                         parents, door_peers), door_peers),
                 "adjmdlep": modules.build_adjmdlep(
                     module_neighbours.get(i, []), module_origins),
                 "modacous": (-1, -1.0, 0),
@@ -691,6 +692,10 @@ def build_rif_level(objects, level_name, texture_paths=None,
             index_num=len(objs) + 1,
             shape_id_no=file_id,
             strategy=entry["strategy"],
+            num_vertices=len(entry["mesh"].vertices),
+            # Baked light, the same as a module gets: SHPVTINT is what the
+            # engine reads, and without it the item is drawn unlit.
+            prelight_intensities=entry.get("prelight"),
         ))
 
     # ---- environment skeleton (REBENVDT) ----
@@ -1361,6 +1366,21 @@ def _build_object_chunk(name, location_rif, orientation_rif,
             intensities=prelight_intensities,
         ))
     return ObjectChunk(children)
+
+
+def _visibility_peers(obj, visibility, name_to_index, index, parents,
+                      door_peers):
+    """Return the modules this one can see, by index.
+
+    The panel's Links list is authoritative when it has anything to say: it is
+    what the author arranged. The parent tree is the fallback, because a level
+    built before the list existed still needs a graph.
+    """
+    linked = (visibility or {}).get(obj.name)
+    if linked:
+        return sorted(name_to_index[name] for name in linked
+                      if name in name_to_index)
+    return _linked_peers(index, parents, door_peers)
 
 
 def _linked_peers(index, parents, door_peers):

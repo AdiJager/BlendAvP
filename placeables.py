@@ -300,6 +300,18 @@ def _apply_particle_defaults(settings, _context):
     settings.particle_speed = chosen["speed"]
 
 
+def _pickup_variant_items(self, context):
+    """Return the variant list for whichever pickup category this is.
+
+    Blender calls this on every draw, so the list follows the category without
+    anything having to be reset by hand.
+    """
+    variants = PICKUP_VARIANTS.get(self.pickup_type)
+    if not variants:
+        return [("0", "- none -", "This category has one variant")]
+    return [(str(number), label, "") for number, label in variants]
+
+
 class RIF_PlaceableSettings(bpy.types.PropertyGroup):
     """Per-object settings for a placed AvP gameplay object."""
 
@@ -667,6 +679,14 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         min=0,
         max=255,
     )
+    pickup_variant: bpy.props.EnumProperty(
+        name="Variant",
+        description=(
+            "Which one of this pickup's kind. The list follows the category, "
+            "so a weapon number never appears for a piece of ammo"),
+        items=_pickup_variant_items,
+    )
+
     texture_id: bpy.props.IntProperty(
         name="Model Variant",
         description="AVPGENER.textureID: which model/skin number to use",
@@ -885,6 +905,44 @@ PICKUP_SHAPES = {
     (5, 0): "Armour01",
     (13, 0): "secpass",
     (15, 0): "Pboost",
+}
+
+
+# The variant list a pickup offers, keyed by its INANIMATEOBJECT_TYPE. Every
+# entry is (sub_type, label); the number is what reaches the file, the label is
+# what an author reads. Weapons and ammunition are `WEAPON_ID` and `AMMO_ID`
+# from EQUIPMNT.H, which is why the numbers are not consecutive.
+PICKUP_VARIANTS = {
+    2: (  # IOT_Weapon
+        (0, "Pulse Rifle"),
+        (2, "Smartgun"),
+        (3, "Flamethrower"),
+        (5, "SADAR"),
+        (6, "Grenade Launcher"),
+        (7, "Minigun"),
+        (22, "Marine Pistol"),
+        (23, "Frisbee Launcher"),
+    ),
+    3: (  # IOT_Ammo
+        (0, "10mm"),
+        (2, "Smartgun"),
+        (3, "Flamethrower"),
+        (5, "SADAR"),
+        (6, "Grenade"),
+        (7, "Minigun"),
+        (8, "Pulse Grenade"),
+    ),
+    4: ((0, "Medkit"),),
+    5: ((0, "Armour"),),
+    6: ((0, "Key"),),
+    7: ((0, "Boxed Sentry Gun"),),
+    8: ((0, "IR Goggles"),),
+    10: ((0, "Data Tape"),),
+    11: ((0, "Motion Tracker Upgrade"),),
+    12: ((0, "Pheromone Pod"),),
+    13: ((0, "Security Pass"),),
+    14: ((0, "Destroy Base"),),
+    15: ((0, "Field Charge"),),
 }
 
 
@@ -2173,6 +2231,25 @@ def _warn_shape(operator, spec, reason):
         print(f"[RIF] WARNING: {message}")
 
 
+def _sync_pickup_variant(obj, spec):
+    """Point the variant list at the sub_type the entry presets.
+
+    lags sets sub_type, the number the file wants; the panel shows
+    pickup_variant, so without this the list sat on its first entry and every
+    pickup read as a pulse rifle. The list is a view of the number, so it is set
+    from it here rather than repeated in every row of the table.
+    """
+    if spec.kind != KIND_PICKUP:
+        return
+    sub_type = getattr(obj.rif_placeable, "sub_type", 0)
+    try:
+        obj.rif_placeable.pickup_variant = str(sub_type)
+    except (TypeError, ValueError):
+        # A sub_type the list does not offer: leave the list where it is rather
+        # than raising while placing an object.
+        pass
+
+
 def _shape_mesh_for(spec, context, operator=None):
     """Return a mesh read from shape_rifs for this entry, or None.
 
@@ -2250,14 +2327,21 @@ def _make_operator(spec):
         """
         shape_mesh = _shape_mesh_for(spec, context, self)
         if shape_mesh is not None:
-            # A pickup with a model is just that mesh: everything below -- the
-            # type, the switches, the panel -- is the same as for any object.
+            # A pickup with a model is that mesh plus everything the ordinary
+            # path sets. Leaving the marker off made it look like a plain mesh,
+            # so the AvP Object panel appeared instead of the AvP Placeable one
+            # that belongs to a pickup.
             obj = bpy.data.objects.new(spec.shape_file, shape_mesh)
             context.collection.objects.link(obj)
+            obj[PLACEABLE_PROP] = spec.kind
+            obj.rif_placeable.kind = spec.kind
             for key, value in spec.object_flags.items():
                 setattr(obj, key, value)
             if spec.pickup_type is not None:
                 obj.rif_placeable.pickup_type = spec.pickup_type
+            for key, value in spec.flags.items():
+                setattr(obj.rif_placeable, key, value)
+            _sync_pickup_variant(obj, spec)
             for other in context.selected_objects:
                 other.select_set(False)
             obj.select_set(True)
@@ -2447,6 +2531,7 @@ def _make_operator(spec):
             setattr(obj.rif_placeable, key, value)
         for key, value in spec.object_flags.items():
             setattr(obj, key, value)
+        _sync_pickup_variant(obj, spec)
         context.collection.objects.link(obj)
 
         for other in context.selected_objects:
@@ -2752,7 +2837,7 @@ class RIF_PT_placeable(bpy.types.Panel):
             box = layout.box()
             box.label(text="Placed object", icon="CUBE")
             if kind == KIND_PICKUP:
-                box.prop(settings, "sub_type")
+                box.prop(settings, "pickup_variant")
             box.prop(settings, "object_mass")
             box.prop(settings, "object_integrity")
             box.prop(settings, "object_heavy")

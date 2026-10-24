@@ -395,12 +395,17 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
 
         # Every material slot gets one texture index, and BMPNAMES is built from
         # the same list, so the polygon indices and the chunk can never disagree.
-        tex_paths, bitmap_mapping = _build_bitmap_mapping(objs)
+        placed_specs = _collect_placed_objects(context, objs)
+        tex_paths, bitmap_mapping = _build_bitmap_mapping(
+            objs, [spec["mesh"] for spec in placed_specs])
 
         hierarchy = _build_hierarchy(objs, self.link_mode)
-        _report_layout(self, context, objs, hierarchy)
+        visibility = _visibility_links(objs, self.link_mode)
+        _report_layout(self, context, objs, hierarchy, visibility)
 
-        originals = _apply_bitmap_indices(objs, bitmap_mapping)
+        placed_objs = [obj for obj in context.scene.objects
+                       if any(obj.data is spec["mesh"] for spec in placed_specs)]
+        originals = _apply_bitmap_indices(objs + placed_objs, bitmap_mapping)
 
         # The manual slider packs to 0x00RRGGBB (bits 0..7 blue, 8..15 green,
         flags_override = _resolve_shape_flags_override(self)
@@ -445,8 +450,17 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         # Prelight is always baked. It used to be a toggle, but the "off" state
         # only ever produced a black level: with no prelight and no placed-light
         # object system (bh_light.c), every vertex renders black.
+        # Placed objects are lit too: without their share the pickups and
+        # levers come out with no SHPVTINT and the game draws them unlit.
         object_intensities = _bake_object_lights(
-            objs, lights, prelight_colour)
+            objs + placed_objs, lights, prelight_colour)
+        # The builder indexes `objects` alone, so the placed objects' share is
+        # handed over by name rather than by position.
+        by_name = {obj.name: object_intensities[index]
+                   for index, obj in enumerate(objs + placed_objs)
+                   if index < len(object_intensities)}
+        for spec in placed_specs:
+            spec["prelight"] = by_name.get(spec["name"])
 
         _report_bake_quality(self, object_intensities, prelight_colour)
 
@@ -477,6 +491,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 texture_paths=tex_paths,
                 player_start=player_start,
                 hierarchy=hierarchy,
+                visibility=visibility,
                 # 1.0 means "unscaled", which is the absence of the chunk.
                 global_scale=(self.global_scale
                               if abs(self.global_scale - 1.0) > 1e-9 else None),
@@ -493,7 +508,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 spawns=spawns,
                 global_generator=_collect_global_generator(context),
                 waypoints=waypoint_specs,
-                placed_objects=_collect_placed_objects(context, objs),
+                placed_objects=placed_specs,
                 sounds=_collect_sounds(context),
                 sound_directory=_sound_directory(context),
                 paths=_collect_paths(context, objs)[0],
@@ -524,7 +539,7 @@ def _material_texture_path(mat):
     return rim_name_for_material(mat, DUMMY_TEXTURE)
 
 
-def _build_bitmap_mapping(objs):
+def _build_bitmap_mapping(objs, extra_meshes=()):
     """Return ``(paths, mapping)`` linking materials to BMPNAMES indices.
 
     ``paths`` is the BMPNAMES name list in index order; ``mapping`` maps each
@@ -536,18 +551,23 @@ def _build_bitmap_mapping(objs):
     pointed at the first one's texture. Deriving both from one list keeps them
     consistent by construction.
     """
+    # Placed objects are not in `objs`: `_gather_meshes` drops them so they stay
+    # out of the collision system. Their materials still need an index, or their
+    # polygons keep index zero and draw the first module's texture.
+    meshes = [obj.data for obj in objs] + list(extra_meshes)
+
     paths = []
     index_of = {}
-    for obj in objs:
-        for mat in obj.data.materials:
+    for mesh in meshes:
+        for mat in mesh.materials:
             path = _material_texture_path(mat)
             if path not in index_of:
                 index_of[path] = len(paths)
                 paths.append(path)
 
     mapping = {}
-    for obj in objs:
-        for mat in obj.data.materials:
+    for mesh in meshes:
+        for mat in mesh.materials:
             mapping[mat] = index_of[_material_texture_path(mat)]
     return paths, mapping
 
@@ -1424,9 +1444,21 @@ def _collect_placed_objects(context, objs):
 
     specs = []
     for obj in context.scene.objects:
-        if obj.get(PLACEABLE_PROP) not in (KIND_PICKUP, KIND_OBJECT) \
-                or obj.type != "MESH":
+        if obj.type != "MESH":
             continue
+        marked = obj.get(PLACEABLE_PROP)
+        if marked not in (KIND_PICKUP, KIND_OBJECT):
+            # An object built by 3.3.0 has no marker at all, so an author's
+            # pickups from that window would silently vanish from the export.
+            # A mesh that names a pickup category and is not one of our placed
+            # objects is a pickup, whatever it is labelled -- and the marker is
+            # set here so the panel agrees from now on.
+            settings_candidate = getattr(obj, "rif_placeable", None)
+            if (settings_candidate is None
+                    or getattr(settings_candidate, "kind", "") != KIND_PICKUP
+                    or getattr(obj, "rif_object_type", "MODULE") != "SIMPLE_OBJECT"):
+                continue
+            obj[PLACEABLE_PROP] = KIND_PICKUP
         settings = obj.rif_placeable
         loc = obj.matrix_world.translation
         bx, by, bz = blender_to_rif_axis(loc.x, loc.y, loc.z)
@@ -1439,7 +1471,12 @@ def _collect_placed_objects(context, objs):
             "orientation": _convert_orientation(rotation),
             "strategy": {
                 "type_id": settings.pickup_type,
-                "sub_type": settings.sub_type,
+                # The panel shows a named variant for a pickup, and the number
+                # it stands for is what the file wants. A generator has no such
+                # list, so its own sub_type is used unchanged.
+                "sub_type": (int(settings.pickup_variant)
+                              if obj.get(PLACEABLE_PROP) == KIND_PICKUP
+                              else settings.sub_type),
                 # Shown as a plain number in the panel; the spares marker the
                 # format always carries is added here rather than by the artist.
                 "integrity": compose_integrity(settings.object_integrity),
@@ -2193,7 +2230,7 @@ def _path_layout_problems(context, objs):
     return problems
 
 
-def _module_layout_problems(objs, hierarchy):
+def _module_layout_problems(objs, hierarchy, visibility=None):
     """Return a list of things wrong with the level's modules, worst first.
 
     One source of truth: the export warnings and the Validate Level command
@@ -2213,13 +2250,26 @@ def _module_layout_problems(objs, hierarchy):
             f"by the game. Split the level into at least two objects")
         return problems
 
-    if not hierarchy:
+    # Either way of linking counts. The Outliner tree is one, each module's
+    # Links list is the other, and a level that used only the second was being
+    # told it had linked nothing.
+    linked = {name for name, peers in (visibility or {}).items() if peers}
+    if not hierarchy and len(linked) < 2:
         problems.append(
-            f"{count} modules and nothing parented in the Outliner, so no "
-            f"module names any other and each one renders on its own: you will "
-            f"see only the room you stand in. Parent modules to each other to "
-            f"link visibility, and leave a generator's module unlinked so it "
-            f"stays out of sight")
+            f"{count} modules and no links, so no module names any other and "
+            f"each one renders on its own: you will see only the room you stand "
+            f"in. Link them either by parenting in the Outliner or by filling "
+            f"in each module's Links list, and leave a generator's module "
+            f"unlinked so it stays out of sight")
+
+    if visibility is not None and linked and len(linked) < count:
+        lonely = sorted(obj.name for obj in objs if obj.name not in linked)
+        if lonely:
+            problems.append(
+                "These modules are linked to nothing and will only ever be "
+                "visible from inside themselves: "
+                + ", ".join(lonely[:4])
+                + ". Add them to a Links list, or parent them")
 
     boxes = [(obj.name, _world_box(obj)) for obj in objs]
     boxes = [(name, box) for name, box in boxes if box is not None]
@@ -2349,6 +2399,38 @@ def _budget_layout_problems(context, spawns):
     return problems
 
 
+def _visibility_links(objs, mode):
+    """Return {name: set(names)} of modules that can see each other.
+
+    Separate from `_build_hierarchy` on purpose. A tree holds one parent per
+    module, which is what OBJCHIER needs, but a module can have any number of
+    neighbours and VMDARRAY wants all of them. Reducing a Links list to its first
+    entry is what made a corridor that named two rooms see only one.
+    """
+    links = {obj.name: set() for obj in objs}
+    names = {obj.name for obj in objs}
+
+    if mode == "LIST":
+        for obj in objs:
+            for link in getattr(obj, "rif_module_links", ()):
+                target = (link.target_name or "").strip()
+                if target and target in names and target != obj.name:
+                    links[obj.name].add(target)
+    elif mode == "OUTLINER":
+        for obj in objs:
+            parent = getattr(obj, "parent", None)
+            if parent is not None and parent.name in names:
+                links[obj.name].add(parent.name)
+                links[parent.name].add(obj.name)
+
+    # Symmetric. If A can see B then B can see A, or standing in B you are blind
+    # to a room that is watching you.
+    for name, peers in list(links.items()):
+        for peer in peers:
+            links[peer].add(name)
+    return links
+
+
 def _build_hierarchy(objs, mode):
     """Return {child_name: parent_name} for the chosen link mode.
 
@@ -2402,13 +2484,14 @@ def _build_hierarchy(objs, mode):
     return {o.name: o.parent.name for o in objs if o.parent is not None} or None
 
 
-def _report_layout(operator, context, objs, hierarchy):
+def _report_layout(operator, context, objs, hierarchy, visibility=None):
     """Warn about every layout problem the engine will not tolerate.
 
     Covers modules and sound emitters both, from the same rule sets the Debug
     command reads, so the two can never disagree about what is wrong.
     """
-    for problem in _module_layout_problems(objs, hierarchy):
+    for problem in _module_layout_problems(objs, hierarchy,
+                                          visibility):
         _report(operator, {"WARNING"}, problem)
     for problem in _sound_layout_problems(context):
         _report(operator, {"WARNING"}, problem)
@@ -2518,10 +2601,12 @@ class RIF_OT_validate_level(bpy.types.Operator):
             return {"CANCELLED"}
         notes.append(f"{len(objs)} module(s)")
 
-        # The validator has no Link Mode of its own: it checks the layout
-        # that the Outliner produces, which is the original one.
+        # Both ways of linking are checked, so the validator sees what the
+        # export would write rather than assuming the Outliner was used.
         hierarchy = _build_hierarchy(objs, "OUTLINER")
-        problems.extend(_module_layout_problems(objs, hierarchy))
+        visibility = _visibility_links(objs, "LIST")
+        problems.extend(_module_layout_problems(objs, hierarchy,
+                                              visibility))
         problems.extend(_sound_layout_problems(context))
         problems.extend(_waypoint_layout_problems(context))
         problems.extend(_path_layout_problems(context, objs))
@@ -3035,33 +3120,20 @@ class RIF_MT_add_avp(bpy.types.Menu):
         the single-player-only ones because a skirmish map can never spawn the
         latter. See `placeables.py`.
 
-        Diagnostics deliberately live elsewhere (`RIF_MT_debug_avp`, in the
-        Object menu): they are tooling, not something a level designer places.
+        Placing is all this menu does. Validation and launching sit below a rule
+        at the end, because they are what happens once the placing is finished.
         """
         from . import placeables
 
         placeables.menu_draw(self, context)
-        # Testing is what this menu is used for most, so the round trip to the
-        # game gets a place here rather than in the Debug submenu.
+        # Checking and running are the two things done after placing objects, so
+        # they sit below a rule that separates them from the placing itself.
+        # Validate comes first: it is the step that catches a level which would
+        # not load, and launching is pointless before it passes.
         self.layout.separator()
+        self.layout.operator(RIF_OT_validate_level.bl_idname,
+                             icon="CHECKMARK")
         self.layout.operator(RIF_OT_launch_game.bl_idname, icon="PLAY")
-
-
-class RIF_MT_debug_avp(bpy.types.Menu):
-    """AvP diagnostics submenu, kept out of Object > Add."""
-
-    bl_idname = "RIF_MT_debug_avp"
-    bl_label = "Debug"
-
-    def draw(self, context):
-        """List the diagnostic helpers for inspecting a scene before export."""
-        self.layout.operator(RIF_OT_validate_level.bl_idname, icon="CHECKMARK")
-
-
-def _menu_func_debug(self, context):
-    """Hook the Debug submenu into the Object menu."""
-    self.layout.separator()
-    self.layout.menu(RIF_MT_debug_avp.bl_idname, text="Debug")
 
 
 def _menu_func_add(self, context):
@@ -3089,7 +3161,6 @@ _CLASSES = (
     RIF_OT_launch_game,
     RIF_OT_validate_level,
     RIF_MT_add_avp,
-    RIF_MT_debug_avp,
 )
 
 
@@ -3103,14 +3174,12 @@ def register():
         type=RIF_LightSettings)
     bpy.types.TOPBAR_MT_file_export.append(_menu_func_export)
     bpy.types.VIEW3D_MT_add.append(_menu_func_add)
-    bpy.types.VIEW3D_MT_object.append(_menu_func_debug)
 
 
 def unregister():
     """Unregister everything registered by register()."""
     from . import placeables
     bpy.types.VIEW3D_MT_add.remove(_menu_func_add)
-    bpy.types.VIEW3D_MT_object.remove(_menu_func_debug)
     bpy.types.TOPBAR_MT_file_export.remove(_menu_func_export)
     del bpy.types.Object.rif_light
     placeables.unregister_placeables()
