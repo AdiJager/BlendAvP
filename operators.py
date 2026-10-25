@@ -244,17 +244,20 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
     use_custom_name: BoolProperty(
         name="Custom Name",
         description=(
-            "Use a name other than the scene. Off by default: a scene is what "
-            "a level is, so the name follows it and one .blend can hold "
-            "several levels without renaming anything"),
+            "Set custom RIFFNAME. Off by default: a scene is what a level is, "
+            "so RIFFNAME follows it and one .blend can hold several levels "
+            "without renaming anything"),
         default=False,
     )
 
     level_name: StringProperty(
-        name="Level Name",
+        name="RIFFNAME",
         description=(
-            "Value written into RIFFNAME. The engine shows this name in its "
-            "level list, so it is worth matching the exported file"
+            "Written into the RIFFNAME chunk. It is not the name the game lists: "
+            "that screen shows the file name. RIFFNAME seeds the ObjectID of "
+            "every NPC generator -- the engine hashes it together with the "
+            "generator's name -- so two levels sharing one would give their "
+            "generators the same ids"
         ),
         default="custom",
     )
