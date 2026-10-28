@@ -390,7 +390,10 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
     def _export_level(self, context):
         """Level export: multi-object + REBENVDT skeleton."""
         objs = _gather_meshes(context, self.export_selected_only)
-        if not objs:
+        # A level of placed objects alone is legal: the shell is optional, and
+        # an author blocking one out starts with a pickup or a Simple Object.
+        # Only refusing both is right.
+        if not objs and not _has_placeables(context):
             _report(self, {"ERROR"}, "No mesh objects to export")
             return None
 
@@ -401,6 +404,14 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         placed_specs = _collect_placed_objects(context, objs)
         tex_paths, bitmap_mapping = _build_bitmap_mapping(
             objs, [spec["mesh"] for spec in placed_specs])
+        texture_sizes, unknown_sizes = _texture_size_table(
+            objs, [spec["mesh"] for spec in placed_specs])
+        if unknown_sizes:
+            _report(self, {"WARNING"},
+                    f"{len(unknown_sizes)} texture(s) have no image size and "
+                    "are written as 128x128: "
+                    + ", ".join(unknown_sizes[:4])
+                    + (" ..." if len(unknown_sizes) > 4 else ""))
 
         hierarchy = _build_hierarchy(objs, self.link_mode)
         visibility = _visibility_links(objs, self.link_mode)
@@ -492,6 +503,7 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
                 (self.level_name if self.use_custom_name
                  else context.scene.name),
                 texture_paths=tex_paths,
+                texture_sizes=texture_sizes,
                 player_start=player_start,
                 hierarchy=hierarchy,
                 visibility=visibility,
@@ -542,6 +554,30 @@ def _material_texture_path(mat):
     return rim_name_for_material(mat, DUMMY_TEXTURE)
 
 
+def _material_image_size(mat):
+    """Return the (width, height) in pixels of a material's image, or None.
+
+    A material without a texture node, or whose image has no size yet, returns
+    None so the caller can fall back and warn. Reading the node rather than the
+    file keeps this working for packed images, which have no usable path.
+    """
+    if mat is None or not getattr(mat, "use_nodes", False):
+        return None
+    tree = getattr(mat, "node_tree", None)
+    if tree is None:
+        return None
+    for node in tree.nodes:
+        if getattr(node, "type", "") != "TEX_IMAGE":
+            continue
+        image = getattr(node, "image", None)
+        if image is None:
+            continue
+        width, height = getattr(image, "size", (0, 0))
+        if width and height:
+            return (int(width), int(height))
+    return None
+
+
 def _build_bitmap_mapping(objs, extra_meshes=()):
     """Return ``(paths, mapping)`` linking materials to BMPNAMES indices.
 
@@ -573,6 +609,34 @@ def _build_bitmap_mapping(objs, extra_meshes=()):
         for mat in mesh.materials:
             mapping[mat] = index_of[_material_texture_path(mat)]
     return paths, mapping
+
+
+def _texture_size_table(objs, extra_meshes=()):
+    """Return ``({rim_name: (width, height)}, unknown names)`` for the level.
+
+    The size has to come from the material's image, not from a constant: a level
+    may use one of the game's 512x512 or 256x256 textures, and a full 0..1 UV
+    range would then store 0..128 and show a quarter of the image at twice the
+    size.
+
+    128x128 is the fallback for a slot with no image, and those names are
+    returned so one warning can name them -- silently assuming 128 for a known
+    256x256 image is the defect this exists to remove.
+    """
+    sizes = {}
+    unknown = []
+    meshes = [obj.data for obj in objs] + list(extra_meshes)
+    for mesh in meshes:
+        for mat in mesh.materials:
+            path = str(_material_texture_path(mat))
+            if path in sizes:
+                continue
+            size = _material_image_size(mat)
+            if size is None:
+                unknown.append(mat.name if mat is not None else "<empty slot>")
+                size = (128, 128)
+            sizes[path] = size
+    return sizes, unknown
 
 
 def _apply_bitmap_indices(objs, mapping):
@@ -888,21 +952,6 @@ class RIF_OT_load_shapes(bpy.types.Operator):
                     mesh = shape_reader.build_mesh(
                         shape, f"{path.stem}_{number}",
                         stem=path.stem, number=number)
-                    # Zero-fill rather than skip: a shape whose UV list is one
-                    # short is still mostly right, and dropping all of it makes
-                    # the whole model use one texel.
-                    if shape.uvs:
-                        layer = mesh.uv_layers.new(name="UVMap")
-                        for face_index, corners in enumerate(shape.uvs):
-                            if face_index >= len(faces):
-                                break
-                            for corner_index, (u, v) in enumerate(corners):
-                                if corner_index >= len(faces[face_index]):
-                                    break
-                                loop_index = mesh.polygons[face_index].loop_start \
-                                    + corner_index
-                                if loop_index < len(mesh.loops):
-                                    layer.data[loop_index].uv = (u, v)
 
                     obj = bpy.data.objects.new(mesh.name, mesh)
                     scene.collection.objects.link(obj)
@@ -1247,6 +1296,21 @@ def _report(operator, levels, message):
     print(f"[RIF] {tag}: {message}")
 
 
+def _has_placeables(context):
+    """True when the scene holds at least one exportable placed object.
+
+    A Simple Object is in this set now that it joins the placeable system, so a
+    scene with only that one object has no modules and must still export.
+    """
+    from .placeables import KIND_OBJECT, KIND_PICKUP, PLACEABLE_PROP
+
+    wanted = (KIND_PICKUP, KIND_OBJECT)
+    for obj in getattr(context, "scene", None).objects:
+        if obj.type == "MESH" and obj.get(PLACEABLE_PROP) in wanted:
+            return True
+    return False
+
+
 def _gather_meshes(context, selected_only=False):
     """Return the meshes to export, in a stable order.
 
@@ -1261,10 +1325,11 @@ def _gather_meshes(context, selected_only=False):
     else:
         scene = getattr(context, "scene", None)
         candidates = list(getattr(scene, "objects", None) or [])
-    from .placeables import PLACEABLE_PROP
+    from .placeables import OBJECT_TYPE_NONE, PLACEABLE_PROP
 
     meshes = [obj for obj in candidates
-              if obj.type == "MESH" and PLACEABLE_PROP not in obj]
+              if obj.type == "MESH" and PLACEABLE_PROP not in obj
+              and getattr(obj, "rif_object_type", None) != OBJECT_TYPE_NONE]
     meshes.sort(key=lambda obj: obj.name)
     return meshes
 
@@ -1441,13 +1506,17 @@ def _collect_placed_objects(context, objs):
     The category comes from the menu entry that created the object and the
     concrete item from `sub_type`, so neither is guessed here.
     """
-    from .placeables import KIND_OBJECT, KIND_PICKUP, PLACEABLE_PROP
+    from .placeables import (KIND_OBJECT, KIND_PICKUP, OBJECT_TYPE_NONE,
+                             PLACEABLE_PROP)
     from .rif.builder import _convert_orientation
     from .rif.chunks.strategy import compose_integrity
 
     specs = []
     for obj in context.scene.objects:
         if obj.type != "MESH":
+            continue
+        if getattr(obj, "rif_object_type", None) == OBJECT_TYPE_NONE:
+            # A reference or a marker: never part of the level.
             continue
         marked = obj.get(PLACEABLE_PROP)
         if marked not in (KIND_PICKUP, KIND_OBJECT):
@@ -1459,7 +1528,8 @@ def _collect_placed_objects(context, objs):
             settings_candidate = getattr(obj, "rif_placeable", None)
             if (settings_candidate is None
                     or getattr(settings_candidate, "kind", "") != KIND_PICKUP
-                    or getattr(obj, "rif_object_type", "MODULE") != "SIMPLE_OBJECT"):
+                    or getattr(obj, "rif_object_type", "MODULE")
+                    != "SIMPLE_OBJECT"):
                 continue
             obj[PLACEABLE_PROP] = KIND_PICKUP
         settings = obj.rif_placeable
@@ -2233,6 +2303,23 @@ def _path_layout_problems(context, objs):
     return problems
 
 
+def _has_generators():
+    """True when the scene holds an NPC generator.
+
+    A single-module level is exportable; what the caveat is about is generators
+    that can never fire because their module is always visible. With no
+    generator in the scene there is nothing to warn about.
+    """
+    import bpy as _bpy
+    from .placeables import KIND_NPC, PLACEABLE_PROP
+
+    scene = getattr(_bpy.context, "scene", None)
+    for obj in getattr(scene, "objects", None) or ():
+        if obj.get(PLACEABLE_PROP) == KIND_NPC:
+            return True
+    return False
+
+
 def _module_layout_problems(objs, hierarchy, visibility=None):
     """Return a list of things wrong with the level's modules, worst first.
 
@@ -2240,17 +2327,30 @@ def _module_layout_problems(objs, hierarchy, visibility=None):
     both read this, so they can never drift apart. An empty list means the
     layout is one the engine expects.
     """
+    # A Simple Object is not a module: it is a mesh with the placed-object
+    # switches on it, kept out of the placeable-marker system so the AvP Object
+    # panel stays available. `_gather_meshes` cannot tell the two apart, so the
+    # filter belongs here rather than there.
+    from .placeables import OBJECT_TYPE_SIMPLE
+
+    objs = [obj for obj in objs
+            if getattr(obj, "rif_object_type", None) != OBJECT_TYPE_SIMPLE]
+
     problems = []
     count = len(objs)
     if count < 2:
-        problems.append(
-            f"Only one module. The engine will not create an NPC while the "
-            f"generator's module is visible, and with a single module every "
-            f"generator is always visible — so Mixed Enemy and Default Enemy "
-            f"can never spawn. A lone module also lists no peers in its "
-            f"VMDARRAY, which no retail level does: the smallest has 14 "
-            f"modules and the median is 190, so this arrangement is untested "
-            f"by the game. Split the level into at least two objects")
+        # A lone module is a legitimate level: the engine loads it and the room
+        # is visible, which is all a block-out needs. The caveat below only
+        # matters when something has to spawn, so it is reported when the scene
+        # actually holds a generator -- warning on every fresh scene that has one
+        # module said "this is wrong" about work in progress.
+        if _has_generators():
+            problems.append(
+                f"Only one module. The engine will not create an NPC while the "
+                f"generator's module is visible, and with a single module every "
+                f"generator is always visible -- so Mixed Enemy and Default "
+                f"Enemy can never spawn. Add a second module so the generator "
+                f"can sit in one and be out of sight of the other")
         return problems
 
     # Either way of linking counts. The Outliner tree is one, each module's
@@ -2327,10 +2427,22 @@ def _door_layout_problems(context):
         # message that names the mistake; saying "no child mesh" about it too
         # would bury the useful line under a redundant one.
         parent = obj.parent
+        leaves = [child for child in obj.children if child.type == "MESH"]
+        # The vertex-count check comes before the skip below, because it is the
+        # one problem that survives a door nested in something that is not a
+        # door -- and that nesting is exactly the case the skip handles. Leaving
+        # it after the skip hid the reason a door would not open.
+        if leaves and len(leaves[0].data.vertices) != len(obj.data.vertices):
+            problems.append(
+                f"Door {obj.name!r}: its leaf {leaves[0].name!r} has "
+                f"{len(leaves[0].data.vertices)} vertices but the module has "
+                f"{len(obj.data.vertices)}. The engine blends them one for one, "
+                "so no morph is written and the door will not move. Duplicate "
+                "the module mesh and move the copy where the leaf should end up")
+            continue
         if (parent is not None and parent.type == "MESH"
                 and not getattr(parent, "rif_module_door", False)):
             continue
-        leaves = [child for child in obj.children if child.type == "MESH"]
         if not leaves:
             problems.append(
                 f"Door {obj.name!r} has no child mesh, so there is no leaf "

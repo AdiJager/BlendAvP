@@ -91,6 +91,13 @@ class Shape:
         self.vertex_normals = []
         self.uvs = []
         self.bitmaps = []
+        # {bitmap index: (width, height)} from BMPNAMES, for entries
+        # that record a size rather than a transparency colour.
+        self.bitmap_sizes = {}
+        # UVs as stored in the file, in texture pixels. The normalised
+        # `uvs` list below is these divided by 128, which is only
+        # right when the bitmap is 128 across.
+        self.uvs_pixels = []
 
     @property
     def is_empty(self):
@@ -196,23 +203,32 @@ def parse_shape(data, start, end, bitmaps):
         # were: a degenerate entry has no corners and no place in either list.
         # Parsing them independently let the two lists end up different lengths,
         # and the importer then skipped the UVs entirely for those shapes.
-        records = _parse_uvs(data, uv_data[0], uv_data[1])
+        records, records_raw = _parse_uvs(data, uv_data[0], uv_data[1])
         for index, corners in enumerate(shape.polygons):
             wanted = (shape.polygon_uv_indexes[index]
                       if index < len(shape.polygon_uv_indexes) else index)
             if 0 <= wanted < len(records):
                 shape.uvs.append(records[wanted])
+                shape.uvs_pixels.append(records_raw[wanted])
             else:
                 shape.uvs.append([(0.0, 0.0)] * len(corners))
+                shape.uvs_pixels.append([(0.0, 0.0)] * len(corners))
 
     return None if shape.is_empty else shape
 
 
 def _parse_uvs(data, start, end):
-    """Return a list of per-polygon (u, v) lists."""
+    """Return (normalised, raw) per-polygon UV lists.
+
+    `normalised` divides by 128 and flips V, which is right for every shape in
+    `shape_rifs`: all their textures are 128 across. `raw` keeps the values as
+    stored, in texture pixels, so `build_mesh` can divide each face by the size
+    of the bitmap that face actually names.
+    """
     out = []
+    raw = []
     if end - start < UV_HEADER_SIZE + 4:
-        return out
+        return out, raw
     position = start + UV_HEADER_SIZE
     while position + 4 <= end:
         nv = _i32(data, position)
@@ -220,19 +236,34 @@ def _parse_uvs(data, start, end):
         if nv < 1 or nv > 4:
             break
         if position + nv * 8 > end:
-            return out
+            return out, raw
         corners = []
+        pixels = []
         for _ in range(nv):
             u, v = struct.unpack_from("<2f", data, position)
             position += 8
-            corners.append((u / UV_PIXELS_PER_UNIT,
-                            v / UV_PIXELS_PER_UNIT))
+            pixels.append((u, v))
+            # The inverse of `uv_to_rif_pixels`: the engine counts rows from the
+            # top of the image, Blender from the bottom, and the writer's -0.5
+            # is cancelled here so a round trip through both is exact.
+            corners.append(((u + 0.5) / UV_PIXELS_PER_UNIT,
+                            1.0 - (v + 0.5) / UV_PIXELS_PER_UNIT))
         out.append(corners)
-    return out
+        raw.append(pixels)
+    return out, raw
 
 
-def parse_bitmaps(data, start, end):
-    """Return the bitmap names a file lists, in index order."""
+CHUNK_BMP_FLAG_IFF = 0x01000000
+
+
+def parse_bitmaps(data, start, end, sizes=None):
+    """Return the bitmap names a file lists, in index order.
+
+    `sizes`, when given, is filled with `{index: (width, height)}` from the same
+    entry's `d3` word -- but only for an entry whose flags carry
+    `ChunkBMPFlag_IFF`. For anything else that word is a transparency colour and
+    reading it as a size would scale the model by an arbitrary factor.
+    """
     # {index: name}, keyed by each entry's own index field. That field is what
     # a polygon's poly_colour refers to, and it is NOT the position in the list:
     # the first entry of 52_cabfrg has index 1, so matching by position found
@@ -244,7 +275,14 @@ def parse_bitmaps(data, start, end):
     for _ in range(min(count, 512)):
         if position + 20 > end:
             break
+        flags = _u32(data, position)
         index = _u32(data, position + 4)
+        d3 = _u32(data, position + 16)
+        if sizes is not None and (flags & CHUNK_BMP_FLAG_IFF):
+            width = d3 & 0xFFFF
+            height = (d3 >> 16) & 0xFFFF
+            if width and height:
+                sizes[index] = (width, height)
         position += 20                     # flags, index, d1, d2, d3
         stop = data.find(b"\x00", position, end)
         if stop < 0:
@@ -254,7 +292,7 @@ def parse_bitmaps(data, start, end):
     return names
 
 
-def _find_bitmaps(data, start, end):
+def _find_bitmaps(data, start, end, sizes=None):
     """Return the bitmap names from BMPNAMES, wherever it sits.
 
     It is not a top-level chunk: it lives inside REBENVDT, which is why looking
@@ -262,9 +300,9 @@ def _find_bitmaps(data, start, end):
     """
     for ident, pstart, pend in children(data, start, end):
         if ident == "BMPNAMES":
-            return parse_bitmaps(data, pstart, pend)
+            return parse_bitmaps(data, pstart, pend, sizes)
         if ident in ("REBENVDT", "REBSHAPE"):
-            found = _find_bitmaps(data, pstart, pend)
+            found = _find_bitmaps(data, pstart, pend, sizes)
             if found:
                 return found
     return []
@@ -301,8 +339,10 @@ def _winded_faces(shape):
         corners = list(corners)
         wanted = (shape.polygon_normals[face_index]
                   if face_index < len(shape.polygon_normals) else None)
-        corner_uvs = (list(shape.uvs[face_index])
-                      if face_index < len(shape.uvs) else [])
+        # Raw pixels, not the normalised list: the size belongs to this face's
+        # bitmap and is not known here, so the division waits for `build_mesh`.
+        corner_uvs = (list(shape.uvs_pixels[face_index])
+                      if face_index < len(shape.uvs_pixels) else [])
         if wanted is not None and len(corners) >= 3:
             if _needs_reverse(shape, corners, wanted):
                 corners.reverse()
@@ -333,6 +373,20 @@ def _needs_reverse(shape, corners, wanted):
     return nx * wanted[0] + ny * wanted[1] + nz * wanted[2] < 0.0
 
 
+def _face_bitmap_size(shape, face_index):
+    """Return (width, height) of the bitmap this face names, defaulting to 128.
+
+    128 is what every texture in `shape_rifs` is, so a file that records no size
+    comes in exactly as it did before the sizes were read.
+    """
+    bitmap = (shape.polygon_bitmaps[face_index]
+              if face_index < len(shape.polygon_bitmaps) else None)
+    size = shape.bitmap_sizes.get(bitmap) if shape.bitmap_sizes else None
+    if size:
+        return size
+    return (UV_PIXELS_PER_UNIT, UV_PIXELS_PER_UNIT)
+
+
 def build_mesh(shape, name, stem=None, number=0):
     """Return a finished Blender mesh for one Shape.
 
@@ -359,13 +413,18 @@ def build_mesh(shape, name, stem=None, number=0):
         for face_index, corners in enumerate(uvs):
             if face_index >= len(faces):
                 break
+            width, height = _face_bitmap_size(shape, face_index)
             start = mesh.polygons[face_index].loop_start
             for corner_index, (u, v) in enumerate(corners):
                 if corner_index >= len(faces[face_index]):
                     break
                 loop_index = start + corner_index
                 if loop_index < len(layer.data):
-                    layer.data[loop_index].uv = (u, v)
+                    # The inverse of `uv_to_rif_pixels`, with this face's own
+                    # size: the engine counts rows from the top, Blender from
+                    # the bottom.
+                    layer.data[loop_index].uv = ((u + 0.5) / width,
+                                                 1.0 - (v + 0.5) / height)
 
     apply_smoothing(mesh, shape)
 
@@ -471,7 +530,8 @@ def read_shapes(path):
     # would find no REBSHAPE at the top level and return nothing, which is a
     # clear enough failure for a function only ever pointed at shape_rifs.
 
-    bitmaps = _find_bitmaps(data, 12, len(data))
+    bitmap_sizes = {}
+    bitmaps = _find_bitmaps(data, 12, len(data), bitmap_sizes)
 
     shapes = []
     for ident, pstart, pend in children(data, 12, len(data)):
@@ -479,5 +539,6 @@ def read_shapes(path):
             continue
         shape = parse_shape(data, pstart, pend, bitmaps)
         if shape is not None:
+            shape.bitmap_sizes = bitmap_sizes
             shapes.append(shape)
     return shapes

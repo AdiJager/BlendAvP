@@ -28,18 +28,31 @@ def rif_to_meters(rif_int: int) -> float:
 
 
 def uv_to_rif_pixels(u: float, v: float,
-                     pixels: float = DEFAULT_UV_PIXELS):
-    """Map normalised Blender UV to RIF pixel space.
+                     width: float = DEFAULT_UV_PIXELS,
+                     height: float = None):
+    """Map a normalised Blender UV to the engine's texture-pixel space.
 
-    No V-flip. It used to flip, on the assumption that the game is Y-down and
-    the importer is not -- but the importer this add-on ships reads V unchanged,
-    so the two disagreed and every textured surface was mirrored in game while
-    looking right in Blender. Writing V as it is keeps a round trip identical.
+    V is flipped. The engine counts rows from the top of the IFF --
+    d3d_render.cpp:942-943 samples (V + 0.5) / height -- and the RIM loader does
+    not reverse them (awTexLd.cpp:1352: AreRowsReversed returns false), so its
+    v = 0 is the top row. Blender's v = 0 is the bottom row.
 
-    Scaling is by pixels, not pixels - 1: the reader multiplies back by
-    1/128, so u=1.0 has to come back as 128 to be lossless.
+    The 0.5 puts the vertex on a texel centre: the loader truncates the stored
+    float to an integer texel and the renderer samples centres, so without it a
+    UV of exactly 1.0 would store the row one past the image and wrap. The
+    reader adds the same 0.5 back, which is what makes the round trip exact.
+
+    Tiling is passed through: UVs may be negative or exceed the bitmap, and the
+    engine wraps.
+
+    width and height are the texture's real size in pixels, not a constant: the
+    game ships textures from 64x64 to 512x512, and writing 128 for one of those
+    makes the engine sample a quarter of the image at twice the size. height
+    defaults to width, which is what every shipped level texture is.
     """
-    return (u * pixels, v * pixels)
+    if height is None:
+        height = width
+    return (u * width - 0.5, (1.0 - v) * height - 0.5)
 
 
 def blender_to_rif_axis(x: float, y: float, z: float):

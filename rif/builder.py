@@ -63,7 +63,7 @@ from .chunks.sound import SoundDirectoryChunk, SoundObjectChunk
 from .chunks.strategy import AVPStrategyChunk, ObjectProjectDataChunk
 from .chunks.waypoint import WaypointChunk
 from .types import (
-    DEFAULT_LOCK_USER, DEFAULT_NOTES,
+    DEFAULT_LOCK_USER, DEFAULT_NOTES, DEFAULT_UV_PIXELS,
     meters_to_rif, uv_to_rif_pixels, blender_to_rif_axis,
 )
 from .texture_library import rim_name_for_material
@@ -323,7 +323,7 @@ def build_rif_multi(objects, hierarchy=None, visibility=None,
     return GodFatherChunk(children).serialize()
 
 
-def build_rif_level(objects, level_name, texture_paths=None,
+def build_rif_level(objects, level_name, texture_paths=None, texture_sizes=None,
                     player_start=None, player_orientation=None,
                     hierarchy=None, visibility=None, global_scale=None,
                     lights=None, ambient=255,
@@ -459,8 +459,12 @@ def build_rif_level(objects, level_name, texture_paths=None,
         the top of this module).
     """
     objects = list(objects)
-    if not objects:
-        raise ValueError("build_rif_level requires at least one object")
+    # No shell is a legal level: a scene holding only placed objects still has a
+    # world, a texture table and an environment, which is everything the engine
+    # needs to load. Refusing it made a block-out of one pickup unexportable.
+    if not objects and not placed_objects:
+        raise ValueError(
+            "build_rif_level needs objects or placed objects; it has neither")
 
     # A door leaf is a child mesh of a module marked as a door. Its geometry
     # goes into SHPMORPH > SUBSHAPE, not into a shape and module of its own, so
@@ -477,6 +481,15 @@ def build_rif_level(objects, level_name, texture_paths=None,
                 break
     if door_leaves:
         leaves = {leaf.name for leaf in door_leaves.values()}
+        # `object_intensities` is aligned with the list as it arrived, so it has
+        # to lose the same entries. Filtering only `objects` shifted every baked
+        # light after the door by one, and the corridor past it lit up in the
+        # wrong colours.
+        if object_intensities and len(object_intensities) >= len(objects):
+            kept = [value for obj, value in zip(objects, object_intensities)
+                    if obj.name not in leaves]
+            if kept:
+                object_intensities = kept
         objects = [obj for obj in objects if obj.name not in leaves]
         if not objects:
             raise ValueError(
@@ -556,12 +569,17 @@ def build_rif_level(objects, level_name, texture_paths=None,
             # would shift the geometry while the offsets stayed put.
             recentre=fragments is None,
             matrix=_rotation_scale_matrix(obj),
+            slot_sizes=_slot_sizes_for(slot_bitmaps, texture_paths,
+                                       texture_sizes),
         )
         if fragments is not None:
             shape.children.append(fragments)
         leaf = door_leaves.get(obj.name)
         if leaf is not None:
-            _attach_door_morph(shape, obj, leaf, texture_paths)
+            _attach_door_morph(
+                shape, obj, leaf, texture_paths,
+                _slot_sizes_for(_resolve_bitmap_indices(leaf.data, texture_paths),
+                                texture_paths, texture_sizes))
         shapes.append(shape)
 
         # `module_origins[i]` is the true world position, which the module box
@@ -684,6 +702,8 @@ def build_rif_level(objects, level_name, texture_paths=None,
         # sits where the artist put it.
         shapes.append(_build_shape_chunk(
             entry["mesh"], entry["name"], file_id, bitmap_slots,
+            slot_sizes=_slot_sizes_for(bitmap_slots, texture_paths,
+                                       texture_sizes),
         ))
         objs.append(_build_object_chunk(
             name=entry["name"],
@@ -702,7 +722,7 @@ def build_rif_level(objects, level_name, texture_paths=None,
     env_children = [
         EnvironmentHeaderChunk(),
         RIFNameChunk(level_name),
-        _build_bmpnames(texture_paths),
+        _build_bmpnames(texture_paths, texture_sizes),
         BMPNamesExtraDataChunk(),
         BMPNamesVersionChunk(1),
     ]
@@ -871,7 +891,7 @@ def _build_hierarchy_node(name, children_of):
     return ObjectHierarchyChunk(node_children)
 
 
-def _attach_door_morph(shape, module, leaf, texture_paths):
+def _attach_door_morph(shape, module, leaf, texture_paths, slot_sizes=None):
     """Append SHPMORPH for a door leaf to its module's REBSHAPE.
 
     The leaf's geometry has to end up in the same frame as the module's, or the
@@ -891,7 +911,7 @@ def _attach_door_morph(shape, module, leaf, texture_paths):
 
     slots = _resolve_bitmap_indices(leaf.data, texture_paths)
     verts, vert_normals, polys, poly_normals, uv_lists = \
-        _extract_geometry(leaf.data, slots, _rotation_scale_matrix(leaf))
+        _extract_geometry(leaf.data, slots, _rotation_scale_matrix(leaf), None, slot_sizes)
     if not verts or not polys:
         raise ValueError(f"door leaf {leaf.name!r} has no geometry")
 
@@ -899,13 +919,12 @@ def _attach_door_morph(shape, module, leaf, texture_paths):
     # modules in retail, module_verts == sub_verts in every one. A leaf with a
     # different count would be blended against unrelated vertices and collapse
     # into a shape nobody authored, which reads in game as a door that is simply
-    # too small.
+    # too small. Skipping the morph leaves a door that does not move -- the same
+    # outcome as a door with no leaf at all -- which beats refusing to write the
+    # whole level. The operator reports it, where the message can reach the user.
     module_verts = shape.children[0].num_verts
     if len(verts) != module_verts:
-        raise ValueError(
-            f"door leaf {leaf.name!r} has {len(verts)} vertices but its module "
-            f"{module.name!r} has {module_verts}; the engine blends them one "
-            f"for one, so the leaf must be a duplicate of the module")
+        return
 
     # Where the leaf sits relative to its module, in RIF millimetres.
     delta = leaf.matrix_world.translation - module.matrix_world.translation
@@ -917,7 +936,9 @@ def _attach_door_morph(shape, module, leaf, texture_paths):
     bounds = _compute_bounds(verts)
     centre = _compute_centre(bounds)
     radius = _compute_radius(verts, centre)
-    uv_pixels = _uv_to_pixels(uv_lists)
+    # Already in pixels: converted per polygon in `_extract_geometry`,
+    # where the material slot that owns the size is known.
+    uv_pixels = uv_lists
 
     geometry = [
         ShapeCentreChunk(centre, radius),
@@ -950,9 +971,27 @@ def _rotation_scale_matrix(obj):
     return matrix
 
 
+def _slot_sizes_for(slot_bitmaps, texture_paths, texture_sizes):
+    """Return each material slot's (width, height), from the bitmap it names.
+
+    `slot_bitmaps[slot]` is an index into `texture_paths`, which is the same list
+    `BMPNAMES` is built from, so the size is looked up rather than passed in
+    parallel -- two lists that must agree are two lists that can drift.
+    """
+    if not texture_sizes:
+        return None
+    sizes = []
+    for index in slot_bitmaps or ():
+        name = (texture_paths[index]
+                if 0 <= index < len(texture_paths) else "")
+        sizes.append(texture_sizes.get(str(name), (DEFAULT_UV_PIXELS,
+                                                    DEFAULT_UV_PIXELS)))
+    return sizes
+
+
 def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
                        shape_flags=None, recentre=False, matrix=None,
-                       slot_flags=None):
+                       slot_flags=None, slot_sizes=None):
     """Return a fully assembled REBSHAPE chunk for one mesh.
 
     shape_flags : SHPHEAD1.flags value; defaults to SHAPE_FLAGS_DEFAULT.
@@ -975,7 +1014,7 @@ def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
     verts_int, vert_normals, polys, poly_normals, uv_lists = \
         _extract_geometry(mesh, slot_bitmaps, matrix,
                           slot_flags if slot_flags is not None
-                          else _slot_flags(mesh))
+                          else _slot_flags(mesh), slot_sizes)
     offset = (0, 0, 0)
     if recentre:
         offset = _compute_centre(_compute_bounds(verts_int))
@@ -984,7 +1023,9 @@ def _build_shape_chunk(mesh, object_name, file_id_num, slot_bitmaps,
     bounds = _compute_bounds(verts_int)
     centre = _compute_centre(bounds)
     radius = _compute_radius(verts_int, centre)
-    uv_pixels = _uv_to_pixels(uv_lists)
+    # Already in pixels: converted per polygon in `_extract_geometry`,
+    # where the material slot that owns the size is known.
+    uv_pixels = uv_lists
 
     chunk = ShapeChunk([
         ShapeHeaderChunk(
@@ -1051,28 +1092,40 @@ def _trigger_strategy(obj):
     """
     on_destroy = bool(getattr(obj, "rif_trigger_on_destroy", False))
     on_pickup = bool(getattr(obj, "rif_trigger_on_pickup", False))
-    if not (on_destroy or on_pickup):
+    destructible = bool(getattr(obj, "rif_destructible", False))
+    explosion = int(getattr(obj, "rif_trigger_explosion", "0"))
+    if not (on_destroy or on_pickup or destructible or explosion):
         return None
 
+    # A target is only needed to send a message to something else. The
+    # explosion is about this object being destroyed, and the engine reads it
+    # from the strategy's own flags -- so a Destructible object with no target
+    # still needs a strategy, or it cannot blow up at all.
     target = getattr(obj, "rif_trigger_target", None)
-    if target is None:
-        return None
 
-    from .chunks.strategy import AVPStrategyChunk, trigger_flags
+    from .chunks.strategy import AVPStrategyChunk, compose_integrity, trigger_flags
     from .chunks.trigger import virtual_object_id
 
-    integrity = (int(getattr(obj, "rif_integrity", 1))
-                 if getattr(obj, "rif_destructible", False) else 0)
+    # Integrity 0 means indestructible, so a Destructible object left at the
+    # default 0 could never be destroyed and its explosion would never fire.
+    # One is the weakest thing that still breaks, and the spares marker goes on
+    # the way it does for every other SimpleStrategy this exporter writes.
+    integrity = (compose_integrity(max(1, int(getattr(obj, "rif_integrity", 1))))
+                 if destructible else 0)
     return AVPStrategyChunk(
         type_id=0,
         integrity=integrity,
         flags=trigger_flags(
-            on_destroy, on_pickup,
-            int(getattr(obj, "rif_trigger_explosion", "0"))),
-        target_request=1 if getattr(obj, "rif_trigger_state", False) else 0,
+            on_destroy if target is not None else False,
+            on_pickup if target is not None else False,
+            explosion),
+        target_request=(1 if (target is not None
+                              and getattr(obj, "rif_trigger_state", False))
+                        else 0),
         # The chunk stores the id as one 64-bit word, so the bytes the
-        # trigger writer produces are packed little-endian.
-        target_id=int.from_bytes(virtual_object_id(target.name), "little"),
+        # trigger writer produces are packed little-endian. Zero means "nobody".
+        target_id=(int.from_bytes(virtual_object_id(target.name), "little")
+                   if target is not None else 0),
     )
 
 
@@ -1500,7 +1553,7 @@ def _build_module_data(spec):
     return ObjectModuleDataChunk(children)
 
 
-def _build_bmpnames(texture_paths):
+def _build_bmpnames(texture_paths, texture_sizes=None):
     """Wrap texture paths into a BMPNAMES chunk (never empty).
 
     Entry ``index`` is the position in ``texture_paths``, and callers must pass
@@ -1513,7 +1566,18 @@ def _build_bmpnames(texture_paths):
         # Never emit an empty BMPNAMES: the loader would then resolve no
         # texture at all and silently drop every polygon to iflag_nolight.
         texture_paths = ["dummy.RIM"]
-    entries = [{"index": i, "name": str(p)} for i, p in enumerate(texture_paths)]
+    entries = []
+    for i, path in enumerate(texture_paths):
+        entry = {"index": i, "name": str(path)}
+        # The `d3` word carries the size for an IFF bitmap, which every .RIM
+        # is: width in the low half, height in the high half. The exporter used
+        # to write a constant 128x128 here, which was true for every shipped
+        # level texture and a lie for the other 55 in the archives.
+        size = (texture_sizes or {}).get(str(path))
+        if size:
+            width, height = size
+            entry["d3"] = (int(width) & 0xFFFF) | ((int(height) & 0xFFFF) << 16)
+        entries.append(entry)
     return BMPNamesChunk(entries)
 
 
@@ -1760,7 +1824,7 @@ def _resolve_bitmap_indices(mesh, texture_paths=None):
     return result
 
 
-def _extract_geometry(mesh, slot_bitmaps, matrix=None, slot_flags=None):
+def _extract_geometry(mesh, slot_bitmaps, matrix=None, slot_flags=None, slot_sizes=None):
     """Return (verts_int, vert_normals, polys, poly_normals, uv_lists).
 
     `matrix` is the object's rotation and scale, without translation. It must be
@@ -1803,13 +1867,26 @@ def _extract_geometry(mesh, slot_bitmaps, matrix=None, slot_flags=None):
             n = (rotation @ n).normalized()
         face_normal = blender_to_rif_axis(n.x, n.y, n.z)
 
-        if uv_layer is not None:
-            loop_uvs = [tuple(uv_layer.data[li].uv)
-                        for li in poly.loop_indices]
+        slot = poly.material_index
+
+        # A UV layer can exist and still hold nothing: deleting every face of a
+        # mesh leaves the layer behind with an empty collection, and indexing it
+        # raises IndexError rather than returning zeros. The loop count is the
+        # honest test -- the layer is only useful if it covers this mesh's loops.
+        if uv_layer is not None and len(uv_layer.data) >= len(mesh.loops):
+            # Converted here, not later: the size belongs to this polygon's own
+            # material and `slot` is the only place that is known. One shape can
+            # mix a 128x128 wall with a 512x512 floor, so a single size per
+            # shape would be wrong for one of them.
+            width, height = (slot_sizes[slot]
+                             if slot_sizes and slot < len(slot_sizes)
+                             else (DEFAULT_UV_PIXELS, DEFAULT_UV_PIXELS))
+            loop_uvs = [uv_to_rif_pixels(u, v, width, height)
+                        for (u, v) in (tuple(uv_layer.data[li].uv)
+                                       for li in poly.loop_indices)]
         else:
             loop_uvs = [(0.0, 0.0)] * len(indices)
 
-        slot = poly.material_index
         bitmap_idx = slot_bitmaps[slot] if slot < len(slot_bitmaps) else 0
 
         if len(indices) > 4:

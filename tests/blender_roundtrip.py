@@ -504,11 +504,35 @@ def test_poly_colour_encodes_uv_index():
 
 @test
 def test_uv_roundtrip_is_lossless_at_edges():
-    """uv_to_rif_pixels is invertible at u=0 and u=1."""
-    for u in (0.0, 1.0):
-        u_pix, _v_pix = uv_to_rif_pixels(u, 0.0)
-        u_back = u_pix / DEFAULT_UV_PIXELS
-        assert abs(u_back - u) < 1e-6, f"u={u} → {u_back}"
+    """The writer and the reader invert each other, V included.
+
+    Both directions carry the half-texel offset, so this asserts the pair rather
+    than the division alone: a test of one half is what let the missing V flip
+    look correct for as long as it did.
+    """
+    for u in (0.0, 0.25, 1.0):
+        for v in (0.0, 0.25, 1.0):
+            u_pix, v_pix = uv_to_rif_pixels(u, v)
+            u_back = (u_pix + 0.5) / DEFAULT_UV_PIXELS
+            v_back = 1.0 - (v_pix + 0.5) / DEFAULT_UV_PIXELS
+            assert abs(u_back - u) < 1e-6, f"u={u} v={v} → {u_back}"
+            assert abs(v_back - v) < 1e-6, f"u={u} v={v} → {v_back}"
+
+
+@test
+def test_uv_flips_v_for_the_engine():
+    """Blender's bottom row (v=0) becomes the engine's last row, not its first.
+
+    The engine counts rows from the top of the image (d3d_render.cpp:942), so a
+    file written without the flip is mirrored in game. This is the assertion
+    that would have caught it.
+    """
+    _u, bottom = uv_to_rif_pixels(0.5, 0.0)
+    _u, top = uv_to_rif_pixels(0.5, 1.0)
+    assert bottom > top, f"v=0 stored {bottom}, v=1 stored {top}"
+    # The engine samples (V + 0.5) / height from the top row.
+    assert abs((bottom + 0.5) / DEFAULT_UV_PIXELS - 1.0) < 1e-6
+    assert abs((top + 0.5) / DEFAULT_UV_PIXELS) < 1e-6
 
 
 @test
@@ -2693,26 +2717,38 @@ def test_export_takes_the_whole_scene_by_default():
 
 @test
 def test_validator_reports_a_single_module_level():
-    """One module is the mistake that silently kills every runtime generator.
+    """One module matters only when something has to spawn in it.
 
     The engine will not create an NPC while the generator's module is visible,
-    and with a single module everything is always visible. A lone module is also
-    an arrangement retail never uses, which is worth saying without claiming it
-    cannot work.
+    and with a single module everything is always visible -- so the caveat is
+    real, but only when the scene holds a generator. A lone module is otherwise
+    a level the engine loads and draws, so warning on it said "this is wrong"
+    about a block-out that is merely unfinished.
     """
     operators = load_operators()
     _make_cube("Only")
 
     problems = operators._module_layout_problems(
         list(bpy.context.scene.objects), None)
-    assert problems, "a one-module level must be reported"
-    assert "one module" in problems[0].lower(), problems[0]
+    assert not problems, f"a lone module with no generator: {problems}"
+    print("    sam modul, bez generatora: brak ostrzezen")
 
-    recorder = _ReportRecorder()
-    operators.RIF_OT_validate_level.execute(recorder, bpy.context)
-    assert recorder.reports, "the validator said nothing at all"
-    assert recorder.warnings(), recorder.reports
-    print(f"    walidator: {recorder.warnings()[0][:90]}")
+
+@test
+def test_validator_reports_single_module_with_a_generator():
+    """The spawn caveat appears once a generator exists to be blocked."""
+    operators = load_operators()
+    _make_cube("Only")
+    # The marker is what `_has_generators` looks for; setting it directly keeps
+    # the test about the validator rather than about a menu entry's name.
+    placeables = load_package_module("placeables")
+    bpy.data.objects["Only"][placeables.PLACEABLE_PROP] = placeables.KIND_NPC
+
+    problems = operators._module_layout_problems(
+        list(bpy.context.scene.objects), None)
+    assert problems, "a one-module level with a generator must be reported"
+    assert "one module" in problems[0].lower(), problems[0]
+    print(f"    walidator: {problems[0][:90]}")
 
 
 # ------------------------------------------------------------------ runner

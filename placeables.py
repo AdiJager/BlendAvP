@@ -851,7 +851,7 @@ class _PlaceableSpec:
     def __init__(self, key, label, description, icon, category, kind,
                  npc_type=0, display=None, flags=None, legacy_marker=None,
                  pickup_type=None, object_flags=None, pieces=0,
-                 shape_file=None):
+                 shape_file=None, scale=None):
         self.key = key
         self.label = label
         self.description = description
@@ -871,6 +871,9 @@ class _PlaceableSpec:
         # Model to read from shape_rifs when this entry is used. None
         # means the entry has no model of its own and stays a cube.
         self.shape_file = shape_file
+        # Size for the placeholder geometry, in metres. None keeps whatever the
+        # creation branch already sets, which is right for a marker.
+        self.scale = scale
         # Set on objects the existing export path finds by marker rather than
         # by the new `rif_placeable` property.
         self.legacy_marker = legacy_marker
@@ -1241,6 +1244,14 @@ PLACEABLES = (
             "IOT_FieldCharge (15) - the Predator's energy pickup. sub_type is "
             "always 0 in retail"),
         "MESH_CUBE", CAT_PICKUP, KIND_PICKUP, pickup_type=15, shape_file="Pboost"),
+    _PlaceableSpec(
+        "object_reference", "Hudson", (
+            "Marine-sized reference cube: 0.6 x 0.6 x 1.8 m, measured from "
+            "hnpcmarine.RIF. Stand it next to a door, a corridor or a lift to "
+            "judge the scale. Type is No Export, so it never reaches the .rif"),
+        "MESH_CUBE", CAT_OBJECT, KIND_SIMPLE_OBJECT,
+        object_flags={"rif_object_type": "NO_EXPORT"},
+        scale=(0.6, 0.6, 1.8)),
     _PlaceableSpec(
         "object_simple", "Simple Object", (
             "A placed object with every option off: plain decoration, which "
@@ -1699,6 +1710,7 @@ def pickup_subtype_items(self, context):
 # Module -- exported as a module its strategy would never be dispatched.
 OBJECT_TYPE_MODULE = "MODULE"
 OBJECT_TYPE_SIMPLE = "SIMPLE_OBJECT"
+OBJECT_TYPE_NONE = "NO_EXPORT"
 
 TYPE_SWITCHES = {
     OBJECT_TYPE_MODULE: (
@@ -1971,6 +1983,9 @@ bpy.types.Object.rif_object_type = bpy.props.EnumProperty(
         (OBJECT_TYPE_MODULE, "Module",
          "Part of the level's shell: rooms, walls and doors. Loaded down the "
          "module path, so it reaches the visibility and AI graphs"),
+        (OBJECT_TYPE_NONE, "No Export",
+         "Left out of the .rif entirely. For what exists only to help you "
+         "build: a scale reference, a marker, a block-out volume"),
         (OBJECT_TYPE_SIMPLE, "Simple Object",
          "A placed object: detail, a pickup, something that breaks, a lift or "
          "a fan. Not part of the shell, so it has no visibility list and no "
@@ -2234,7 +2249,7 @@ def _warn_shape(operator, spec, reason):
 def _sync_pickup_variant(obj, spec):
     """Point the variant list at the sub_type the entry presets.
 
-    lags sets sub_type, the number the file wants; the panel shows
+    lags sets sub_type, the number the file wants; the panel shows
     pickup_variant, so without this the list sat on its first entry and every
     pickup read as a pulse rifle. The list is a view of the number, so it is set
     from it here rather than repeated in every row of the table.
@@ -2341,6 +2356,8 @@ def _make_operator(spec):
                 obj.rif_placeable.pickup_type = spec.pickup_type
             for key, value in spec.flags.items():
                 setattr(obj.rif_placeable, key, value)
+            if spec.scale:
+                obj.scale = spec.scale
             _sync_pickup_variant(obj, spec)
             for other in context.selected_objects:
                 other.select_set(False)
@@ -2519,6 +2536,11 @@ def _make_operator(spec):
         # A preset makes an ordinary object with the switches already set, not
         # a placeable marker: the AvP Object panel polls on PLACEABLE_PROP being
         # absent, so setting it here would hide the very panel the author needs.
+        # Every entry in the Objects category is a mesh with
+        # `rif_object_type = SIMPLE_OBJECT`, edited in the AvP Object panel:
+        # that panel polls on PLACEABLE_PROP being absent, so setting it here
+        # would hide the very switches the entry exists to offer. A room or a
+        # door is a module and takes the module path instead.
         if spec.kind not in GEOMETRY_KINDS:
             obj[PLACEABLE_PROP] = spec.kind
             obj.rif_placeable.kind = spec.kind
@@ -2531,6 +2553,8 @@ def _make_operator(spec):
             setattr(obj.rif_placeable, key, value)
         for key, value in spec.object_flags.items():
             setattr(obj, key, value)
+        if spec.scale:
+            obj.scale = spec.scale
         _sync_pickup_variant(obj, spec)
         context.collection.objects.link(obj)
 
