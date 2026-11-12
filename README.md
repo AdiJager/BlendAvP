@@ -1,4 +1,6 @@
-# A Few Words of Introduction
+# Readme
+
+## A Few Words of Introduction
 
 This project aims to offer modernized modding tools for the game Aliens vs Predator (1999/Classic). It is being developed as a full-fledged extension for the Blender editor and is, as much as possible, independent – most operations that could be done on the game using the official modding tools should now be possible to perform with this extension.
 
