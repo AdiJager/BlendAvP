@@ -1160,6 +1160,11 @@ def _collect_spawns(context, objs=None):
             continue
 
         spec = {
+            # The marker kind, so callers can tell a multiplayer spawn from a
+            # creature generator without re-deriving it from the flags. The
+            # validator read this key and found nothing, which made it warn
+            # about a missing single-player start on a network-only level.
+            "kind": kind,
             "location": location,
             "orientation": _object_yaw_to_rif(obj),
             "type": npc_type,
@@ -3107,9 +3112,12 @@ def _report_player_start(operator, player_start, spawns):
     `AVPSTART` — the engine places players from those. A level with neither
     falls back to the world origin, which is worth saying out loud.
     """
+    from . import placeables
+
     if player_start is not None:
         return
-    multiplayer = [s for s in spawns or () if s.get("flags", 0) & 0x40000000]
+    multiplayer = [s for s in spawns or ()
+                   if s.get("kind") == placeables.KIND_PLAYER_START_MP]
     if multiplayer:
         _report(operator, 
             {"INFO"},

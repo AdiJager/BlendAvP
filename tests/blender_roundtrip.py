@@ -2286,9 +2286,13 @@ def test_missing_player_start_is_reported():
     assert not recorder.reports, recorder.reports
 
     # Multiplayer spawns are a legitimate way in, so this is information only.
+    # The spec carries the marker kind, which is what `_collect_spawns` puts
+    # there; the flags alone were a second source of truth that drifted.
+    placeables = load_package_module("placeables")
     recorder = _ReportRecorder()
-    operators._report_player_start(recorder, None,
-                                   [{"flags": 0x48002801}])
+    operators._report_player_start(
+        recorder, None,
+        [{"kind": placeables.KIND_PLAYER_START_MP, "flags": 0x48002801}])
     assert not recorder.warnings(), \
         "multiplayer spawns must not be reported as a problem"
     assert recorder.reports, "it should still be mentioned"
