@@ -34,7 +34,7 @@ Installation is dead simple and no different from other Blender extensions. Afte
 In the newly opened window, go to the "Get Extensions..." tab and expand the "arrow" next to the "Repositories" field. From the expanded menu, select: "Install from Disc...", point to the downloaded zip... and voila – that's all :)
 If the installation was successful, under the "Add" menu (in object mode) you should see a whole new item named simply "AvP", and under the "Export" menu the .rif format should be visible.
 
-![[docs\export.png]]
+![Export menu showing AvP RIF format](docs/export.png)
 
 ---
 ## Configuration
@@ -42,11 +42,11 @@ If the installation was successful, under the "Add" menu (in object mode) you sh
 After installation, the **Aliens vs Predator RIF Exporter** extension will appear in the extensions list. However, to fully use it, a few additional steps are needed.
 In the extension entry, expand the "Details" list:
 
-![[docs\view_details.png]]
+![Extension details expanded](docs/view_details.png)
 
 This will show the options needed for configuration:
 
-![[docs/ext_settings.png]]
+![Extension settings](docs/ext_settings.png)
 
 The most important step is to indicate the game installation in the **"Game Directory"** field. It is according to this path that the extension searches for resources necessary to build game levels.
 
@@ -64,7 +64,7 @@ Before loading textures, Blender must unpack the archives and convert textures f
 
 The button will generate an additional scene in the .blend project file. It serves for inspecting imported materials and as a gallery for faster orientation among the pulled-in resources. It is not required for work, but it's useful to have ;-)
 
-![[docs/mat_gallery.jpg]]
+![Material gallery scene](docs/mat_gallery.jpg)
 
 ### Clear Texture Library
 
@@ -79,7 +79,7 @@ After downloading Fox Modding Tools, unpack the **"shape_rifs.zip"** archive to 
 
 If the folder is already available, pressing **Load Shapes** will create a new scene in the open .blend file in which all game models used inside the original levels will appear.
 
-![[docs/shapes.png]]
+![Imported game shapes](docs/shapes.png)
 
 **Fox Editing Tools** itself must be found and downloaded from the Internet yourself. The extension does not include it and will not include it for licensing reasons.
 
@@ -90,42 +90,42 @@ Below is a quick recipe for a basic custom level:
 
 1. Model a room from a box with inverted faces or add a basic module from the menu: **Add => AvP => Modules => Room**
 
-![[docs/room.png]]
+![Basic room module](docs/room.png)
 
 2. Scale it so that it has a reasonable size (in the example 10x8x4m), assign it materials from the previously imported library, and generate UV mapping as you see fit (in the example below the walls have a cliff texture, and the room uses Cube Projection):
 
-![[docs/basic_module.png]]
+![Textured room module](docs/basic_module.png)
 
 3. Add a spawn point from the menu: **Add => AvP => Multiplayer Spawn**
 
-![[docs/spawnpoint.png]]
+![Multiplayer spawn point](docs/spawnpoint.png)
 
 4. To complete things, it's also useful to have **"Global Generator Data"** from the menu: **AvP => Gameplay**. In the example export we don't add bots, but if you'd like to have them, you must have one global generator and more than one linked module.
 
-![[docs/globalgenerator.png]]
+![Global generator data](docs/globalgenerator.png)
 
 5. A level prepared this way should already export, but for something to be visible in it, it's worth adding a point light and setting ambient:
 
-![[docs/pointlight.png]]
+![Point light setup](docs/pointlight.png)
 
-![[docs/ambient.png]]
+![Ambient lighting settings](docs/ambient.png)
 
 Both ambient (world tab) and point light are typical Blender objects and do not require special treatment.
 **However, it's worth setting them brighter than what comes out of the Eevee preview. The discrepancy in light interpretation between Eevee and the game is still something that requires work and something I struggle with.**
 
 6. Before exporting, it's worth running validation and seeing what it tells us about the current scene: **Add => AvP => Validate**. The script is not perfect, but it should catch the most common errors.
 
-![[docs/validate.jpg]]
+![Validation results](docs/validate.jpg)
 
 7. Finally, all that remains is export: **File => Export => Aliens vs Predator RIF**. The file should be saved to the **avp_rifs\custom** folder – without this it will not appear in the game's map selection list.
 
-![[docs/avp_export.png]]
+![Export to avp_rifs folder](docs/avp_export.png)
 
 8. The map should launch both as a skirmish and as multiplayer. Congratulations! You've just become a level designer ;-)
 
-![[docs/ingame_menu.jpg]]
+![Map in game menu](docs/ingame_menu.jpg)
 
-![[docs/ingame.jpg]]
+![Level in game](docs/ingame.jpg)
 
 ### A Few Important Rules:
 
