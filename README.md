@@ -15,9 +15,9 @@ Adi
 The RIF Exporter – is hosted by me on GitHub – and I recommend it as the most recent source of ready-to-install releases. Additionally, I upload the extension on IndieDB/Moddb – however, these do not have every version and are generally slightly behind with releases.
 I will also try to add the project to the official Blender extensions hosting – but since it is manually moderated, it may lag the most behind the other sources.
 
-GitHub: https://github.com/AdiJager/BlendAvP
-IndieDB: *Coming Soon*
-Blender Extensions: *Coming Soon*
+* GitHub: https://github.com/AdiJager/BlendAvP
+* IndieDB: *Coming Soon*
+* Blender Extensions: *Coming Soon*
 
 ---
 ## Requirements
@@ -148,8 +148,8 @@ Full documentation can be read at: *Coming Soon*
 ---
 ## Credits
 
-Project Moderator: AdiJager
-Code Generator: Deep Seek Flash 4.1
+* Project Moderator: AdiJager
+* Code Generator: Deep Seek Flash 4.1
 
 Special thanks to the original developers of the game, for creating the most awesome FPS of all time still worth modding, despite the passage of over twenty years. Double thanks for making the game's source code public, as without it the exporter project would not be possible.
 
