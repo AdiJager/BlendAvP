@@ -145,7 +145,9 @@ Both ambient (world tab) and point light are typical Blender objects and do not 
 ---
 ## Manual
 
-Full documentation can be read at: *Coming Soon*
+Full documentation can be read at: 
+
+* Git Wiki: https://github.com/AdiJager/BlendAvP/wiki
 
 ---
 ## Credits
