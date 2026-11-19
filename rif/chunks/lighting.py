@@ -114,22 +114,34 @@ class LightSetHeaderChunk(Chunk):
 
 
 class AmbienceChunk(Chunk):
-    """AMBIENCE — ambient light intensity hint for the set.
+    """AMBIENCE — the level's ambient floor, in 16.16 fixed point.
 
-    Note: this value is NOT consumed by VertexIntensity_Standard_Opt in
-    Kshape.c (that function only reads SHPVTINT prelight and runtime
-    LightSourcesForObject[]). It is a hint for the prelight bake step
-    or for the D3D global ambient multiplier. Emitting it is harmless.
+    The engine shifts it down before use (`Avpview.c:641`:
+    `GlobalAmbience = VDB_Ambience >> 8`), so the value has to be written eight
+    bits above the 0..255 an author picks. Writing the plain level made every
+    ambient below 256 arrive as zero; retail confirms the unit, with 57 of its
+    63 levels at 0 and the rest at 655, 2048, 2620, 11873 -- all 16.16.
+
+    It is only a floor: `d3d_render.cpp:4211-4215` raises a channel that falls
+    below it and never lowers one. Static geometry starts from SHPVTINT, so the
+    prelight colour is what actually lights it, and the two are kept consistent
+    by deriving both from the same World reading.
+
+    `ambience` is taken in the author's 0..255 and scaled here, so no caller has
+    to know the unit.
     """
 
     identifier = "AMBIENCE"
 
+    #: Bits the engine shifts away before reading the value.
+    FIXED_BITS = 8
+
     def __init__(self, ambience: int = DEFAULT_AMBIENCE):
-        self.ambience = ambience
+        self.ambience = int(ambience)
 
     def payload(self) -> bytes:
-        """Serialise one i32 ambience level."""
-        return struct.pack("<i", self.ambience)
+        """Serialise one i32 ambience level, shifted into 16.16."""
+        return struct.pack("<i", self.ambience << self.FIXED_BITS)
 
 
 class LightScaleChunk(Chunk):

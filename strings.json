@@ -326,7 +326,7 @@
     "The waypoint this link points at": "",
     "These change how bots move, not how it looks": "",
     "This module is a door. The engine moves it along the shape it already has, so the geometry is the door and the strategy only says how it behaves": "",
-    "This module is under open sky. The engine draws the sky only when a module the player is standing in carries this, so without it the sky colour in World > Level Settings does nothing. Note that a starfield, if enabled for the level, replaces the clouds rather than joining them": "",
+    "This module is under open sky. The engine draws the sky only when a module the player is standing in carries this, so without it the sky colour in World > AvP Level Settings does nothing. Note that a starfield, if enabled for the level, replaces the clouds rather than joining them": "",
     "This one lights the room": "",
     "Time": "",
     "Timing": "",

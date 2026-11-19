@@ -978,14 +978,20 @@ def test_ltsethdr_name_padded_to_8():
 
 @test
 def test_ambience_value_roundtrip():
-    """AMBIENCE payload reflects the ambient argument."""
+    """AMBIENCE carries the ambient argument in 16.16, as the engine reads it.
+
+    `Avpview.c:641` does `GlobalAmbience = VDB_Ambience >> 8`, so a payload equal
+    to the plain 0..255 level arrives as zero. The test asserts the shift rather
+    than the raw number, which is what it used to do.
+    """
     obj = _make_cube()
     data = build_rif_level([obj], "lvl", ambient=200)
     idx, size = _find_chunk(data, "AMBIENCE")
     assert idx > 0, "AMBIENCE missing"
     assert size == 16, f"AMBIENCE size should be 16, got {size}"
     ambience = _read_i32(data, idx + 12)
-    assert ambience == 200, f"ambience = {ambience}"
+    assert ambience == 200 << 8, f"ambience = {ambience}"
+    assert ambience >> 8 == 200, f"engine would read {ambience >> 8}"
 
 
 @test

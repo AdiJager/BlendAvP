@@ -476,7 +476,8 @@ class RIF_OT_export(bpy.types.Operator, ExportHelper):
         for spec in placed_specs:
             spec["prelight"] = by_name.get(spec["name"])
 
-        _report_bake_quality(self, object_intensities, prelight_colour)
+        _report_bake_quality(
+            self, object_intensities, prelight_colour, len(lights))
 
         try:
             spawns, skipped = _collect_spawns(context, objs)
@@ -2806,13 +2807,19 @@ def _resolve_shape_flags_override(operator):
     return int(operator.shape_flags_override)
 
 
-def _report_bake_quality(operator, baked, base_colour):
+def _report_bake_quality(operator, baked, base_colour, light_count=0):
     """Warn when the baked lighting will look flat in-game.
 
     A World ambient that is already bright saturates every vertex, so point
     lights and colour can no longer show through — the most common cause of a
     uniformly lit room. Checking the histogram here turns that into an
     immediate message instead of a surprise inside the game.
+
+    `light_count` is what keeps the message honest. With no lamps every vertex
+    carries the ambient and nothing else, so a spread of zero is the correct
+    result rather than a fault, and the advice below ("lower World > Strength")
+    would point at the one setting that is doing exactly what it was asked to.
+    The caller already reports "no point/spot lights" in that case.
     """
     levels = []
     for entry in baked:
@@ -2826,13 +2833,13 @@ def _report_bake_quality(operator, baked, base_colour):
     base = (base_colour >> 16) & 255
     spread = max(levels) - min(levels)
 
-    if saturated > total * 0.9:
+    if saturated > total * 0.9 and light_count:
         _report(operator, 
             {"WARNING"},
             f"{saturated}/{total} vertices are fully saturated. World ambient "
             f"is about {base}/255 — lower World > Strength so lights and "
             "colour can show")
-    elif spread <= 2:
+    elif spread <= 2 and light_count:
         _report(operator, 
             {"WARNING"},
             "Baked lighting is flat: only "
@@ -2919,18 +2926,35 @@ def _scene_world(context):
 
 
 def _world_color_strength(context):
-    """Return (colour, strength) from Blender's World settings.
+    """Return (colour, strength) from the World's Background node.
 
-    Blender expresses ambient as World > Color plus a World > Strength
-    multiplier; together they are the flat term an unlit surface receives.
-    Falls back to mid grey at strength 1.0 when the scene has no world.
+    The node is what the World actually shades with. `World.color` is the
+    viewport display colour and `World.strength` does not exist in Blender 5 at
+    all, so reading those two -- which is what this used to do -- returned the
+    same pair for every scene and no setting an author made could reach the
+    file. Both reads fell back silently because they were written as `getattr`
+    with defaults.
+
+    Falls back to the viewport colour at strength 1.0 for a World with no nodes,
+    which is the case for a World created by older files.
     """
     world = _scene_world(context)
     if world is None:
         return (0.5, 0.5, 0.5), 1.0
-    colour = tuple(getattr(world, "color", (0.5, 0.5, 0.5)))
-    strength = float(getattr(world, "strength", 1.0) or 0.0)
-    return colour, strength
+
+    tree = getattr(world, "node_tree", None) if world.use_nodes else None
+    if tree is not None:
+        for node in tree.nodes:
+            if getattr(node, "type", "") != "BACKGROUND":
+                continue
+            colour_input = node.inputs.get("Color")
+            strength_input = node.inputs.get("Strength")
+            if colour_input is None or strength_input is None:
+                continue
+            colour = tuple(colour_input.default_value)[:3]
+            return colour, float(strength_input.default_value)
+
+    return tuple(getattr(world, "color", (0.5, 0.5, 0.5)))[:3], 1.0
 
 
 def _spot_direction_blender(light_object):

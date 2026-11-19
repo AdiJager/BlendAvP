@@ -2925,7 +2925,7 @@ class RIF_PT_world_audio(bpy.types.Panel):
     listed folders works and a custom level needs none of its own.
     """
 
-    bl_label = "Level Settings"
+    bl_label = "AvP Level Settings"
     bl_idname = "RIF_PT_world_audio"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -3037,7 +3037,7 @@ def register_placeables():
         description=(
             "This module is under open sky. The engine draws the sky only when "
             "a module the player is standing in carries this, so without it the "
-            "sky colour in World > Level Settings does nothing. Note that a "
+            "sky colour in World > AvP Level Settings does nothing. Note that a "
             "starfield, if enabled for the level, replaces the clouds rather "
             "than joining them"),
         default=False)
