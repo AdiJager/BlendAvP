@@ -1333,8 +1333,20 @@ def _gather_meshes(context, selected_only=False):
         candidates = list(getattr(scene, "objects", None) or [])
     from .placeables import OBJECT_TYPE_NONE, PLACEABLE_PROP
 
+    # A fragment piece is a mesh child of a fragmenting object. Its geometry
+    # belongs inside SHPFRAGS, where the engine keeps it until the object
+    # breaks -- exported as a mesh of its own it stands in the level from the
+    # start, which is the opposite of what a piece is. The same reasoning that
+    # takes a door leaf out of the module list, applied where it is cheap.
+    pieces = {child.name
+              for obj in candidates
+              if getattr(obj, "rif_fragments", False)
+              for child in getattr(obj, "children", ())
+              if getattr(child, "type", "") == "MESH"}
+
     meshes = [obj for obj in candidates
               if obj.type == "MESH" and PLACEABLE_PROP not in obj
+              and obj.name not in pieces
               and getattr(obj, "rif_object_type", None) != OBJECT_TYPE_NONE]
     meshes.sort(key=lambda obj: obj.name)
     return meshes

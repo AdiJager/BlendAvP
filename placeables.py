@@ -1287,16 +1287,15 @@ PLACEABLES = (
                       "rif_track_enabled": True}),
     _PlaceableSpec(
         "object_lamp", "Lamp", (
-            "A lamp that emits light, with the pieces its housing breaks into "
-            "already set up. Turn on Light and mark a material as a corona to "
-            "give it a flare"),
+            "A lamp that emits light, using the Bulb model from shape_rifs when "
+            "the game folder has it and a cube otherwise. Turn on Light and mark "
+            "a material as a corona to give it a flare. Nothing is set up to "
+            "break it: a lamp's integrity comes from the lamp code itself, which "
+            "never reads Destructible, so breaking is opt-in here"),
         "LIGHT_POINT", CAT_OBJECT, KIND_SIMPLE_OBJECT,
         object_flags={"rif_object_type": "SIMPLE_OBJECT",
-                      "rif_placed_light": True,
-                      "rif_fragments": True,
-                      "rif_destructible": True,
-                      "rif_integrity": 16},
-        pieces=2),
+                      "rif_placed_light": True},
+        shape_file="Bulb_0|Bulb"),
     _PlaceableSpec(
         "object_destructible", "Destructible", (
             "An object that breaks into pieces, with the pieces already there "
@@ -1403,7 +1402,7 @@ class RIF_PT_module(bpy.types.Panel):
         # The type first: it decides which path the engine takes, and therefore
         # which of the sections below can mean anything at all.
         box = layout.box()
-        box.label(text="AvP object", icon="OUTLINER_OB_EMPTY")
+        box.label(text="AvP Object", icon="OUTLINER_OB_EMPTY")
         box.prop(obj, "rif_object_type")
 
         object_type = getattr(obj, "rif_object_type", "MODULE")
@@ -1479,7 +1478,7 @@ class RIF_PT_module(bpy.types.Panel):
                 acts.prop(obj, "rif_switch_extra")
 
                 timing = box.box()
-                timing.label(text="Behaviour", icon="TIME")
+                timing.label(text="Behavior", icon="TIME")
                 timing.prop(obj, "rif_switch_mode")
                 if obj.rif_switch_mode != "1":
                     timing.prop(obj, "rif_switch_time")
@@ -1570,7 +1569,7 @@ class RIF_PT_module(bpy.types.Panel):
                 inner.prop(obj, "rif_light_on_at_start")
 
                 shape = box.box()
-                shape.label(text="Behaviour", icon="PLAY")
+                shape.label(text="Behavior", icon="PLAY")
                 shape.prop(obj, "rif_light_type")
                 shape.prop(obj, "rif_light_on_off_type")
 
@@ -1740,7 +1739,7 @@ def _on_object_type(self, context):
 
 
 bpy.types.Object.rif_placed_light = bpy.props.BoolProperty(
-    name="Emits light",
+    name="Emits Light",
     description=(
         "The object is a lamp: it carries a PLOBJLIT record, and the light "
         "comes out of the object's origin, so moving the object moves the "
@@ -1757,17 +1756,17 @@ bpy.types.Object.rif_light_brightness = bpy.props.FloatProperty(
 
 bpy.types.Object.rif_light_range = bpy.props.FloatProperty(
     name="Range",
-    description="How far the light reaches, in metres",
+    description="How far the light reaches, in meters",
     default=10.0, min=0.1, soft_max=100.0, precision=2)
 
 bpy.types.Object.rif_light_colour = bpy.props.FloatVectorProperty(
-    name="Colour",
-    description="Colour while the light is on",
+    name="Color",
+    description="Color while the light is on",
     subtype="COLOR", default=(1.0, 1.0, 1.0), min=0.0, max=1.0, size=3)
 
 bpy.types.Object.rif_light_off_colour = bpy.props.FloatVectorProperty(
-    name="Off colour",
-    description=("Colour while the light is off. The engine fades between "
+    name="Off Color",
+    description=("Color while the light is off. The engine fades between "
                  "the two, so this is what a dying lamp cools to"),
     subtype="COLOR", default=(0.0, 0.0, 0.0), min=0.0, max=1.0, size=3)
 
@@ -1801,7 +1800,7 @@ bpy.types.Object.rif_light_fade_up_ms = bpy.props.IntProperty(
 
 bpy.types.Object.rif_light_fade_down_ms = bpy.props.IntProperty(
     name="Fade down",
-    description="Milliseconds to reach the off colour", default=0,
+    description="Milliseconds to reach the off color", default=0,
     min=0, soft_max=10000)
 
 bpy.types.Object.rif_light_on_ms = bpy.props.IntProperty(
@@ -2141,7 +2140,7 @@ def _draw_movement(layout, obj):
     if obj.rif_track_end is None:
         inner.label(text="No end point: the track stays put", icon="INFO")
     flags = box.box()
-    flags.label(text="Behaviour", icon="PLAY")
+    flags.label(text="Behavior", icon="PLAY")
     flags.prop(obj, "rif_track_loop")
     flags.prop(obj, "rif_track_playing_at_start")
     flags.prop(obj, "rif_track_loop_back_forth")
@@ -2289,22 +2288,32 @@ def _shape_mesh_for(spec, context, operator=None):
 
     from .rif import shape_reader
 
-    path = Path(game_directory) / "shape_rifs" / f"{spec.shape_file}.rif"
-    if not path.is_file():
+    # `shape_file` may list several names separated by `|`, tried in order.
+    # The Lamp asks for `Bulb_0` and falls back to `Bulb`: the shipped data has
+    # the second, while an editor's own export may have the first, and one name
+    # would make the entry work in one place and not the other.
+    folder = Path(game_directory) / "shape_rifs"
+    path = None
+    for wanted_name in str(spec.shape_file).split("|"):
+        candidate_path = folder / f"{wanted_name.strip()}.rif"
+        if candidate_path.is_file():
+            path = candidate_path
+            break
         # Windows does not care about case, so one more try costs nothing.
-        folder = path.parent
         if folder.is_dir():
-            wanted = path.name.lower()
+            wanted = candidate_path.name.lower()
             for candidate in folder.iterdir():
                 if candidate.name.lower() == wanted:
                     path = candidate
                     break
-    if not path.is_file():
-        folder = Path(game_directory) / "shape_rifs"
+        if path is not None:
+            break
+    if path is None:
         if not folder.is_dir():
             _warn_shape(operator, spec, f"no shape_rifs folder in {game_directory}")
         else:
-            _warn_shape(operator, spec, f"{spec.shape_file}.rif is not in {folder}")
+            _warn_shape(operator, spec,
+                        f"{spec.shape_file}.rif is not in {folder}")
         return None
 
     try:
@@ -2318,8 +2327,11 @@ def _shape_mesh_for(spec, context, operator=None):
 
     shape = shapes[0]
     # One call builds geometry, winding, smoothing, UVs and materials together:
-    # doing only the geometry here is what made pickups arrive flat.
-    return shape_reader.build_mesh(shape, spec.shape_file)
+    # doing only the geometry here is what made pickups arrive flat. The stem is
+    # the file that was actually found, not the whole candidate list, or the
+    # object would be called Bulb_0|Bulb and every material with it.
+    stem = path.stem
+    return shape_reader.build_mesh(shape, stem, stem=stem)
 
 
 def _make_operator(spec):
@@ -2346,7 +2358,9 @@ def _make_operator(spec):
             # path sets. Leaving the marker off made it look like a plain mesh,
             # so the AvP Object panel appeared instead of the AvP Placeable one
             # that belongs to a pickup.
-            obj = bpy.data.objects.new(spec.shape_file, shape_mesh)
+            # Named after the mesh, which carries the file that was found --
+            # spec.shape_file may be a candidate list like Bulb_0|Bulb.
+            obj = bpy.data.objects.new(shape_mesh.name, shape_mesh)
             context.collection.objects.link(obj)
             obj[PLACEABLE_PROP] = spec.kind
             obj.rif_placeable.kind = spec.kind
@@ -2662,7 +2676,7 @@ class RIF_PT_placeable(bpy.types.Panel):
                 layout.prop(settings, "sub_type")
             layout.prop(settings, "texture_id")
             box = layout.box()
-            box.label(text="Behaviour", icon="OPTIONS")
+            box.label(text="Behavior", icon="OPTIONS")
             box.prop(settings, "mission")
             if settings.mission == "5":
                 # Only a patrol reads a route, so it is offered only then:
@@ -2910,7 +2924,7 @@ class RIF_PT_material_avp(bpy.types.Panel):
         if getattr(material, "rif_material_light_corona", False):
             box.label(text="Drawn as a flare that faces the camera",
                       icon="INFO")
-            box.label(text="Its position is the centre of its polygon",
+            box.label(text="Its position is the center of its polygon",
                       icon="INFO")
             box.label(text="Needs a light on the object to do anything",
                       icon="INFO")

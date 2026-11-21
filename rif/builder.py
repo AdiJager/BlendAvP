@@ -190,9 +190,14 @@ OBJ_FLAGS = 0x00000200
 PLACED_OBJECT_FLAGS = 0x0000FC00
 OBJ_VERSION_NO = 1
 
-# `shape.h:625` -- the polygon is drawn as a light flare, and its centre
-# becomes the flare's position (`bh_light.c:193`).
+# `shape.h:625` -- the polygon marks where a light flare goes: the engine
+# averages its vertices into the flare's position (`bh_light.c:183-203`).
 POLY_FLAG_LIGHT_CORONA = 0x20000000
+
+# `shape.h:548` -- "Don't draw this item". A corona polygon is a marker, not a
+# surface: the engine only reads its centroid, so leaving it drawable put a
+# static textured quad next to the flare, with whatever alpha its texture had.
+POLY_FLAG_NOT_VISIBLE = 0x00000001
 
 
 def _slot_flags(mesh):
@@ -202,7 +207,7 @@ def _slot_flags(mesh):
         value = POLY_FLAGS
         if material is not None and getattr(
                 material, "rif_material_light_corona", False):
-            value |= POLY_FLAG_LIGHT_CORONA
+            value |= POLY_FLAG_LIGHT_CORONA | POLY_FLAG_NOT_VISIBLE
         flags.append(value)
     return flags
 
@@ -591,9 +596,11 @@ def build_rif_level(objects, level_name, texture_paths=None, texture_sizes=None,
         shift = shape.origin_offset
         loc_rif = tuple(module_origins[i][a] + shift[a] for a in range(3))
 
-        loc, rot_q, _scale = obj.matrix_world.decompose()
-        orient_rif = _convert_orientation(rot_q)
-        orient_rif = _convert_orientation(rot_q)
+        # The vertices already carry this rotation: `_build_shape_chunk` above
+        # was given `_rotation_scale_matrix(obj)`. Writing it here as well turned
+        # every rotated object twice, which a lamp -- the shape most often
+        # rotated -- showed as a fitting at the wrong angle.
+        orient_rif = (0.0, 0.0, 0.0, 1.0)
 
         module_data = None
         # A platform lift and a fan are placed objects, not part of the level's
@@ -1275,6 +1282,14 @@ def _fragments_for(obj):
             minimum=bounds["min"],
             location=location,
             copies=getattr(child, "rif_fragment_copies", 1),
+            # The geometry the engine reads when the piece appears. Its absence
+            # was a null read, and the game crashed the moment it broke.
+            verts=verts,
+            vert_normals=_normals,
+            poly_normals=_pn,
+            polys=polys,
+            uvs=_uv,
+            centre=centre,
         ))
 
     if not pieces:

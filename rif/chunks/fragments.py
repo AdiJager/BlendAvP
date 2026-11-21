@@ -157,16 +157,48 @@ class ShapeFragmentsChunk(Chunk):
 
 
 def build_piece(name, file_id_num, num_verts, num_polys, radius, maximum,
-                minimum, location, copies=1):
-    """Build one SUBSHAPE for a fragment piece."""
-    return SubShapeChunk([
+                minimum, location, copies=1, verts=None, vert_normals=None,
+                poly_normals=None, polys=None, uvs=None, centre=None):
+    """Build one SUBSHAPE for a fragment piece.
+
+    The geometry is not optional. A header that declares `num_verts` and
+    `num_polys` is a promise that those chunks follow; without them the engine
+    reads a null pointer and the game crashes as soon as the object breaks.
+    Every retail piece carries all of them -- across 1323 pieces, `SHPRAWVT`,
+    `SHPVNORM`, `SHPPNORM` and `SHPPOLYS` appear 1323 times and `SHPUVCRD` 1322.
+
+    `centre` is emitted when given, which is where retail puts `SHPCENTR`: a
+    piece needs its own centre for the scatter maths.
+    """
+    children = [
         FragmentHeaderChunk(file_id_num=file_id_num, num_verts=num_verts,
                             num_polys=num_polys, radius=radius,
                             maximum=maximum, minimum=minimum),
+    ]
+    if centre is not None and verts is not None:
+        from .centre import ShapeCentreChunk
+        children.append(ShapeCentreChunk(centre, radius))
+    if verts:
+        from .polygon import ShapePolygonChunk
+        from .pnormal import ShapePolygonNormalChunk
+        from .uv import ShapeUVCoordChunk
+        from .vertex import ShapeVertexChunk
+        from .vnormal import ShapeVertexNormalChunk
+        children.append(ShapeVertexChunk(verts))
+        if vert_normals:
+            children.append(ShapeVertexNormalChunk(vert_normals))
+        if poly_normals:
+            children.append(ShapePolygonNormalChunk(poly_normals))
+        if polys:
+            children.append(ShapePolygonChunk(polys))
+        if uvs:
+            children.append(ShapeUVCoordChunk(uvs))
+    children.extend([
         FragmentNameChunk(name),
         FragmentDataChunk(copies),
         FragmentLocationChunk(location),
     ])
+    return SubShapeChunk(children)
 
 
 def build_fragments_chunk(pieces):
