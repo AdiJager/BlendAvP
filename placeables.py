@@ -694,6 +694,18 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         min=0,
         max=255,
     )
+    sentry_ammo: bpy.props.IntProperty(
+        name="Sentry Ammo",
+        description=(
+            "Rounds a Sentry Turret carries: the generator's two spare bytes, "
+            "read as one number (Objsetup.cpp:2823). The gun spends 30 a "
+            "second (AGUN_ROF), so 500 is under twenty seconds of fire. "
+            "30000 or more means unlimited. Ignored by every other entry"
+        ),
+        default=30000,
+        min=0,
+        max=65535,
+    )
     race_marine: bpy.props.BoolProperty(
         name="Marine",
         description=(
@@ -719,8 +731,19 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
     inactive: bpy.props.BoolProperty(
         name="Inactive",
         description=(
-            "AVPGENFLAG_GENERATORINACTIVE. Keeps the generator in the level "
-            "but stops it spawning anything"
+            "AVPGENFLAG_GENERATORINACTIVE. Stops this generator producing "
+            "anything, and nothing in the level can switch it back on"
+        ),
+        default=False,
+    )
+    dormant: bpy.props.BoolProperty(
+        name="Dormant",
+        description=(
+            "The creature is placed but starts asleep: ABS_Dormant in "
+            "BH_ALIEN.C:704. It wakes when touched or shot, then behaves "
+            "normally and never returns to sleep. Writes the same "
+            "AVPGENFLAG_GENERATORINACTIVE bit, which for a fixed creature means "
+            "dormant rather than disabled"
         ),
         default=False,
     )
@@ -2596,15 +2619,42 @@ def _make_operator(spec):
 PLACEABLE_OPERATORS = {spec.key: _make_operator(spec) for spec in PLACEABLES}
 
 
+#: `AVPGENER.type` values that place one creature at level load rather than
+#: spawning: `Objsetup.cpp:2983` sends them to `add_alien`, which reads the
+#: inactive flag as "start `ABS_Dormant`" instead of "do not run".
+DORMANT_NPC_TYPES = (1, 5, 8)
+
+#: Order the groups appear in, and the words the separator is about.
+GROUP_ORDER = ("generator", "alien", "solo")
+
+
+def _entry_group(spec):
+    """Return which group a menu entry belongs to.
+
+    Three kinds share one category and behave differently: a generator keeps
+    producing enemies, a fixed alien is one creature that can start asleep, and
+    the rest are single player only. The label suffix is what says the last one,
+    because it is also the only place the user sees it.
+    """
+    if spec.category != CAT_GENERATOR:
+        return "solo" if "(single player)" in spec.label else "any"
+    if spec.npc_type == 0:
+        return "generator"
+    if spec.npc_type in DORMANT_NPC_TYPES:
+        return "alien"
+    return "solo"
+
+
 def _draw_category(layout, category):
-    """Draw every entry of one category into a submenu layout."""
-    entries = sorted((spec for spec in PLACEABLES if spec.category == category),
-                     key=lambda spec: spec.label.lower())
+    """Draw one category's entries, grouped and alphabetical within each group."""
+    entries = sorted(
+        (spec for spec in PLACEABLES if spec.category == category),
+        key=lambda spec: (GROUP_ORDER.index(_entry_group(spec))
+                          if _entry_group(spec) in GROUP_ORDER else -1,
+                          spec.label.lower()))
     previous_group = None
     for spec in entries:
-        # Separate the network-legal generators from the single-player ones,
-        # because the distinction decides whether an entry is usable at all.
-        group = "solo" if "(single player)" in spec.label else "any"
+        group = _entry_group(spec)
         if previous_group is not None and group != previous_group:
             layout.separator()
         previous_group = group
@@ -2685,8 +2735,22 @@ class RIF_PT_placeable(bpy.types.Panel):
                 if not settings.patrol_path:
                     box.label(text="A patrol needs a route",
                               icon="ERROR")
-            box.prop(settings, "inactive")
+            # The same flag means "disabled" to a generator and "asleep" to a
+            # fixed creature, so the entry that created the object decides the
+            # label. `npc_type` is what separates the two.
+            if (getattr(settings, "kind", "") == KIND_NPC
+                    and getattr(settings, "npc_type", 0)
+                    in DORMANT_NPC_TYPES):
+                box.prop(settings, "dormant")
+            else:
+                box.prop(settings, "inactive")
             box.prop(settings, "excluded_hard")
+            if (getattr(settings, "kind", "") == KIND_NPC
+                    and getattr(settings, "npc_type", 0) == 9):
+                # The turret's only ammunition is this field: the engine takes
+                # it from the generator's spare bytes and overrides its own
+                # default, so leaving it at zero leaves the gun empty.
+                box.prop(settings, "sentry_ammo")
 
         if kind == KIND_WEIGHTED:
             # The fifteen weights belong to THIS object: it is the one that

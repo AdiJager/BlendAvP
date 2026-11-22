@@ -234,7 +234,9 @@ class AVPGeneratorChunk(Chunk):
         # Only the low 12 bits survive a round trip through the loader.
         buf += struct.pack("<i", self.orientation & 0xFFF)
         buf += struct.pack("<i", self.npc_type)
-        buf += struct.pack("<i", self.flags)
+        # Unsigned: `GEN_INACTIVE` is 0x80000000, which does not fit a signed
+        # word, and ticking `Inactive` used to abort the whole export.
+        buf += struct.pack("<I", self.flags & 0xFFFFFFFF)
         buf += struct.pack("<4B", self.texture_id & 0xFF, self.sub_type & 0xFF,
                            self.extra1 & 0xFF, self.extra2 & 0xFF)
         buf += self.name.encode("latin-1", "replace") + b"\x00"

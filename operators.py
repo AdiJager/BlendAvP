@@ -1120,7 +1120,13 @@ def _collect_spawns(context, objs=None):
                                     inactive=settings.inactive)
             npc_type = 0
         elif kind == placeables.KIND_NPC:
-            flags = generator_flags(inactive=settings.inactive)
+            # A fixed alien reads this bit as "start dormant"; everything else
+            # reads it as "do not run". Both are the same bit in the file, so
+            # the property is chosen here rather than at the call site.
+            inactive = (bool(getattr(settings, "dormant", False))
+                        if settings.npc_type in placeables.DORMANT_NPC_TYPES
+                        else bool(settings.inactive))
+            flags = generator_flags(inactive=inactive)
             npc_type = settings.npc_type
         elif kind in (placeables.KIND_DEFAULT_ENEMY,
                       placeables.KIND_WEIGHTED):
@@ -1175,6 +1181,14 @@ def _collect_spawns(context, objs=None):
             else 0,
             "texture_id": settings.texture_id,
         }
+        if (kind == placeables.KIND_NPC
+                and getattr(settings, "npc_type", 0) == 9):
+            # `att->ammo = (agc->extra1 << 8) + agc->extra2` (Objsetup.cpp:2823).
+            # The only entry that reads these bytes as a count; the Xenoborg
+            # reads them as UpTime and ModuleRange, so this stays conditional.
+            ammo = max(0, min(65535, int(getattr(settings, "sentry_ammo", 500))))
+            spec["extra1"] = ammo >> 8
+            spec["extra2"] = ammo & 0xFF
         mission = int(settings.mission or 0)
         if mission:
             spec["mission"] = mission
