@@ -1789,11 +1789,17 @@ def test_placeable_properties_register_in_blender():
         assert settings.race_marine is True, "race_marine default is wrong"
         assert settings.race_alien is True, "race_alien default is wrong"
         assert settings.race_predator is True, "race_predator default is wrong"
-        assert settings.npc_type == 1, "npc_type default is wrong"
-        assert settings.mix_drone == 1, "mix_drone default is wrong"
+        # An enum identifier is a string, not a number. The list is built by a
+        # callback so it can follow the object's kind, and a callback enum has no
+        # default to resolve -- Blender lands on the first item. Every entry that
+        # needs a creature sets it explicitly, so this is the bare-object value.
+        assert settings.npc_type == "0", "npc_type default is wrong"
+        # Zero like the other fourteen, so a fresh generator is weightless and
+        # falls back to the level default instead of silently rolling drones.
+        assert settings.mix_drone == 0, "mix_drone default is wrong"
         # The fields must be writable, not read-only placeholders.
-        settings.npc_type = 8
-        assert holder.rif_placeable.npc_type == 8, "npc_type is not writable"
+        settings.npc_type = "8"
+        assert holder.rif_placeable.npc_type == "8", "npc_type is not writable"
     finally:
         if holder is not None:
             bpy.data.objects.remove(holder, do_unlink=True)
@@ -2120,21 +2126,21 @@ def test_zero_weight_generator_still_writes_settings():
 
 
 @test
-def test_default_enemy_generator_starts_with_no_weights():
-    """Placing a Default Enemy Generator must preset every proportion to zero.
+def test_no_default_enemy_generator_entry():
+    """The menu has one spawning generator, not two.
 
-    The property group defaults `mix_drone` to 1 so a Mixed generator does
-    something useful immediately. That default would be wrong here: it turns the
-    fallback into a hard-coded drone generator and ignores GLOGENDC.
+    `Default Enemy Generator` existed only as "a generator with no weights": the
+    engine still honours that (`Objsetup.cpp:3105` falls back to GLOGENDC's
+    creature when every weight is zero), but two menu entries that differ by a
+    table the engine treats as optional made the choice look bigger than it is.
+    A Mixed generator with all zeros is the same object.
     """
     placeables = load_package_module("placeables")
-    spec = [s for s in placeables.PLACEABLES
-            if s.kind == placeables.KIND_DEFAULT_ENEMY]
-    assert spec, "no Default Enemy Generator entry in the menu"
-    presets = spec[0].flags
-    for field in ("mix_drone", "mix_predalien", "mix_praetorian"):
-        assert presets.get(field) == 0, \
-            f"{field} must be preset to 0, got {presets.get(field)!r}"
+    kinds = {spec.kind for spec in placeables.PLACEABLES
+             if spec.category == placeables.CAT_GENERATOR}
+    assert placeables.KIND_DEFAULT_ENEMY not in kinds, (
+        "the Default Enemy Generator entry is still in the menu")
+    assert placeables.KIND_WEIGHTED in kinds, "the spawning generator went missing"
 
 
 @test

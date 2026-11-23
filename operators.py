@@ -1123,14 +1123,22 @@ def _collect_spawns(context, objs=None):
             # A fixed alien reads this bit as "start dormant"; everything else
             # reads it as "do not run". Both are the same bit in the file, so
             # the property is chosen here rather than at the call site.
+            npc_type = int(settings.npc_type)
             inactive = (bool(getattr(settings, "dormant", False))
-                        if settings.npc_type in placeables.DORMANT_NPC_TYPES
+                        if npc_type in placeables.DORMANT_NPC_TYPES
                         else bool(settings.inactive))
-            flags = generator_flags(inactive=inactive)
-            npc_type = settings.npc_type
+            # The difficulty bits are inverted and only a fixed creature honours
+            # them: a spawning generator never reaches `create_strategies_from_list`.
+            allowed = [name for name, on in (("easy", settings.diff_easy),
+                                            ("medium", settings.diff_medium),
+                                            ("hard", settings.diff_hard)) if on]
+            flags = generator_flags(inactive=inactive, difficulty=allowed)
         elif kind in (placeables.KIND_DEFAULT_ENEMY,
                       placeables.KIND_WEIGHTED):
-            flags = generator_flags(advanced=True, inactive=settings.inactive)
+            flags = generator_flags(
+                advanced=True, inactive=settings.inactive,
+                use_own_rate=bool(getattr(settings, "use_own_rate", False)),
+                use_own_limit=bool(getattr(settings, "use_own_limit", False)))
             npc_type = 0
         elif kind == placeables.KIND_GLOBAL_GENERATOR:
             # Not a generator itself: it is the marker that asks for a
@@ -1181,8 +1189,16 @@ def _collect_spawns(context, objs=None):
             else 0,
             "texture_id": settings.texture_id,
         }
+        if kind == placeables.KIND_WEIGHTED:
+            # GENEXSET's three numbers. `BH_GENER.C:195` reads the rate only when
+            # AVPGENFLAG_USEOWNRATE is set, and `:299` reads the limit only with
+            # USEOWNLIMIT, so both flags and values travel together.
+            spec["generation_rate"] = int(getattr(settings, "own_rate", 0))
+            spec["gen_rate_increase"] = int(
+                getattr(settings, "own_rate_increase", 0))
+            spec["gen_limit"] = int(getattr(settings, "own_max_npcs", 0))
         if (kind == placeables.KIND_NPC
-                and getattr(settings, "npc_type", 0) == 9):
+                and int(getattr(settings, "npc_type", 0)) == 9):
             # `att->ammo = (agc->extra1 << 8) + agc->extra2` (Objsetup.cpp:2823).
             # The only entry that reads these bytes as a count; the Xenoborg
             # reads them as UpTime and ModuleRange, so this stays conditional.
@@ -2406,9 +2422,13 @@ def _module_layout_problems(objs, hierarchy, visibility=None):
                 + ", ".join(lonely[:4])
                 + ". Add them to a Links list, or parent them")
 
+    # Module boxes overlapping is normal: a connector is built to sit inside the
+    # corridor it joins, and on a level that plays correctly five pairs overlap
+    # by 37% of the smaller box. Reporting that was reporting the content as a
+    # defect, so the check is gone. Only modules that touch nothing are named.
     boxes = [(obj.name, _world_box(obj)) for obj in objs]
     boxes = [(name, box) for name, box in boxes if box is not None]
-    overlapping, isolated = set(), []
+    isolated = []
     for index, (name, box) in enumerate(boxes):
         low, high = box
         touches = False
@@ -2421,17 +2441,9 @@ def _module_layout_problems(objs, hierarchy, visibility=None):
             if any(gap < -0.001 for gap in gaps):
                 continue
             touches = True
-            if all(gap > 0.001 for gap in gaps):
-                overlapping.add(" / ".join(sorted((name, other_name))))
         if not touches:
             isolated.append(name)
 
-    if overlapping:
-        problems.append(
-            "Modules overlap instead of touching: "
-            + ", ".join(sorted(overlapping)[:4])
-            + ". The engine expects modules to meet at a face; move them apart "
-              "or expect the level to misbehave in game")
     if isolated:
         problems.append(
             "Modules touch nothing, so the player falls into empty space beside "
@@ -2531,7 +2543,10 @@ def _budget_layout_problems(context, spawns):
     if budget is None:
         return [
             "The scene has generators but no Global Generator Data. GLOGENDC "
-            "is what gives them a budget, so nothing would ever spawn"]
+            "is what sets their budget; without it the engine falls back to "
+            "its own defaults: 25 creatures at once, 4 a minute rising by 2, "
+            "and always aliens. Add Global Generator Data to choose the enemy "
+            "and the numbers yourself, or leave it out to keep those values"]
 
     problems = []
     if not budget.get("npcs_per_minute"):

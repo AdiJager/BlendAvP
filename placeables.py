@@ -227,6 +227,73 @@ class RIF_OT_module_link_remove(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class RIF_OT_module_link_auto(bpy.types.Operator):
+    """Fill the link list from the modules whose boxes touch this one.
+
+    The neighbour source is geometry, the way inteng gets one from a visibility
+    pass (`autolink_pass.h`): it only looks at what can be reached, not at every
+    module in the level. Here that is a box test rather than a render, so a module
+    behind a wall but touching it will be linked as well.
+
+    A pair counts as adjacent when their world boxes overlap on at least two axes
+    and are no further apart than `TOLERANCE` on the third -- an opening, not a
+    corner. Names already in the list are left alone, and existing rows keep their
+    order, so the button can be pressed again after adding a module.
+    """
+
+    bl_idname = "rif.module_link_auto"
+    bl_label = "Auto"
+    bl_options = {"REGISTER", "UNDO"}
+
+    #: How far apart two boxes may be on the contact axis and still touch, in metres.
+    TOLERANCE = 0.05
+
+    def execute(self, context):
+        """Append one row per adjacent module and report what was found."""
+        from .operators import _world_box
+
+        obj = context.active_object
+        if obj is None or not hasattr(obj, "rif_module_links"):
+            return {"CANCELLED"}
+        box = _world_box(obj)
+        if box is None:
+            self.report({"WARNING"}, "This module has no geometry to measure")
+            return {"CANCELLED"}
+
+        low, high = box
+        known = {link.target_name for link in obj.rif_module_links}
+        found = []
+        for other in context.scene.objects:
+            if other is obj or other.type != "MESH":
+                continue
+            if getattr(other, "rif_object_type", None) != "MODULE":
+                continue
+            if not other.name or other.name in known:
+                continue
+            other_box = _world_box(other)
+            if other_box is None:
+                continue
+            o_low, o_high = other_box
+            gaps = [min(high[a], o_high[a]) - max(low[a], o_low[a])
+                    for a in range(3)]
+            # A corner touch gives an overlap on one axis only; an opening gives
+            # two, because the modules face each other across the contact axis.
+            if sum(1 for gap in gaps if gap > 0.0) < 2:
+                continue
+            if any(gap < -self.TOLERANCE for gap in gaps):
+                continue
+            found.append(other.name)
+
+        for name in sorted(found):
+            link = obj.rif_module_links.add()
+            link.target_name = name
+        if found:
+            self.report({"INFO"}, f"Linked {len(found)} adjacent module(s)")
+        else:
+            self.report({"INFO"}, "No adjacent module found")
+        return {"FINISHED"}
+
+
 class RIF_SwitchTarget(bpy.types.PropertyGroup):
     """One object a switch sends to, named the way the artist named it."""
 
@@ -320,15 +387,14 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         description="Which AvP chunk this object becomes on export",
         default=KIND_NPC,
     )
-    npc_type: bpy.props.IntProperty(
+    npc_type: bpy.props.EnumProperty(
         name="NPC Type",
         description=(
-            "AVPGENER.type. 1 Drone, 5 Predalien, 8 Praetorian spawn in a "
-            "network game; 2/3/4/6/7/9 are single player only"
+            "AVPGENER.type: which creature this entry places. Drone, Predalien "
+            "and Praetorian also work in skirmish and co-op; the rest are "
+            "single player only and are silently skipped in a network game"
         ),
-        default=1,
-        min=0,
-        max=9,
+        items=lambda self, context: _npc_type_items(self),
     )
     sound_wav: bpy.props.EnumProperty(
         name="Sound",
@@ -533,84 +599,84 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
             "Relative chance of a marine with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_flame_marine: bpy.props.IntProperty(
         name="Flamethrower",
         description=(
             "Relative chance of a marine with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_smart_marine: bpy.props.IntProperty(
         name="Smartgun",
         description=(
             "Relative chance of a marine with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_sadar_marine: bpy.props.IntProperty(
         name="SADAR",
         description=(
             "Relative chance of a marine with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_grenade_marine: bpy.props.IntProperty(
         name="Grenade launcher",
         description=(
             "Relative chance of a marine with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_minigun_marine: bpy.props.IntProperty(
         name="Minigun",
         description=(
             "Relative chance of a marine with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_pistol_marine: bpy.props.IntProperty(
         name="Pistol",
         description=(
             "Relative chance of a marine with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_shotgun_civilian: bpy.props.IntProperty(
         name="Shotgun",
         description=(
             "Relative chance of a civilian with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_pistol_civilian: bpy.props.IntProperty(
         name="Pistol",
         description=(
             "Relative chance of a civilian with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_flame_civilian: bpy.props.IntProperty(
         name="Flamethrower",
         description=(
             "Relative chance of a civilian with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_unarmed_civilian: bpy.props.IntProperty(
         name="Unarmed",
         description=(
             "Relative chance of a civilian with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     mix_molotov_civilian: bpy.props.IntProperty(
         name="Molotov",
         description=(
             "Relative chance of a civilian with this weapon. The engine rolls "
             "against the sum of all fifteen weights, so only the proportions "
             "matter -- 1 and 2 behave like 10 and 20"),
-        default=0, min=0, max=10000)
+        default=0, min=0, max=1000)
     death_damage: bpy.props.IntProperty(
         name="Damage",
         description=(
@@ -791,23 +857,26 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
             "The three values are relative to each other, so 2/1/1 means "
             "half drones and a quarter each of the others"
         ),
-        default=1,
+        # Zero, like the other fourteen: a generator with no weights falls back
+        # to the level's default creature (`Objsetup.cpp:3105`), which is a
+        # legitimate setup and what the panel reports.
+        default=0,
         min=0,
-        max=100,
+        max=1000,
     )
     mix_predalien: bpy.props.IntProperty(
         name="Predalien",
         description="Share of this generator's output that should be Predaliens",
         default=0,
         min=0,
-        max=100,
+        max=1000,
     )
     mix_praetorian: bpy.props.IntProperty(
         name="Praetorian",
         description="Share of this generator's output that should be Praetorians",
         default=0,
         min=0,
-        max=100,
+        max=1000,
     )
     enemy_kind: EnumProperty(
         name="Default Enemy",
@@ -822,6 +891,65 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
              "Generators without weights spawn marines with pulse rifles"),
         ),
         default="aliens",
+    )
+    diff_easy: BoolProperty(
+        name="Easy",
+        description=(
+            "This creature appears on Easy. Clearing it sets "
+            "AVPGENFLAG_NOTDIFFICULTY1, and the engine drops it when the level "
+            "starts on that difficulty (Objsetup.cpp:597, then the filter at "
+            ":489). Retail gates facehuggers this way"),
+        default=True,
+    )
+    diff_medium: BoolProperty(
+        name="Medium",
+        description="This creature appears on Medium (AVPGENFLAG_NOTDIFFICULTY2)",
+        default=True,
+    )
+    diff_hard: BoolProperty(
+        name="Hard",
+        description=(
+            "This creature appears on Hard and Impossible "
+            "(AVPGENFLAG_NOTDIFFICULTY3). `create_strategies_from_list` treats "
+            "both with the same bit"),
+        default=True,
+    )
+    use_own_rate: BoolProperty(
+        name="Use own rate",
+        description=(
+            "AVPGENFLAG_USEOWNRATE. This generator keeps its own speed instead "
+            "of the level's NPCs per minute, and climbs by its own increase. "
+            "The level's Acceleration stops applying to it"),
+        default=False,
+    )
+    own_rate: IntProperty(
+        name="NPCs per minute",
+        description=(
+            "GenerationRate for this generator alone. The engine stores it "
+            "multiplied by 100, which the exporter does when writing it "
+            "(Objsetup.cpp:3068). Read only when Use own rate is on"),
+        default=4, min=0, max=100,
+    )
+    own_rate_increase: IntProperty(
+        name="Increase per minute",
+        description=(
+            "How much the rate climbs every 60 seconds while Use own rate is on "
+            "(BH_GENER.C:194-205)"),
+        default=2, min=0, max=100,
+    )
+    use_own_limit: BoolProperty(
+        name="Use own NPC limit",
+        description=(
+            "AVPGENFLAG_USEOWNLIMIT. This generator stops at its own number of "
+            "creatures instead of the level's Max NPCs"),
+        default=False,
+    )
+    own_max_npcs: IntProperty(
+        name="Max alive",
+        description=(
+            "How many creatures this generator may keep alive at once. Read "
+            "only when Use own NPC limit is on"),
+        default=25, min=0, max=255,
     )
     max_npcs: IntProperty(
         name="Max NPCs",
@@ -1053,18 +1181,7 @@ PLACEABLES = (
 
     # -- Generator roles that are not a fixed NPC -------------------------
     _PlaceableSpec(
-        "gen_default", "Default Enemy Generator", (
-            "Spawns whatever the level names as its default enemy - aliens or "
-            "humans, set in Global Generator Data. The simplest way to "
-            "populate a level: place it, and enemies come to you."),
-        "MESH_UVSPHERE", CAT_GENERATOR, KIND_DEFAULT_ENEMY,
-        # Every proportion zero, so the generator carries no weights and the
-        # engine falls back to GLOGENDC's creature. Leaving the shared default
-        # of 1 here would make it roll for drones instead, which ignores the
-        # level setting the entry exists to honour.
-        flags={"mix_drone": 0, "mix_predalien": 0, "mix_praetorian": 0}),
-    _PlaceableSpec(
-        "gen_weighted", "Mixed Enemy Generator", (
+        "gen_weighted", "NPC Generator", (
             "Spawns several kinds of enemy in proportions you choose, rather "
             "than just one. This is what skirmish and coop maps use for their "
             "bots. Only Alien Drones, Predaliens and Praetorians ever appear "
@@ -1155,7 +1272,7 @@ PLACEABLES = (
             "GLOGENDC: one per level. Sets the default enemy kind, the NPC "
             "limit, spawns per minute, and the hive state change time. Placing "
             "a second one is a mistake - the game reads a single chunk."),
-        "EMPTY_AXIS", CAT_GAMEPLAY, KIND_GLOBAL_GENERATOR),
+        "EMPTY_AXIS", CAT_GENERATOR, KIND_GLOBAL_GENERATOR),
     _PlaceableSpec(
         "pickup_weapon", "Weapon  (choose none)", (
             "Placeholder entry kept for the category; use one of the specific "
@@ -1450,6 +1567,7 @@ class RIF_PT_module(bpy.types.Panel):
                 row.prop(link, "target_name", text=f"Module {index + 1}")
             row = box.row(align=True)
             row.operator("rif.module_link_add", icon="ADD")
+            row.operator("rif.module_link_auto", icon="AUTO")
             row.operator("rif.module_link_remove", icon="REMOVE")
             if not len(obj.rif_module_links):
                 box.label(text="Used when Link Mode is By List", icon="INFO")
@@ -1850,6 +1968,17 @@ bpy.types.Material.rif_material_light_corona = bpy.props.BoolProperty(
         "is the centre of its polygon, so it can sit away from the lamp's "
         "origin. Only one corona per object takes effect, and it does nothing "
         "unless the object is a light"),
+    default=False)
+
+# ---- an invisible surface still stops the player ------------------------
+bpy.types.Material.rif_material_invisible = bpy.props.BoolProperty(
+    name="Invisible",
+    description=(
+        "iflag_notvis: the polygons are not drawn but still collide. Players, "
+        "NPCs and objects stop at them exactly as at a wall, which is how a "
+        "level gets a barrier it does not want to show. Bullets are the "
+        "exception: `bh_weap.c:1066` sets IgnoresNotVisPolys, so shots pass "
+        "straight through"),
     default=False)
 
 bpy.types.Object.rif_placed_switch = bpy.props.BoolProperty(
@@ -2583,7 +2712,7 @@ def _make_operator(spec):
             obj.rif_placeable.kind = spec.kind
         if spec.legacy_marker is not None:
             obj[MARKER_PROP] = spec.legacy_marker
-        obj.rif_placeable.npc_type = spec.npc_type
+        obj.rif_placeable.npc_type = str(spec.npc_type)
         if spec.pickup_type is not None:
             obj.rif_placeable.pickup_type = spec.pickup_type
         for key, value in spec.flags.items():
@@ -2624,8 +2753,9 @@ PLACEABLE_OPERATORS = {spec.key: _make_operator(spec) for spec in PLACEABLES}
 #: inactive flag as "start `ABS_Dormant`" instead of "do not run".
 DORMANT_NPC_TYPES = (1, 5, 8)
 
-#: Order the groups appear in, and the words the separator is about.
-GROUP_ORDER = ("generator", "alien", "solo")
+#: Order the groups appear in. `budget` is the level-wide data, which decides
+#: what every generator below it may produce, so it sits above them all.
+GROUP_ORDER = ("budget", "generator", "alien", "solo")
 
 
 def _entry_group(spec):
@@ -2638,11 +2768,52 @@ def _entry_group(spec):
     """
     if spec.category != CAT_GENERATOR:
         return "solo" if "(single player)" in spec.label else "any"
+    if spec.kind == KIND_GLOBAL_GENERATOR:
+        # The level-wide budget, not a placement: it belongs above the generators
+        # because it is what gives them a rate and a ceiling.
+        return "budget"
     if spec.npc_type == 0:
         return "generator"
     if spec.npc_type in DORMANT_NPC_TYPES:
         return "alien"
     return "solo"
+
+
+#: What a weight-table generator can actually produce: the three aliens
+#: `BH_GENER.C` has `CreateAlienDynamic` calls for. Marines come from the weights
+#: too, but each is a weapon variant rather than a type, so they are not listed
+#: here -- `Default Enemy` decides whether marines appear at all.
+GENERATOR_NPC_TYPES = ("0", "1", "5", "8")
+
+
+def _npc_type_items(settings):
+    """Return the NPC Type list that fits the object it is drawn on.
+
+    A fixed creature can be any of the nine. A spawning generator cannot make a
+    Queen or a Sentry Turret at all, so offering them would be offering a choice
+    that silently does nothing.
+    """
+    all_items = [
+        ("0", "None (a generator)", "AVPGENER.type 0: no fixed creature, "
+         "the entry spawns enemies instead"),
+        ("1", "Alien Drone", "AVPGENER.type 1: skirmish, co-op and single "
+         "player"),
+        ("2", "Predator", "AVPGENER.type 2: single player only"),
+        ("3", "Facehugger", "AVPGENER.type 3: single player only"),
+        ("4", "Xenoborg", "AVPGENER.type 4: single player only"),
+        ("5", "Predalien", "AVPGENER.type 5: skirmish, co-op and single "
+         "player"),
+        ("6", "Queen", "AVPGENER.type 6: single player only"),
+        ("7", "Marine", "AVPGENER.type 7: single player only, weapon chosen "
+         "by Sub Type"),
+        ("8", "Praetorian", "AVPGENER.type 8: skirmish, co-op and single "
+         "player"),
+        ("9", "Sentry Turret", "AVPGENER.type 9: single player only"),
+    ]
+    kind = getattr(settings, "kind", "")
+    if kind in (KIND_DEFAULT_ENEMY, KIND_WEIGHTED):
+        return [item for item in all_items if item[0] in GENERATOR_NPC_TYPES]
+    return all_items
 
 
 def _draw_category(layout, category):
@@ -2718,13 +2889,26 @@ class RIF_PT_placeable(bpy.types.Panel):
             box.label(text="Alien is off in skirmish (maxAlien = 0)",
                       icon="INFO")
 
-        if kind in (KIND_NPC, KIND_DEFAULT_ENEMY, KIND_WEIGHTED):
+        if kind == KIND_NPC:
+            # Only a fixed creature has these. A spawning generator forces its
+            # type to 0 and takes its weapon from a weight, so both fields used
+            # to sit there doing nothing.
             layout.prop(settings, "npc_type")
-            if settings.npc_type == 7:
-                layout.prop(settings, "sub_type")
-            if settings.npc_type == 2:
+            if int(settings.npc_type) in (2, 7):
                 layout.prop(settings, "sub_type")
             layout.prop(settings, "texture_id")
+            difficulty = layout.box()
+            difficulty.label(text="Appears on difficulty", icon="SORT_ASC")
+            row = difficulty.row(align=True)
+            row.prop(settings, "diff_easy", toggle=True)
+            row.prop(settings, "diff_medium", toggle=True)
+            row.prop(settings, "diff_hard", toggle=True)
+            if not (settings.diff_easy or settings.diff_medium
+                    or settings.diff_hard):
+                # All three set means every difficulty drops the creature, which
+                # is the same as not placing it at all.
+                difficulty.label(text="Never appears on any difficulty",
+                                 icon="ERROR")
             box = layout.box()
             box.label(text="Behavior", icon="OPTIONS")
             box.prop(settings, "mission")
@@ -2739,12 +2923,15 @@ class RIF_PT_placeable(bpy.types.Panel):
             # fixed creature, so the entry that created the object decides the
             # label. `npc_type` is what separates the two.
             if (getattr(settings, "kind", "") == KIND_NPC
-                    and getattr(settings, "npc_type", 0)
+                    and int(getattr(settings, "npc_type", 0))
                     in DORMANT_NPC_TYPES):
                 box.prop(settings, "dormant")
             else:
                 box.prop(settings, "inactive")
-            box.prop(settings, "excluded_hard")
+            # `Not on hard difficulty` is not drawn: it writes
+            # AVPGENFLAG_NOTDIFFICULTY3, a bit the game defines and never reads.
+            # Only placed objects honour the difficulty bits, through the
+            # separate OBJECT_FLAG_NOTDIFFICULTY set.
             if (getattr(settings, "kind", "") == KIND_NPC
                     and getattr(settings, "npc_type", 0) == 9):
                 # The turret's only ammunition is this field: the engine takes
@@ -2777,8 +2964,22 @@ class RIF_PT_placeable(bpy.types.Panel):
             if not any(getattr(settings, f)
                        for f in ("mix_drone", "mix_predalien",
                                  "mix_praetorian", "mix_pulse_marine")):
-                box.label(text="No weights: the level's default creature", 
-                          icon="ERROR")
+                # Not an error: `Objsetup.cpp:3105` gives a weightless generator
+                # the level's default creature, which is a legitimate setup.
+                box.label(text="No weights: the level's default creature",
+                          icon="INFO")
+
+            timing = layout.box()
+            timing.label(text="Timing", icon="TIME")
+            timing.prop(settings, "use_own_rate")
+            column = timing.column()
+            column.enabled = settings.use_own_rate
+            column.prop(settings, "own_rate")
+            column.prop(settings, "own_rate_increase")
+            timing.prop(settings, "use_own_limit")
+            column = timing.column()
+            column.enabled = settings.use_own_limit
+            column.prop(settings, "own_max_npcs")
 
         if kind == KIND_MISSION_OBJECTIVE:
             box = layout.box()
@@ -2993,6 +3194,14 @@ class RIF_PT_material_avp(bpy.types.Panel):
             box.label(text="Needs a light on the object to do anything",
                       icon="INFO")
 
+        box = layout.box()
+        box.label(text="Invisible barrier", icon="MOD_MASK")
+        box.prop(material, "rif_material_invisible")
+        if getattr(material, "rif_material_invisible", False):
+            box.label(text="Not drawn, but still solid", icon="INFO")
+            box.label(text="Players and NPCs stop at it; bullets pass through",
+                      icon="INFO")
+
 
 class RIF_PT_world_audio(bpy.types.Panel):
     """Audio settings for the current level, kept on the scene's World.
@@ -3046,6 +3255,7 @@ CLASSES = (
     RIF_SwitchTarget,
     RIF_ModuleLink,
     RIF_OT_module_link_add,
+    RIF_OT_module_link_auto,
     RIF_OT_module_link_remove,
     RIF_OT_switch_target_add,
     RIF_OT_switch_target_remove,

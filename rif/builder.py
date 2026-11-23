@@ -208,6 +208,13 @@ def _slot_flags(mesh):
         if material is not None and getattr(
                 material, "rif_material_light_corona", False):
             value |= POLY_FLAG_LIGHT_CORONA | POLY_FLAG_NOT_VISIBLE
+        if material is not None and getattr(
+                material, "rif_material_invisible", False):
+            # Not drawn, still solid: `Dynamics.c:2699` only steps over a notvis
+            # polygon when the moving object carries `IgnoresNotVisPolys`, and the
+            # only thing that sets it is a weapon (`bh_weap.c:1066`). So players
+            # and NPCs collide, shots pass through.
+            value |= POLY_FLAG_NOT_VISIBLE
         flags.append(value)
     return flags
 

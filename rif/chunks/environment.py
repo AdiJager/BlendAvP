@@ -156,6 +156,16 @@ GEN_MODEFLAGSSET = 0x00000001
 GEN_GAMEMODE_MARINE = 0x00000800
 GEN_GAMEMODE_ALIEN = 0x00001000
 GEN_GAMEMODE_PREDATOR = 0x00002000
+# These three are inverted: the bit means "NOT on this difficulty". `Objsetup.cpp:597`
+# reads them through the identically numbered OBJECT_FLAG_NOTDIFFICULTY set, and
+# `create_strategies_from_list` (`:489`) drops the creature on a difficulty whose
+# bit is set. Retail uses all three: three facehugger generators in Invasion.RIF
+# carry 0x00100000 and 0x00200000.
+GEN_NOT_EASY = 0x00100000
+GEN_NOT_MEDIUM = 0x00200000
+GEN_NOT_HARD = 0x00400000
+GEN_USEOWNRATE = 0x04000000
+GEN_USEOWNLIMIT = 0x02000000
 GEN_ADVANCEDGENERATOR = 0x08000000
 GEN_MULTIPLAYERSTART = 0x40000000
 GEN_INACTIVE = 0x80000000
@@ -165,12 +175,21 @@ ORIENTATION_UNITS_PER_TURN = 4096
 
 
 def generator_flags(races=("marine", "alien", "predator"), inactive=False,
-                    multiplayer_start=False, advanced=False):
+                    multiplayer_start=False, advanced=False,
+                    use_own_rate=False, use_own_limit=False,
+                    difficulty=("easy", "medium", "hard")):
     """Return the AVPGENER flag word for the given roles and races.
 
     `MODEFLAGSSET` is set unconditionally: all 1480 retail generators carry it,
     and it marks the race bits as meaningful. The race bits themselves are read
     by the engine only on MULTIPLAYERSTART generators.
+
+    `difficulty` lists the levels this creature appears on. The bits are stored
+    inverted, so a level that is not listed gets its bit set: `AddToBehaviourList`
+    receives the generator's flags (`Objsetup.cpp:2805`) and turns them into
+    `diff_easy`/`diff_medium`/`diff_hard`, which `create_strategies_from_list`
+    then filters on. This works for a fixed creature only -- a spawning generator
+    never reaches that list.
     """
     flags = GEN_MODEFLAGSSET
     if "marine" in races:
@@ -183,8 +202,21 @@ def generator_flags(races=("marine", "alien", "predator"), inactive=False,
         flags |= GEN_MULTIPLAYERSTART | GEN_ADVANCEDGENERATOR
     if advanced:
         flags |= GEN_ADVANCEDGENERATOR
+    # `BH_GENER.C:195` reads this as "use my own rate instead of the level's",
+    # and `:299` reads the limit one. Both were hardcoded to zero before.
+    if use_own_rate:
+        flags |= GEN_USEOWNRATE
+    if use_own_limit:
+        flags |= GEN_USEOWNLIMIT
     if inactive:
         flags |= GEN_INACTIVE
+    # Inverted: a bit set means "not on that difficulty".
+    if "easy" not in difficulty:
+        flags |= GEN_NOT_EASY
+    if "medium" not in difficulty:
+        flags |= GEN_NOT_MEDIUM
+    if "hard" not in difficulty:
+        flags |= GEN_NOT_HARD
     return flags
 
 
