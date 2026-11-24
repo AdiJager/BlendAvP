@@ -56,16 +56,19 @@ CAT_SOUND = "SOUND"
 CAT_EFFECTS = "EFFECTS"
 CAT_MORPH = "MORPH"
 
+#: The Add > AvP categories, alphabetical by label. The order here is the order
+#: the menu draws, so it is kept sorted rather than grouped by what the entries
+#: are for: an author looking for "Pickups" scans a list, not a taxonomy.
 CATEGORY_LABELS = (
-    (CAT_MODULE, "Modules"),
-    (CAT_PLAYER_START, "Player Start"),
-    (CAT_GENERATOR, "NPC Generator"),
-    (CAT_PICKUP, "Pickups"),
-    (CAT_OBJECT, "Objects"),
-    (CAT_SOUND, "Sound"),
     (CAT_EFFECTS, "Effects"),
-    (CAT_NAVIGATION, "Navigation"),
     (CAT_GAMEPLAY, "Gameplay"),
+    (CAT_GENERATOR, "Generators"),
+    (CAT_MODULE, "Modules"),
+    (CAT_NAVIGATION, "Navigation"),
+    (CAT_OBJECT, "Objects"),
+    (CAT_PICKUP, "Pickups"),
+    (CAT_PLAYER_START, "Player Start"),
+    (CAT_SOUND, "Sound"),
 )
 
 # Generator kinds, matching the roles found in retail (`AVPGENER.type` + flags).
@@ -1266,6 +1269,46 @@ PLACEABLES = (
             "nothing, silently. 570 of them across 44 levels. Spark and flame "
             "also light the room; steam and black smoke only emit"),
         "EMPTY_SINGLE_ARROW", CAT_EFFECTS, KIND_PARTICLE_GENERATOR),
+
+    # -- Preconfigured emitters -------------------------------------------
+    # The engine has four emitter types and `PARGEN_DEFAULTS` already carries the
+    # numbers retail uses for each, so these entries are that mechanism with a
+    # menu name: setting `particle_type` fires `_apply_particle_defaults`.
+    _PlaceableSpec(
+        "particle_spark", "Sparks", (
+            "PARGENER type 0: fifteen sparks and a flash of light, 272 of them "
+            "across the shipped levels. Lights the room as well as emitting, so "
+            "a few go a long way"),
+        "EMPTY_SINGLE_ARROW", CAT_EFFECTS, KIND_PARTICLE_GENERATOR,
+        flags={"particle_type": "0"}),
+    _PlaceableSpec(
+        "particle_steam", "Steam", (
+            "PARGENER type 1: a white plume, 178 in retail. Emits no light, and "
+            "the retail rate is 0 -- one particle a second that does not move, "
+            "which is what a vent looks like. Raise Rate and Speed for a jet"),
+        "EMPTY_SINGLE_ARROW", CAT_EFFECTS, KIND_PARTICLE_GENERATOR,
+        flags={"particle_type": "1"}),
+    _PlaceableSpec(
+        "particle_smoke", "Black Smoke", (
+            "PARGENER type 2: dark smoke, 55 in retail. Emits no light. Useful "
+            "behind a fire to give it something to rise through"),
+        "EMPTY_SINGLE_ARROW", CAT_EFFECTS, KIND_PARTICLE_GENERATOR,
+        flags={"particle_type": "2"}),
+    _PlaceableSpec(
+        "particle_flame", "Flame", (
+            "PARGENER type 3: fire, 65 in retail, and the only other type that "
+            "lights the room. Pair it with Black Smoke for a burning room"),
+        "EMPTY_SINGLE_ARROW", CAT_EFFECTS, KIND_PARTICLE_GENERATOR,
+        flags={"particle_type": "3"}),
+    _PlaceableSpec(
+        "particle_waterfall", "Waterfall", (
+            "A cascade: seven Steam emitters, the centre one the parent and the "
+            "rest its children, laid out the way Fall.RIF does its waterfall -- "
+            "retail has no waterfall type, the effect is the count and the "
+            "spacing. Move the parent and the whole fall follows; raise Rate and "
+            "Speed on all seven for a heavier flow"),
+        "EMPTY_SINGLE_ARROW", CAT_EFFECTS, KIND_PARTICLE_GENERATOR,
+        flags={"particle_type": "1"}),
 
     _PlaceableSpec(
         "global_generator", "Global Generator Data", (
@@ -2486,6 +2529,40 @@ def _shape_mesh_for(spec, context, operator=None):
     return shape_reader.build_mesh(shape, stem, stem=stem)
 
 
+def _add_waterfall_emitters(context, parent):
+    """Scatter the extra steam emitters a waterfall is made of, as children.
+
+    `Fall.RIF` builds its waterfall from seven Steam generators placed along the
+    drop, all with frequency, speed and quantity at zero -- one slow plume each,
+    together reading as falling water. There is no waterfall type in the engine;
+    the effect is the count and the spacing.
+
+    The offsets are Fall's own, taken relative to its fourth emitter and divided
+    by ten, so the whole thing fits a room instead of the level's 110 m shaft.
+    Dividing keeps the shape: a slanted cascade rather than a straight column.
+    Coordinates are converted from the file's frame (`x, y, z` -> `x, z, -y`).
+    """
+    offsets = ((-6.11, -0.08, -0.39), (-2.58, -1.96, -0.79),
+               (-2.20, -1.55, -0.78), (0.24, 3.46, 0.80),
+               (1.50, 10.86, -0.77), (-1.13, 8.04, -0.01))
+    for index, (rif_x, rif_y, rif_z) in enumerate(offsets, start=2):
+        child = bpy.data.objects.new(
+            f"{parent.name} {index}", None)
+        child.empty_display_type = "SINGLE_ARROW"
+        child.empty_display_size = 0.5
+        child.parent = parent
+        child.location = (rif_x, rif_z, -rif_y)
+        child[PLACEABLE_PROP] = KIND_PARTICLE_GENERATOR
+        child.rif_placeable.kind = KIND_PARTICLE_GENERATOR
+        # Type first: setting it fires `_apply_particle_defaults`, so the numbers
+        # copied below are the ones that survive.
+        child.rif_placeable.particle_type = parent.rif_placeable.particle_type
+        child.rif_placeable.particle_frequency = parent.rif_placeable.particle_frequency
+        child.rif_placeable.particle_quantity = parent.rif_placeable.particle_quantity
+        child.rif_placeable.particle_speed = parent.rif_placeable.particle_speed
+        context.collection.objects.link(child)
+
+
 def _make_operator(spec):
     """Build the operator class for one menu entry.
 
@@ -2525,6 +2602,8 @@ def _make_operator(spec):
             if spec.scale:
                 obj.scale = spec.scale
             _sync_pickup_variant(obj, spec)
+            if spec.key == "particle_waterfall":
+                _add_waterfall_emitters(context, obj)
             for other in context.selected_objects:
                 other.select_set(False)
             obj.select_set(True)
@@ -2723,6 +2802,8 @@ def _make_operator(spec):
             obj.scale = spec.scale
         _sync_pickup_variant(obj, spec)
         context.collection.objects.link(obj)
+        if spec.key == "particle_waterfall":
+            _add_waterfall_emitters(context, obj)
 
         for other in context.selected_objects:
             other.select_set(False)
@@ -2755,7 +2836,9 @@ DORMANT_NPC_TYPES = (1, 5, 8)
 
 #: Order the groups appear in. `budget` is the level-wide data, which decides
 #: what every generator below it may produce, so it sits above them all.
-GROUP_ORDER = ("budget", "generator", "alien", "solo")
+#: `preset` holds the named emitters, which belong below the plain Particle
+#: Generator they are shortcuts for.
+GROUP_ORDER = ("budget", "preset", "generator", "alien", "solo")
 
 
 def _entry_group(spec):
@@ -2766,6 +2849,10 @@ def _entry_group(spec):
     the rest are single player only. The label suffix is what says the last one,
     because it is also the only place the user sees it.
     """
+    if spec.category == CAT_EFFECTS:
+        # The named emitters are shortcuts for the plain entry above them, so
+        # they come after it, below a rule.
+        return "any" if spec.key == "particle_generator" else "preset"
     if spec.category != CAT_GENERATOR:
         return "solo" if "(single player)" in spec.label else "any"
     if spec.kind == KIND_GLOBAL_GENERATOR:
