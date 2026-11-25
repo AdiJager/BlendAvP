@@ -253,7 +253,7 @@ class RIF_OT_module_link_auto(bpy.types.Operator):
 
     def execute(self, context):
         """Append one row per adjacent module and report what was found."""
-        from .operators import _world_box
+        from .operators import _is_module, _world_box
 
         obj = context.active_object
         if obj is None or not hasattr(obj, "rif_module_links"):
@@ -267,11 +267,12 @@ class RIF_OT_module_link_auto(bpy.types.Operator):
         known = {link.target_name for link in obj.rif_module_links}
         found = []
         for other in context.scene.objects:
-            if other is obj or other.type != "MESH":
+            if other is obj or other.name in known:
                 continue
-            if getattr(other, "rif_object_type", None) != "MODULE":
-                continue
-            if not other.name or other.name in known:
+            # One definition of "is a module", shared with Link Modules: a
+            # marker's mesh is a cube or a sphere, and its `rif_object_type`
+            # keeps the default "MODULE", so the type alone is not enough.
+            if not _is_module(other):
                 continue
             other_box = _world_box(other)
             if other_box is None:
@@ -382,6 +383,10 @@ def _pickup_variant_items(self, context):
     return [(str(number), label, "") for number, label in variants]
 
 
+#: The weapon codes each of the three type 7 entries may use, split the way
+#: `NPCSETUP.CPP:419` splits them, because that is what decides the model: the
+#: military codes load `hnpcmarine.RIF`, every other code `hnpc_civvie.RIF`.
+#: The aliases (31, 32 to the shotgun, 41 and 91 to the pistol) are left out.
 class RIF_PlaceableSettings(bpy.types.PropertyGroup):
     """Per-object settings for a placed AvP gameplay object."""
 
@@ -736,6 +741,92 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         default=0,
         min=0,
     )
+    marine_group: bpy.props.EnumProperty(
+        name="Group",
+        description=(
+            "Which of the three type 7 entries placed this creature. It decides "
+            "the weapon list and which model's accoutrements apply, so it is set "
+            "by the menu entry and not by hand"),
+        items=(
+            ("marine", "Marine", "Military model, hnpcmarine.RIF"),
+            ("civilian", "Civilian", "Civilian model, hnpc_civvie.RIF"),
+            ("android", "Android", "Civilian model, sub_type 120"),
+        ),
+        default="marine",
+    )
+    weapon_marine: bpy.props.EnumProperty(
+        name="Weapon",
+        description=(
+            "AVPGENER.sub_type for a military marine (Objsetup.cpp:2499). These "
+            "are the codes that load hnpcmarine.RIF (NPCSETUP.CPP:419); an "
+            "unknown code falls back to the pulse rifle"),
+        items=(
+            ("0", "Pulse Rifle", "MNPCW_PulseRifle"),
+            ("5", "Marine Pistol", "MNPCW_PistolMarine"),
+            ("10", "Smartgun", "MNPCW_Smartgun"),
+            ("20", "Grenade Launcher", "MNPCW_GrenadeLauncher"),
+            ("50", "Flamethrower", "MNPCW_Flamethrower"),
+            ("60", "SADAR", "MNPCW_SADAR"),
+            ("70", "Minigun", "MNPCW_Minigun"),
+        ),
+        default="0",
+    )
+    weapon_civilian: bpy.props.EnumProperty(
+        name="Weapon",
+        description=(
+            "AVPGENER.sub_type for a civilian (Objsetup.cpp:2499). These are the "
+            "codes that load hnpc_civvie.RIF (NPCSETUP.CPP:419). A scientist is "
+            "a civilian with a different accoutrement, not a kind of its own"),
+        items=(
+            ("30", "Shotgun", "MNPCW_MShotgun"),
+            ("40", "Civilian Pistol", "MNPCW_MPistol"),
+            ("80", "Molotov", "MNPCW_MMolotov"),
+            ("90", "Scientist", "MNPCW_MPistol with a scientist accoutrement"),
+            ("100", "Civilian Flamethrower", "MNPCW_MFlamer"),
+            ("110", "Unarmed Civilian", "MNPCW_MUnarmed, no weapon at all"),
+        ),
+        default="30",
+    )
+    weapon_android: bpy.props.EnumProperty(
+        name="Weapon",
+        description=(
+            "An android has one code, 120, and its weapon is part of that entry "
+            "rather than a separate choice: MNPCW_Android carries a shotgun, "
+            "the 'Android shotgun' hierarchy and its own muzzle flash "
+            "(Bh_marin.c:648)"),
+        items=(("120", "Android (shotgun)",
+                "MNPCW_Android: hnpc_civvie with the Android shotgun "
+                "hierarchy, 8-round clip"),),
+        default="120",
+    )
+    predator_primary: bpy.props.EnumProperty(
+        name="Primary",
+        description=(
+            "The Predator's main weapon: bits 0-2 of AVPGENER.sub_type "
+            "(Objsetup.cpp:2599)"),
+        items=(
+            ("0", "Pistol", "PNPCW_Pistol"),
+            ("1", "Wristblade", "PNPCW_Wristblade"),
+            ("2", "Plasma Caster", "PNPCW_PlasmaCaster"),
+            ("3", "Staff", "PNPCW_Staff"),
+        ),
+        default="0",
+    )
+    predator_secondary: bpy.props.EnumProperty(
+        name="Secondary",
+        description=(
+            "The Predator's backup weapon: bits 3-5 of AVPGENER.sub_type "
+            "(Objsetup.cpp:2618). The engine forces the two to differ "
+            "(`:2637`), so picking the same one twice gives a wristblade -- or "
+            "a pistol, if the primary was a wristblade"),
+        items=(
+            ("0", "Pistol", "PNPCW_Pistol"),
+            ("1", "Wristblade", "PNPCW_Wristblade"),
+            ("2", "Plasma Caster", "PNPCW_PlasmaCaster"),
+            ("3", "Staff", "PNPCW_Staff"),
+        ),
+        default="3",
+    )
     sub_type: bpy.props.IntProperty(
         name="Weapon / Variant",
         description=(
@@ -756,9 +847,48 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         items=_pickup_variant_items,
     )
 
+    predator_profile: bpy.props.EnumProperty(
+        name="Personal Profile",
+        description=(
+            "Which Predator fights here. AVPGENER.textureID indexes "
+            "`predatorCV[]` in Bh_pred.c:153, so this is a combat profile and "
+            "not a skin: health, speed, armour, whether it carries the shoulder "
+            "cannon, how it paces its shots, and how readily it cloaks. Values "
+            "above 4 are clamped, so these five are the whole list. Standard is "
+            "the only one retail ships: all 26 placed Predators across the 63 "
+            "levels use 0, so the other four are known from the table and never "
+            "tested by the game's own data"),
+        items=(
+            ("0", "Standard",
+             "800 health, 8000 speed, armour 200, shoulder cannon, cloaking 2"),
+            ("1", "Heavy",
+             "1000 health, 7000 speed, armour 500, no cannon, cloaking 4"),
+            ("2", "Skirmisher",
+             "600 health, 10000 speed, armour 10, cannon, cloaking 8"),
+            ("3", "Light",
+             "600 health, 8000 speed, armour 200, no cannon, cloaking 2"),
+            ("4", "Elite",
+             "1000 health, 9000 speed, armour 100, cannon, cloaking 6"),
+        ),
+        default="0",
+    )
+    marine_accoutrement: bpy.props.EnumProperty(
+        name="Accoutrement",
+        description=(
+            "Which gear set this creature wears: AVPGENER.textureID reaches "
+            "`ChangeToAlternateAccoutrementSet` (Bh_marin.c:1882), which swaps "
+            "helmet, armour and face sections and also sets the voice and "
+            "whether the model is female. The list follows Weapon/Variant, "
+            "because that decides which model is loaded (NPCSETUP.CPP:419): the "
+            "military codes use hnpcmarine.RIF with 11 collections, every other "
+            "code uses hnpc_civvie.RIF with 19"),
+        items=lambda self, context: _accoutrement_items(self),
+    )
     texture_id: bpy.props.IntProperty(
         name="Model Variant",
-        description="AVPGENER.textureID: which model/skin number to use",
+        description=(
+            "AVPGENER.textureID, the raw number. The panel shows Personal "
+            "Profile or Accoutrement instead, depending on the creature"),
         default=0,
         min=0,
         max=255,
@@ -1172,10 +1302,25 @@ PLACEABLES = (
         "MESH_CONE", CAT_GENERATOR, KIND_NPC, npc_type=6),
     _PlaceableSpec(
         "gen_marine", "Marine  (single player)", (
-            "AVPGENER type 7. Weapon chosen by sub_type: 0 pulse, 5 pistol, "
-            "10 smartgun, 20 grenade, 30-32 shotgun, 50 flamer, 60 SADAR, "
-            "70 minigun. 100-120 are civilians. Single player only."),
-        "MESH_UVSPHERE", CAT_GENERATOR, KIND_NPC, npc_type=7),
+            "AVPGENER type 7, military model: pulse rifle, marine pistol, "
+            "smartgun, grenade launcher, flamethrower, SADAR or minigun. Single "
+            "player only."),
+        "MESH_UVSPHERE", CAT_GENERATOR, KIND_NPC, npc_type=7,
+        flags={"marine_group": "marine"}),
+    _PlaceableSpec(
+        "gen_civilian", "Civilian  (single player)", (
+            "AVPGENER type 7, civilian model: shotgun, civilian pistol, "
+            "molotov, scientist's pistol, civilian flamethrower or unarmed. The "
+            "scientist is a civilian with a different accoutrement, not a kind "
+            "of its own. Single player only."),
+        "MESH_UVSPHERE", CAT_GENERATOR, KIND_NPC, npc_type=7,
+        flags={"marine_group": "civilian"}),
+    _PlaceableSpec(
+        "gen_android", "Android  (single player)", (
+            "AVPGENER type 7, civilian model with sub_type 120. Single player "
+            "only."),
+        "MESH_UVSPHERE", CAT_GENERATOR, KIND_NPC, npc_type=7,
+        flags={"marine_group": "android"}),
     _PlaceableSpec(
         "gen_sentry", "Sentry Turret  (single player)", (
             "AVPGENER type 9. Shoots anything not human. Single player only, "
@@ -1262,8 +1407,7 @@ PLACEABLES = (
         "EMPTY_SINGLE_ARROW", CAT_GAMEPLAY, KIND_MESSAGE),
 
     _PlaceableSpec(
-        "particle_generator", "Particle Generator  (spark, steam, smoke, "
-        "flame)", (
+        "particle_generator", "Particle Generator", (
             "An emitter. It runs only while its module is VISIBLE, which is the "
             "opposite of an enemy generator -- one the player can never see does "
             "nothing, silently. 570 of them across 44 levels. Spark and flame "
@@ -1610,7 +1754,7 @@ class RIF_PT_module(bpy.types.Panel):
                 row.prop(link, "target_name", text=f"Module {index + 1}")
             row = box.row(align=True)
             row.operator("rif.module_link_add", icon="ADD")
-            row.operator("rif.module_link_auto", icon="AUTO")
+            row.operator("rif.module_link_auto", icon="SNAP_ON")
             row.operator("rif.module_link_remove", icon="REMOVE")
             if not len(obj.rif_module_links):
                 box.label(text="Used when Link Mode is By List", icon="INFO")
@@ -2718,13 +2862,16 @@ def _make_operator(spec):
                      (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
             mesh.from_pydata(verts, [], faces)
             mesh.update()
-            # A room's faces look at whoever stands inside it. Flipping is
-            # clearer than reversing six winding orders by hand, and it cannot
-            # be got wrong one face at a time.
-            mesh.flip_normals()
             if spec.kind == KIND_MODULE_ROOM:
-                # Three surfaces, because a ceiling is not a wall: it is lit
-                # from below, it is never walked on, and the levels give it its
+                # A room's faces look at whoever stands inside it. Flipping is
+                # clearer than reversing six winding orders by hand, and it
+                # cannot be got wrong one face at a time. A door is a solid slab
+                # and keeps the outward winding `from_pydata` gave it: flipping
+                # it too made every face of the door leaf point inward, which the
+                # engine drew from the wrong side.
+                mesh.flip_normals()
+            if spec.kind == KIND_MODULE_ROOM:
+                # Three surfaces, because a ceiling is not a wall: it is lit                # from below, it is never walked on, and the levels give it its
                 # own material. Backface culling is on for all three, matching
                 # the rest of the exporter -- the engine draws single-sided
                 # polygons with no culling, so leaving it off would show the
@@ -2873,6 +3020,81 @@ def _entry_group(spec):
 GENERATOR_NPC_TYPES = ("0", "1", "5", "8")
 
 
+#: `sub_type` codes that load the military marine. `NPCSETUP.CPP:419` lists them;
+#: every other code loads the civilian, and the two models carry different
+#: `HSETCOLL` sets, so one accoutrement list cannot serve both.
+MILITARY_MARINE_CODES = (0, 5, 10, 20, 50, 60, 70)
+
+#: The marine weapon codes, one entry per distinct outcome. `Objsetup.cpp:2499`
+#: maps several codes onto one weapon (31 and 32 to the shotgun, 41 and 91 to the
+#: civilian pistol), and nothing else reads `sub_type`, so the aliases are left
+#: out rather than shown as separate choices.
+MARINE_WEAPONS = (
+    ("0", "Pulse Rifle", "Military model, pulse rifle"),
+    ("5", "Marine Pistol", "Military model, pistol"),
+    ("10", "Smartgun", "Military model, smartgun"),
+    ("20", "Grenade Launcher", "Military model, grenade launcher"),
+    ("30", "Shotgun", "Civilian model, shotgun"),
+    ("40", "Civilian Pistol", "Civilian model, pistol"),
+    ("50", "Flamethrower", "Military model, flamethrower"),
+    ("60", "SADAR", "Military model, rocket launcher"),
+    ("70", "Minigun", "Military model, minigun"),
+    ("80", "Molotov", "Civilian model, molotov"),
+    ("100", "Civilian Flamethrower", "Civilian model, flamethrower"),
+    ("110", "Unarmed Civilian", "Civilian model, no weapon"),
+    ("120", "Android", "Civilian model, android"),
+)
+
+#: The Predator weapon bits: `sub_type & 7` is the primary and `>> 3 & 7` the
+#: secondary (`Objsetup.cpp:2599` and `:2618`). Values 4..7 fall to the default,
+#: which is the pistol, so only four are offered.
+PREDATOR_WEAPONS = (
+    ("0", "Pistol", "PNPCW_Pistol"),
+    ("1", "Wristblade", "PNPCW_Wristblade"),
+    ("2", "Plasma Caster", "PNPCW_PlasmaCaster"),
+    ("3", "Staff", "PNPCW_Staff"),
+)
+
+#: `hnpcmarine.RIF` names its collections 2..10, so `num_shape_collections` is 11
+#: (`Projload.cpp:732`). Index 0 is caught by `Projload.cpp:1687` and means
+#: "random"; 1 has no chunk, so the array entry is zero and nothing changes.
+MILITARY_ACCOUTREMENTS = (
+    ("2", "Officer"), ("3", "Marine 2"), ("4", "Marine 3"), ("5", "Captain"),
+    ("6", "Officer 2"), ("7", "Officer 3"), ("8", "Hat"),
+    ("9", "Smart Gunner"), ("10", "Smart Gunner 2"),
+)
+
+#: `hnpc_civvie.RIF` names its collections 2..18, so `num_shape_collections` is 19.
+CIVILIAN_ACCOUTREMENTS = (
+    ("2", "Female with jacket"), ("3", "Male with comm set"),
+    ("4", "Female generic"), ("5", "Male with cap and comm"),
+    ("6", "Male crew cut"), ("7", "Female with comm"),
+    ("8", "Female, jacket and hat"), ("9", "Female, jacket and black T"),
+    ("10", "Male, jacket and black T"), ("11", "Female, black T"),
+    ("12", "Male face 2"), ("13", "Male face 3"),
+    ("14", "Female face 2"), ("15", "Female face 3"),
+    ("16", "Scientist 1"), ("17", "Scientist 2"), ("18", "Scientist 3"),
+)
+
+
+def _accoutrement_items(settings):
+    """Return the accoutrement list that fits the model this entry will load.
+
+    The two marine models keep separate sets of `HSETCOLL` chunks, so an index
+    means a different face depending on which one is loaded. Offering the wrong
+    list would let an author pick 16 on a military marine and get nothing.
+    """
+    group = getattr(settings, "marine_group", "marine")
+    named = (MILITARY_ACCOUTREMENTS if group == "marine"
+             else CIVILIAN_ACCOUTREMENTS)
+    return (("0", "Random",
+             "The game picks one of the named sets (Projload.cpp:1687)"),
+            ("1", "No change",
+             "An index the file does not define leaves the model as loaded"),
+            ) + tuple((value, label, f"HSETCOLL {value}, '{label}'")
+                      for value, label in named)
+
+
 def _npc_type_items(settings):
     """Return the NPC Type list that fits the object it is drawn on.
 
@@ -2980,10 +3202,37 @@ class RIF_PT_placeable(bpy.types.Panel):
             # Only a fixed creature has these. A spawning generator forces its
             # type to 0 and takes its weapon from a weight, so both fields used
             # to sit there doing nothing.
-            layout.prop(settings, "npc_type")
+            # Civilian and Android are type 7 as well, so `npc_type` would read
+            # "Marine" on them and say nothing. Marine itself keeps it, because
+            # there the value is the entry's own identity.
+            if not (int(settings.npc_type) == 7
+                    and getattr(settings, "marine_group", "") in
+                    ("civilian", "android")):
+                layout.prop(settings, "npc_type")
             if int(settings.npc_type) in (2, 7):
-                layout.prop(settings, "sub_type")
-            layout.prop(settings, "texture_id")
+                # `sub_type` means two different things: a single weapon code
+                # for a marine and a bitfield of two weapons for a Predator,
+                # where bits 0-2 are the primary and 3-5 the secondary
+                # (Objsetup.cpp:2499, :2599, :2618). One field cannot say both.
+                if int(settings.npc_type) == 2:
+                    layout.prop(settings, "predator_primary")
+                    layout.prop(settings, "predator_secondary")
+                else:
+                    group = getattr(settings, "marine_group", "marine")
+                    layout.prop(settings, {
+                        "marine": "weapon_marine",
+                        "civilian": "weapon_civilian",
+                        "android": "weapon_android",
+                    }.get(group, "weapon_marine"))
+                # `textureID` means two different things and only reaches two
+                # creatures: `add_marine` (Objsetup.cpp:2432) uses it as an
+                # accoutrement index, `add_predator` (:2596) as the combat profile
+                # `predatorCV[]`. `add_alien` never reads it, and the other
+                # creatures have no variant at all.
+                if int(settings.npc_type) == 2:
+                    layout.prop(settings, "predator_profile")
+                else:
+                    layout.prop(settings, "marine_accoutrement")
             difficulty = layout.box()
             difficulty.label(text="Appears on difficulty", icon="SORT_ASC")
             row = difficulty.row(align=True)
@@ -2996,19 +3245,26 @@ class RIF_PT_placeable(bpy.types.Panel):
                 # is the same as not placing it at all.
                 difficulty.label(text="Never appears on any difficulty",
                                  icon="ERROR")
-            box = layout.box()
-            box.label(text="Behavior", icon="OPTIONS")
-            box.prop(settings, "mission")
-            if settings.mission == "5":
-                # Only a patrol reads a route, so it is offered only then:
-                # a picker that is ignored is worse than no picker.
-                box.prop(settings, "patrol_path")
-                if not settings.patrol_path:
-                    box.label(text="A patrol needs a route",
-                              icon="ERROR")
+            if int(settings.npc_type) == 7:
+                # `Mission` is read only by `add_marine` (`Objsetup.cpp:2462`);
+                # `add_alien` never mentions it, and the other creatures have
+                # their own behaviour instead. A route picker on a Drone was a
+                # field nothing could act on, and choosing one that does not
+                # start in the route trips the engine's own `GLOBALASSERT`.
+                box = layout.box()
+                box.label(text="Behavior", icon="OPTIONS")
+                box.prop(settings, "mission")
+                if settings.mission == "5":
+                    # Only a patrol reads a route, so it is offered only then:
+                    # a picker that is ignored is worse than no picker.
+                    box.prop(settings, "patrol_path")
+                    if not settings.patrol_path:
+                        box.label(text="A patrol needs a route",
+                                  icon="ERROR")
             # The same flag means "disabled" to a generator and "asleep" to a
             # fixed creature, so the entry that created the object decides the
             # label. `npc_type` is what separates the two.
+            box = layout.box()
             if (getattr(settings, "kind", "") == KIND_NPC
                     and int(getattr(settings, "npc_type", 0))
                     in DORMANT_NPC_TYPES):
@@ -3019,8 +3275,11 @@ class RIF_PT_placeable(bpy.types.Panel):
             # AVPGENFLAG_NOTDIFFICULTY3, a bit the game defines and never reads.
             # Only placed objects honour the difficulty bits, through the
             # separate OBJECT_FLAG_NOTDIFFICULTY set.
+            # `npc_type` is an enum, so its identifier is a string: comparing it
+            # to the number 9 was always false and the turret's ammo field
+            # quietly disappeared when the property became an enum.
             if (getattr(settings, "kind", "") == KIND_NPC
-                    and getattr(settings, "npc_type", 0) == 9):
+                    and int(getattr(settings, "npc_type", 0)) == 9):
                 # The turret's only ammunition is this field: the engine takes
                 # it from the generator's spare bytes and overrides its own
                 # default, so leaving it at zero leaves the gun empty.

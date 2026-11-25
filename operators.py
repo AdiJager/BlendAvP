@@ -1185,10 +1185,15 @@ def _collect_spawns(context, objs=None):
             "type": npc_type,
             "flags": flags,
             "name": obj.name,
-            "sub_type": settings.sub_type if kind == placeables.KIND_NPC
-            else 0,
+            "sub_type": _sub_type_for(settings, kind),
             "texture_id": settings.texture_id,
         }
+        # The panel splits `textureID` into two fields because it means two
+        # things; the file has one byte, so the creature picks the source.
+        if kind == placeables.KIND_NPC and int(settings.npc_type) == 2:
+            spec["texture_id"] = int(getattr(settings, "predator_profile", "0"))
+        elif kind == placeables.KIND_NPC and int(settings.npc_type) == 7:
+            spec["texture_id"] = int(getattr(settings, "marine_accoutrement", 0))
         if kind == placeables.KIND_WEIGHTED:
             # GENEXSET's three numbers. `BH_GENER.C:195` reads the rate only when
             # AVPGENFLAG_USEOWNRATE is set, and `:299` reads the limit only with
@@ -1345,6 +1350,49 @@ def _has_placeables(context):
         if obj.type == "MESH" and obj.get(PLACEABLE_PROP) in wanted:
             return True
     return False
+
+
+def _sub_type_for(settings, kind):
+    """Return the `AVPGENER.sub_type` byte for this object.
+
+    The panel splits it into three fields because it means three things: a marine
+    weapon code, and a Predator's primary and secondary weapon packed as two
+    three-bit fields (`Objsetup.cpp:2599` and `:2618`). Everything else writes the
+    raw value the artist typed.
+    """
+    from . import placeables
+
+    if kind != placeables.KIND_NPC:
+        return 0
+    npc_type = int(getattr(settings, "npc_type", 0))
+    if npc_type == 7:
+        group = getattr(settings, "marine_group", "marine")
+        field = {"marine": "weapon_marine", "civilian": "weapon_civilian",
+                 "android": "weapon_android"}.get(group, "weapon_marine")
+        return int(getattr(settings, field, 0))
+    if npc_type == 2:
+        primary = int(getattr(settings, "predator_primary", 0))
+        secondary = int(getattr(settings, "predator_secondary", 0))
+        return (primary & 7) | ((secondary & 7) << 3)
+    return int(settings.sub_type)
+
+
+def _is_module(obj):
+    """Return True when the object is level geometry, not a placeable marker.
+
+    The two are told apart by `PLACEABLE_PROP`, not by `rif_object_type`:
+    a waypoint is a wireframe cube and a sound emitter is a sphere, and every
+    marker keeps the default `rif_object_type` of "MODULE" because nothing ever
+    changes it. Checking the type first let markers into the module scans twice,
+    in `Link Modules` and in the Links panel's Auto button, so the test lives here
+    now and both call it.
+    """
+    from .placeables import PLACEABLE_PROP
+
+    return (obj is not None
+            and getattr(obj, "type", None) == "MESH"
+            and PLACEABLE_PROP not in obj
+            and getattr(obj, "rif_object_type", None) == "MODULE")
 
 
 def _gather_meshes(context, selected_only=False):
@@ -2768,9 +2816,9 @@ class RIF_OT_link_modules(bpy.types.Operator):
         """Return the modules worth scanning, leaving out door leaves."""
         targets = []
         for obj in scene.objects:
-            if getattr(obj, "rif_object_type", None) != "MODULE":
+            if not _is_module(obj):
                 continue
-            if obj.type != "MESH" or not obj.data.polygons:
+            if not obj.data.polygons:
                 continue
             parent = obj.parent
             if parent is not None and getattr(parent, "rif_module_door", False):
