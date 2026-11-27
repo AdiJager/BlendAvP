@@ -1075,27 +1075,11 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         ),
         default=False,
     )
-    link_target: bpy.props.PointerProperty(
-        name="Target Waypoint",
-        description="The waypoint this link points at",
-        type=bpy.types.Object,
-    )
-    link_oneway: bpy.props.BoolProperty(
-        name="One way",
-        description=(
-            "linkflag_oneway. Waypoint links form a directed graph; with this "
-            "on the link is only usable in one direction"
-        ),
-        default=False,
-    )
-    link_reversed: bpy.props.BoolProperty(
-        name="Reversed",
-        description=(
-            "linkflag_reversed_oneway. One way, but in the opposite direction "
-            "to the object's own facing"
-        ),
-        default=False,
-    )
+    # `link_target`, `link_oneway` and `link_reversed` used to sit here and were
+    # read by nothing: the graph comes from proximity (`rif/waypoints.py`) and
+    # `link_entries` writes ALIEN_ONLY on every link, because a link without that
+    # bit can never be climbed (`Bh_waypt.c:895`). They implied an authoring the
+    # exporter never did, so they are gone.
     patrol_closed: bpy.props.BoolProperty(
         name="Closed loop",
         description=(
@@ -1530,17 +1514,21 @@ PLACEABLES = (
 
     _PlaceableSpec(
         "fmv_screen", "FMV Screen", (
-            "A quad whose texture is FMVs\\triggered_plot.RIM. The engine swaps "
-            "that texture for the film frames, so every polygon using it plays "
-            "at once. Before and after a film the screen shows noise the engine "
-            "generates itself, so there is nothing to author for the "
-            "transition. Fill in a Film on a Message to start one; note that "
-            "every FMV screen in the level shows the same film"),
+            "A square 1.2 m quad whose texture is FMVs\\triggered_plot.RIM. The "
+            "engine swaps that texture for the film frames, so every polygon "
+            "using it plays at once. The game makes a 128 x 128 surface for a "
+            "screen and the film is 128 x 96, so it fills the top 96 rows and "
+            "the rest keeps the still image: square, not 4:3. Before and after a "
+            "film the screen shows noise the engine generates itself, so there "
+            "is nothing to author for the transition. A level holds at most 10 "
+            "screens (MAX_NO_FMVTEXTURES) and they all show the same film"),
         "MESH_PLANE", CAT_GAMEPLAY, KIND_SIMPLE_OBJECT,
         object_flags={"rif_object_type": "SIMPLE_OBJECT",
                       "rif_fragments": True,
                       "rif_destructible": True,
-                      "rif_integrity": 3}),
+                      "rif_integrity": 3,
+                      "rif_video_screen": True,
+                      "rif_screen_glow": True}),
 
     _PlaceableSpec(
         "particle_generator", "Particle Generator", (
@@ -1802,15 +1790,30 @@ PLACEABLES = (
 #: (`smacker.c:129`), so any name under that folder works.
 FMV_TEXTURE = "FMVs\\triggered_plot.RIM"
 
+#: Where the film starts inside the 128-row surface, in Blender's UV terms. The
+#: film is 128 by 96 and the engine writes it into rows 0..95 from the top
+#: (`SmackerPlayback.cpp:220`), which is Blender's v 1.0 down to 0.25; the 32 rows
+#: below keep whatever the still picture had, so a quad that sampled them would
+#: show a strip of nothing.
+FILM_V_START = 1.0 - 96.0 / 128.0
+
 
 def _create_fmv_screen(context, spec):
-    """Return a 4:3 screen quad with the FMV material on it.
+    """Return a square screen with the FMV material and its four quarters.
 
-    A quad and nothing more: the preset is a screen surface, not a monitor, so
-    the author drops it into a wall, a desk or a laptop of their own. One
-    polygon means there is no question of which face is the screen.
+    A quad and nothing more: the preset is a screen surface, not a monitor, so the
+    author drops it into a wall, a desk or a laptop of their own. One polygon means
+    there is no question of which face is the screen.
     """
-    width, height = 1.6, 1.2
+    # Square, because the surface the game makes for a screen is `FMV_SIZE` by
+    # `FMV_SIZE` (128 by 128, d3d_render.cpp:58). The film is 128 by 96 and fills
+    # the top 96 rows, so a 4:3 quad would stretch the picture and squeeze the
+    # rows the film never writes.
+    # 4:3, the shape of the picture. The engine's surface is 128 by 128
+    # (`FMV_SIZE`, d3d_render.cpp:58) but the film is 128 by 96 and writes only the
+    # top 96 rows, so the quad takes the film's proportions and the UVs below cover
+    # exactly those rows.
+    width, height = 1.2, 0.9
     mesh = bpy.data.meshes.new("FMV Screen")
     mesh.from_pydata([(-width / 2, 0.0, -height / 2),
                       (width / 2, 0.0, -height / 2),
@@ -1818,30 +1821,69 @@ def _create_fmv_screen(context, spec):
                       (-width / 2, 0.0, height / 2)],
                      [], [(0, 1, 2, 3)])
     mesh.update()
+    # The whole picture, once. Without this layer the exporter writes zero for
+    # every corner and the surface samples a single texel.
+    _uv_layer(mesh, (0.0, 1.0, FILM_V_START, 1.0))
 
-    from .rif.texture_library import RIM_PATH_PROP
-
-    material = bpy.data.materials.new("FMV_Screen")
-    material.use_backface_culling = True
-    # The name is set here rather than derived from an image: the texture is
-    # already in the game's library, and `rim_name_for_material` passes a path
-    # without the `graphics\` prefix through unchanged.
-    material[RIM_PATH_PROP] = FMV_TEXTURE
-    mesh.materials.append(material)
+    mesh.materials.append(_make_fmv_material())
 
     obj = bpy.data.objects.new("FMV Screen", mesh)
     _add_screen_quarters(context, obj)
     return obj
 
 
+def _uv_layer(mesh, rect):
+    """Give a one-quad mesh a UV layer covering `(u0, u1, v0, v1)`.
+
+    The loops of a single quad follow its four corners in order, which is what
+    `from_pydata` built, so the four UVs line up without a lookup table.
+    """
+    u0, u1, v0, v1 = rect
+    layer = mesh.uv_layers.new(name="UVMap")
+    for index, uv in enumerate(((u0, v0), (u1, v0), (u1, v1), (u0, v1))):
+        layer.data[index].uv = uv
+    return layer
+
+
+def _make_fmv_material():
+    """Return the screen material, pointing at the game's `triggered_plot` name.
+
+    The engine decides a polygon is a screen by finding `FMVs` in the image name
+    (`smacker.c:129`), and retail's `BMPNAMES` carries exactly this string, so the
+    name is the marker. The file itself is not shipped: the game creates a 128 by
+    128 surface for the screen and fills it with noise or film. A generated image
+    of that size keeps Blender honest about the size and gives the material
+    something to show.
+    """
+    from .rif.texture_library import RIM_PATH_PROP
+
+    material = bpy.data.materials.new("FMV_Screen")
+    material.use_backface_culling = True
+    material[RIM_PATH_PROP] = FMV_TEXTURE
+
+    image = bpy.data.images.get("triggered_plot")
+    if image is None:
+        image = bpy.data.images.new("triggered_plot", 128, 128)
+
+    material.use_nodes = True
+    tree = material.node_tree
+    texture = tree.nodes.new("ShaderNodeTexImage")
+    texture.image = image
+    texture.location = (-320, 220)
+    surface = tree.nodes.get("Principled BSDF")
+    if surface is not None:
+        tree.links.new(texture.outputs["Color"], surface.inputs["Base Color"])
+    return material
+
+
 def _add_screen_quarters(context, parent):
-    """Cut a screen into four quarter children.
+    """Cut a screen into four quarter children, each keeping its slice of the UV.
 
     The parent is what the player shoots and these are what is left, which is how
     the exporter reads fragments: a mesh child of an object with `rif_fragments`
-    set. Quarters rather than shrunk copies, because a broken pane should look
-    like four pieces of one surface -- the built-in `pieces` path copies the
-    whole mesh and scales it down, which reads as four small screens.
+    set. Quarters rather than shrunk copies, because a broken pane should look like
+    four pieces of one surface -- the built-in `pieces` path copies the whole mesh
+    and scales it down, which reads as four small screens.
     """
     corners = [parent.matrix_world @ vertex.co for vertex in parent.data.vertices]
     low_x = min(c.x for c in corners)
@@ -1852,19 +1894,26 @@ def _add_screen_quarters(context, parent):
     mid_z = (low_z + high_z) / 2
     y = corners[0].y
 
-    for index, (x0, x1, z0, z1) in enumerate((
-            (low_x, mid_x, low_z, mid_z),
-            (mid_x, high_x, low_z, mid_z),
-            (low_x, mid_x, mid_z, high_z),
-            (mid_x, high_x, mid_z, high_z))):
+    middle_v = FILM_V_START + (1.0 - FILM_V_START) / 2.0
+    quarters = (
+        (low_x, mid_x, low_z, mid_z, 0.0, 0.5, FILM_V_START, middle_v),
+        (mid_x, high_x, low_z, mid_z, 0.5, 1.0, FILM_V_START, middle_v),
+        (low_x, mid_x, mid_z, high_z, 0.0, 0.5, middle_v, 1.0),
+        (mid_x, high_x, mid_z, high_z, 0.5, 1.0, middle_v, 1.0),
+    )
+    for index, (x0, x1, z0, z1, u0, u1, v0, v1) in enumerate(quarters):
         mesh = bpy.data.meshes.new(f"{parent.name} piece {index + 1}")
         mesh.from_pydata([(x0, y, z0), (x1, y, z0), (x1, y, z1), (x0, y, z1)],
                          [], [(0, 1, 2, 3)])
         mesh.update()
+        _uv_layer(mesh, (u0, u1, v0, v1))
         for material in parent.data.materials:
             mesh.materials.append(material)
         piece = bpy.data.objects.new(f"{parent.name} piece {index + 1}", mesh)
         piece.parent = parent
+        # Without this the piece keeps its world coordinates as local ones and is
+        # thrown off by the parent's own location the moment it is parented.
+        piece.matrix_parent_inverse = parent.matrix_world.inverted()
         context.collection.objects.link(piece)
 
 
@@ -3946,6 +3995,29 @@ def register_placeables():
             "polygons of a staircase. The engine's own comment calls this a "
             "hack, so mark only actual staircases"),
         default=False)
+    bpy.types.Object.rif_screen_glow = bpy.props.BoolProperty(
+        name="Glow",
+        description=(
+            "Make the screen light the room. The engine cannot do this for a "
+            "video screen: its light comes from PLOBJLIT, which only "
+            "add_placed_light reads, and that is never reached for a video "
+            "screen (Objsetup.cpp:2092). Retail agrees -- its 36 screens own no "
+            "light at all. Turning this on makes the object a placed light "
+            "(IOT_LIGHT, Type 16) instead, so it glows a fixed colour and can "
+            "still snow and play films, because those come from the texture "
+            "name and not from the strategy"),
+        default=True)
+    bpy.types.Object.rif_video_screen = bpy.props.BoolProperty(
+        name="Video screen",
+        description=(
+            "Makes this object an I_BehaviourVideoScreen. The strategy's Type "
+            "becomes IOT_ReservedForJohn, which is the only branch that reaches "
+            "`add_videoscreen` (Objsetup.cpp:2092), and the object is given one "
+            "placed light: the behaviour tints that light with the colour of the "
+            "film it is playing, which is what makes the screen glow. Without "
+            "this a screen still snows and plays films, it just never lights the "
+            "room"),
+        default=False)
     bpy.types.Object.rif_module_door = bpy.props.BoolProperty(
         name="Door",
         description=(
@@ -4024,6 +4096,8 @@ def unregister_placeables():
     del bpy.types.Object.rif_module_fog
     del bpy.types.Object.rif_module_airduct
     del bpy.types.Object.rif_module_stairs
+    del bpy.types.Object.rif_screen_glow
+    del bpy.types.Object.rif_video_screen
     del bpy.types.Object.rif_module_door
     del bpy.types.Object.rif_module_door_locked
     del bpy.types.Object.rif_module_door_proximity

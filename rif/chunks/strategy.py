@@ -73,6 +73,12 @@ IOT_ARMOUR = 5
 IOT_FIELD_CHARGE = 15
 IOT_LIGHT = 16
 
+#: `IOT_ReservedForJohn` (9). Rebellion named it after the artist, and it is the
+#: video screen: `add_newsimpleobject` sends exactly this type to
+#: `add_videoscreen` (`Objsetup.cpp:2092`), which is what gives a screen its
+#: `I_BehaviourVideoScreen` and, with it, the light it tints with the film.
+IOT_VIDEO_SCREEN = 9
+
 # `get_integrity()` masks this off: the top bit is junk left in a spare.
 INTEGRITY_MASK = 0x7FFFFFFF
 

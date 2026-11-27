@@ -1377,6 +1377,54 @@ def _sub_type_for(settings, kind):
     return int(settings.sub_type)
 
 
+def _fmv_case_problems(context):
+    """Return a problem for every material that spells `FMVs` in another case.
+
+    The engine's test is `strstr(ImageName, "FMVs")` (`smacker.c:129`), which is
+    case-sensitive, while opening the file is not. A path with `fmvs` therefore
+    draws but never registers, and the screen stays a still picture.
+    """
+    from .rif.texture_library import RIM_PATH_PROP
+
+    problems = []
+    seen = set()
+    for material in bpy.data.materials:
+        path = str(material.get(RIM_PATH_PROP) or "")
+        if not path or "FMVs" in path:
+            continue
+        if "fmvs" in path.lower() and path not in seen:
+            seen.add(path)
+            problems.append(
+                f"Texture '{path}' spells FMVs in the wrong case: the engine "
+                f"looks for the exact string FMVs, so this screen will never "
+                f"play a film or show noise")
+    return problems
+
+
+def _fmv_screen_problems(objs):
+    """Return a problem when the level holds more screens than the game keeps.
+
+    A screen is a mesh whose texture path contains `FMVs`, which is the same test
+    `smacker.c:129` makes. The engine records at most `MAX_NO_FMVTEXTURES` of them
+    (`smacker.c:100`), so the rest never show a film.
+    """
+    from .rif.texture_library import RIM_PATH_PROP
+
+    screens = 0
+    for obj in objs:
+        for material in getattr(obj.data, "materials", ()):
+            if material is None:
+                continue
+            path = material.get(RIM_PATH_PROP) or material.name or ""
+            if "FMVs" in str(path):
+                screens += 1
+                break
+    if screens > 10:
+        return [f"{screens} FMV screens: the game records at most 10 "
+                f"(MAX_NO_FMVTEXTURES), so the rest will never show a film"]
+    return []
+
+
 def _is_module(obj):
     """Return True when the object is level geometry, not a placeable marker.
 
@@ -2932,6 +2980,8 @@ class RIF_OT_validate_level(bpy.types.Operator):
                                               visibility))
         problems.extend(_sound_layout_problems(context))
         problems.extend(_waypoint_layout_problems(context))
+        problems.extend(_fmv_screen_problems(objs))
+        problems.extend(_fmv_case_problems(context))
         problems.extend(_path_layout_problems(context, objs))
 
         # ---- player start
