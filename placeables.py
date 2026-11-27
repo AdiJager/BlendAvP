@@ -1528,7 +1528,7 @@ PLACEABLES = (
                       "rif_destructible": True,
                       "rif_integrity": 3,
                       "rif_video_screen": True,
-                      "rif_screen_glow": True}),
+                      "rif_screen_glow": False}),
 
     _PlaceableSpec(
         "particle_generator", "Particle Generator", (
@@ -2078,6 +2078,23 @@ class RIF_PT_module(bpy.types.Panel):
                 acts.prop(obj, "rif_switch_press_state",
                           text=f"Press sends state 1 ({pressed})")
                 acts.prop(obj, "rif_switch_extra")
+                # For a message the number is not free-form: the engine reads it
+                # as an instruction, and only one value can make an inactive
+                # message appear. Saying so here is cheaper than discovering it in
+                # game, where the film simply never starts.
+                target_kind = (target.get(PLACEABLE_PROP)
+                               if target is not None else None)
+                if target_kind == KIND_MESSAGE:
+                    if obj.rif_switch_extra == 2:
+                        acts.label(text="Message: activate and display",
+                                   icon="CHECKMARK")
+                    elif obj.rif_switch_extra == 1:
+                        acts.label(text="Message: arm only, never displayed",
+                                   icon="ERROR")
+                    else:
+                        acts.label(text="Message: prints only if already active",
+                                   icon="ERROR")
+                    acts.label(text="A message needs Extra info 2")
 
                 timing = box.box()
                 timing.label(text="Behavior", icon="TIME")
@@ -3998,15 +4015,15 @@ def register_placeables():
     bpy.types.Object.rif_screen_glow = bpy.props.BoolProperty(
         name="Glow",
         description=(
-            "Make the screen light the room. The engine cannot do this for a "
-            "video screen: its light comes from PLOBJLIT, which only "
-            "add_placed_light reads, and that is never reached for a video "
-            "screen (Objsetup.cpp:2092). Retail agrees -- its 36 screens own no "
-            "light at all. Turning this on makes the object a placed light "
-            "(IOT_LIGHT, Type 16) instead, so it glows a fixed colour and can "
-            "still snow and play films, because those come from the texture "
-            "name and not from the strategy"),
-        default=True)
+            "Trade the film's sound for a light. The engine cannot do both: a "
+            "video screen's light never exists (PLOBJLIT is read only by "
+            "add_placed_light, which add_newsimpleobject never reaches for "
+            "IOT_ReservedForJohn, Objsetup.cpp:2092), and a placed light is not a "
+            "video screen -- so the film's volume, which is scaled by the "
+            "nearest video screen (FmvCutscenes.cpp:98 and :529-580), drops to "
+            "zero and the film plays silent. Leave this off for a screen that "
+            "should be heard, which is what retail does"),
+        default=False)
     bpy.types.Object.rif_video_screen = bpy.props.BoolProperty(
         name="Video screen",
         description=(

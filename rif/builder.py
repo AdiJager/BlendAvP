@@ -1285,12 +1285,16 @@ def _placed_light_for(obj):
     moves the light.
     """
     video_screen = bool(getattr(obj, "rif_video_screen", False))
-    if not (getattr(obj, "rif_placed_light", False) or video_screen):
+    # A light only when the screen took the glow, which is the same trade that
+    # makes it a placed light: with glow off it stays a video screen, and retail's
+    # 36 screens carry no PLOBJLIT at all.
+    glow = video_screen and bool(getattr(obj, "rif_screen_glow", False))
+    if not (getattr(obj, "rif_placed_light", False) or glow):
         return None
 
     from .chunks.light import PlacedLightChunk, pack_colour
 
-    if video_screen:
+    if glow:
         # A lamp that glows through a screen: white, one metre of brightness and a
         # five metre reach, which is what `bh_videoscreen.c:177` would have used.
         return PlacedLightChunk(brightness=1.0, range_mm=5000)

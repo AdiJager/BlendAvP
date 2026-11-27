@@ -1377,6 +1377,135 @@ def _sub_type_for(settings, kind):
     return int(settings.sub_type)
 
 
+def _silent_screen_problems(context):
+    """Return a problem for a screen that traded its sound for a light.
+
+    The film's volume is scaled by the nearest `I_BehaviourVideoScreen`
+    (`FmvCutscenes.cpp:98`), so a screen exported as a placed light plays its film
+    with no sound at all -- and quietly, since nothing else marks the change.
+    """
+    from . import placeables
+
+    problems = []
+    for obj in context.scene.objects:
+        if not getattr(obj, "rif_video_screen", False):
+            continue
+        if getattr(obj, "rif_screen_glow", False):
+            problems.append(
+                f"Screen {obj.name!r} has Glow on, so it is exported as a placed "
+                f"light and not as a video screen. The film's volume comes from "
+                f"the nearest video screen, so it will play in silence. Turn Glow "
+                f"off to hear it")
+    return problems
+
+
+def _message_trigger_problems(context):
+    """Return problems for messages that nothing can ever make appear.
+
+    The engine prints a message and starts its film only when the message is
+    already active (`bh_mission.c:125`), or when a request explicitly asks for
+    "activate and display" (`:114`). That request can come through a chain of
+    switches, so the switch graph is walked rather than sampled one hop deep.
+    """
+    from . import placeables
+
+    messages = [obj for obj in context.scene.objects
+                if obj.get(placeables.PLACEABLE_PROP) == placeables.KIND_MESSAGE]
+    if not messages:
+        return []
+
+    def targets(obj):
+        """Return the objects this one sends a request to."""
+        found = []
+        for attribute in ("rif_switch_target", "rif_trigger_target"):
+            found_target = getattr(obj, attribute, None)
+            if found_target is not None:
+                found.append(found_target)
+        return found
+
+    # Which messages a chain of switches can reach, and with what extra data it
+    # arrives: a switch that points at a message sends its own number.
+    reached = {}
+    for switch in context.scene.objects:
+        if getattr(switch, "rif_switch_target", None) is None:
+            continue
+        queue = [(switch, int(getattr(switch, "rif_switch_extra", 0)), 0)]
+        seen = set()
+        while queue:
+            sender, extra, depth = queue.pop()
+            if depth > 6:
+                continue
+            for target in targets(sender):
+                if target.name in seen:
+                    continue
+                seen.add(target.name)
+                if target.get(placeables.PLACEABLE_PROP) == placeables.KIND_MESSAGE:
+                    # The nearest sender wins: it is the one whose word arrives.
+                    reached.setdefault(target.name, (sender, extra))
+                elif getattr(target, "rif_switch_target", None) is not None:
+                    queue.append((target, int(getattr(target, "rif_switch_extra", 0)),
+                                  depth + 1))
+
+    problems = []
+    for message in messages:
+        settings = message.rif_placeable
+        if settings.message_shown_at_start:
+            continue
+        if message.name not in reached:
+            problems.append(
+                f"Message {message.name!r} is not active at start and no switch "
+                f"chain reaches it, so its line is never printed and its film "
+                f"never starts. Tick Show at start, or aim a switch at it")
+            continue
+        sender, extra = reached[message.name]
+        if extra != 2:
+            problems.append(
+                f"Message {message.name!r} is reached by {sender.name!r} with "
+                f"Extra info {extra}. A message needs 2 there: 0 only prints if "
+                f"the message is already active and 1 only arms it, so as it "
+                f"stands nothing shows and no film plays")
+    return problems
+
+
+def _film_number_problems(context):
+    """Return a problem for every Film number with no `message<N>.smk`.
+
+    The engine resolves a film by name and gives up silently when it is not there
+    (`smacker.c:266-289`), so a wrong number looks like a broken screen rather
+    than a missing file.
+    """
+    from . import placeables
+
+    if not placeables.FILM_NUMBERS:
+        game = placeables._game_directory(context)
+        if game:
+            placeables._scan_films(game)
+    if not placeables.FILM_NUMBERS:
+        return []
+
+    known = set(placeables.FILM_NUMBERS)
+    problems = []
+    seen = set()
+    for obj in bpy.data.objects:
+        if obj.get(placeables.PLACEABLE_PROP) != placeables.KIND_MESSAGE:
+            continue
+        settings = obj.rif_placeable
+        # The same choice the export makes: the film number replaces the text
+        # index, and when it is unset the text index stands in for it.
+        number = int(settings.film) or int(settings.message_string)
+        if number <= 0 or number in known or number in seen:
+            continue
+        seen.add(number)
+        source = ("Film number" if int(settings.film)
+                  else "its text number, because Film number is 0")
+        problems.append(
+            f"Message {obj.name!r} asks for film {number} ({source}) and there "
+            f"is no FMVs/message{number}.smk: the game gives up without a word, "
+            f"so the screen only snows and the line prints with no film. The "
+            f"shipped films are numbered {min(known)} to {max(known)}")
+    return problems
+
+
 def _fmv_case_problems(context):
     """Return a problem for every material that spells `FMVs` in another case.
 
@@ -2982,6 +3111,9 @@ class RIF_OT_validate_level(bpy.types.Operator):
         problems.extend(_waypoint_layout_problems(context))
         problems.extend(_fmv_screen_problems(objs))
         problems.extend(_fmv_case_problems(context))
+        problems.extend(_film_number_problems(context))
+        problems.extend(_silent_screen_problems(context))
+        problems.extend(_message_trigger_problems(context))
         problems.extend(_path_layout_problems(context, objs))
 
         # ---- player start
