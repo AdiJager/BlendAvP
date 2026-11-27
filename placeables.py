@@ -30,6 +30,9 @@ the annotation value, so the fields would silently never exist. `operators.py`
 avoids it for the same reason.
 """
 import math
+import re
+from pathlib import Path
+
 import bpy
 from bpy.props import (
     BoolProperty, EnumProperty, IntProperty, PointerProperty, StringProperty,
@@ -387,6 +390,110 @@ def _pickup_variant_items(self, context):
 #: `NPCSETUP.CPP:419` splits them, because that is what decides the model: the
 #: military codes load `hnpcmarine.RIF`, every other code `hnpc_civvie.RIF`.
 #: The aliases (31, 32 to the shotgun, 41 and 91 to the pistol) are left out.
+#: Film numbers found in the game's `FMVs` folder, refreshed by the panel. It is
+#: module state rather than a property so the enum can see it without Blender
+#: having to store a copy: the files are the authority, and a level built on a
+#: machine without the game simply offers nothing.
+FILM_NUMBERS = []
+
+
+def _scan_films(game_directory):
+    """Fill `FILM_NUMBERS` from the game's FMVs folder and return how many.
+
+    The films are `FMVs/message<N>.smk`, and the number is also the text index,
+    so a film without its entry in the game's own text shows a blank line. The
+    scan is deliberately forgiving: no folder, no game, or no files leaves the
+    list empty rather than raising, because the field still accepts a number
+    typed by hand.
+    """
+    FILM_NUMBERS.clear()
+    if not game_directory:
+        return 0
+    folder = Path(game_directory) / "FMVs"
+    if not folder.is_dir():
+        return 0
+    pattern = re.compile(r"^message(\d+)\.smk$", re.IGNORECASE)
+    for path in folder.iterdir():
+        if not path.is_file():
+            continue
+        match = pattern.match(path.name)
+        if match:
+            FILM_NUMBERS.append(int(match.group(1)))
+    FILM_NUMBERS.sort()
+    return len(FILM_NUMBERS)
+
+
+def _game_directory(context):
+    """Return the add-on's Game Directory, or an empty string."""
+    try:
+        preferences = context.preferences.addons[__package__].preferences
+    except (KeyError, AttributeError):
+        return ""
+    return (getattr(preferences, "game_directory", "") or "").strip()
+
+
+def _film_numbers_hint(limit=12):
+    """Return the first `limit` film numbers, for the panel's one-line hint."""
+    return FILM_NUMBERS[:limit]
+
+
+def _scan_film_names(game_directory):
+    """Return {number: "Level - text"} for the game's own message strings.
+
+    The numbering is the order of the quoted entries, which is what the
+    `TEXTSTRING_LEVELMSG_001` tags say, so entry 1 is the first quoted line. The
+    level comment above each entry is the part worth showing: it says which
+    story beat a film belongs to, which a bare number cannot.
+    """
+    names = {}
+    if not game_directory:
+        return names
+    source = Path(game_directory) / "language.txt"
+    if not source.is_file():
+        return names
+    try:
+        from .tools.rif_dump import decompress_rebcrif1, is_rebcrif1
+
+        raw = source.read_bytes()
+        text = (decompress_rebcrif1(raw) if is_rebcrif1(raw) else raw)
+        lines = text.decode("latin-1").splitlines()
+    except (OSError, ValueError, UnicodeDecodeError):
+        return names
+
+    number = 0
+    level = ""
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") and "TEXTSTRING" in stripped:
+            # A new entry: the next comment above the text is the level.
+            level = ""
+            continue
+        if stripped.startswith("#") and level == "":
+            level = stripped.lstrip("#").strip()
+            continue
+        if stripped.startswith('"') and stripped.endswith('"'):
+            number += 1
+            quote = stripped.strip('"')
+            names[number] = f"{level} - {quote}" if level else quote
+            level = ""
+    return names
+
+
+def _film_items(self=None, context=None):
+    """Return the film choices, the empty one first.
+
+    A message without a film must keep working, so index 0 is always offered.
+    The rest come from `FMVs/message<N>.smk`; a number whose file is missing
+    makes `StartTriggerPlotFMV` return without a word (`smacker.c:273`).
+    """
+    items = [("0", "None", "No film: the message only prints its text")]
+    for number in FILM_NUMBERS:
+        items.append((str(number), f"message{number}.smk",
+                      f"Plays FMVs/message{number}.smk on every FMV screen "
+                      f"in the level at once"))
+    return items
+
+
 class RIF_PlaceableSettings(bpy.types.PropertyGroup):
     """Per-object settings for a placed AvP gameplay object."""
 
@@ -893,6 +1000,20 @@ class RIF_PlaceableSettings(bpy.types.PropertyGroup):
         min=0,
         max=255,
     )
+    film: bpy.props.IntProperty(
+        name="Film number",
+        description=(
+            "A cutscene to play on the level's FMV screens, as the number of "
+            "FMVs/message<N>.smk. The number is the message index, because the "
+            "engine reads one field for both (bh_mission.c:119): the text line "
+            "and the film always come together, and there is no film without a "
+            "line. Every FMV screen in the level shows the same film, so two "
+            "screens can never play different ones; before and after a film "
+            "they show noise the engine generates itself. 0 means no film"),
+        default=0,
+        min=0,
+        max=9999,
+    )
     sentry_ammo: bpy.props.IntProperty(
         name="Sentry Ammo",
         description=(
@@ -1248,7 +1369,8 @@ PLACEABLES = (
             "wall it sits in and shape it as the doorway"),
         "MESH_CUBE", CAT_MODULE, KIND_MODULE_DOOR,
         object_flags={"rif_object_type": "MODULE",
-                      "rif_module_door": True}),
+                      "rif_module_door": True,
+                      "rif_module_door_open": True}),
     # -- Player Start ------------------------------------------------------
     _PlaceableSpec(
         "player_start_sp", "Single Player", (
@@ -1405,6 +1527,20 @@ PLACEABLES = (
             "level loads. A switch sends it code 2 to arm it AND show it; "
             "plain 'on' only arms it. 314 of them across 33 levels"),
         "EMPTY_SINGLE_ARROW", CAT_GAMEPLAY, KIND_MESSAGE),
+
+    _PlaceableSpec(
+        "fmv_screen", "FMV Screen", (
+            "A quad whose texture is FMVs\\triggered_plot.RIM. The engine swaps "
+            "that texture for the film frames, so every polygon using it plays "
+            "at once. Before and after a film the screen shows noise the engine "
+            "generates itself, so there is nothing to author for the "
+            "transition. Fill in a Film on a Message to start one; note that "
+            "every FMV screen in the level shows the same film"),
+        "MESH_PLANE", CAT_GAMEPLAY, KIND_SIMPLE_OBJECT,
+        object_flags={"rif_object_type": "SIMPLE_OBJECT",
+                      "rif_fragments": True,
+                      "rif_destructible": True,
+                      "rif_integrity": 3}),
 
     _PlaceableSpec(
         "particle_generator", "Particle Generator", (
@@ -1661,6 +1797,77 @@ PLACEABLES = (
 )
 
 
+#: The texture every FMV screen points at. Retail uses this one name in all
+#: eleven of its screen models, and the engine only looks for the `FMVs` part
+#: (`smacker.c:129`), so any name under that folder works.
+FMV_TEXTURE = "FMVs\\triggered_plot.RIM"
+
+
+def _create_fmv_screen(context, spec):
+    """Return a 4:3 screen quad with the FMV material on it.
+
+    A quad and nothing more: the preset is a screen surface, not a monitor, so
+    the author drops it into a wall, a desk or a laptop of their own. One
+    polygon means there is no question of which face is the screen.
+    """
+    width, height = 1.6, 1.2
+    mesh = bpy.data.meshes.new("FMV Screen")
+    mesh.from_pydata([(-width / 2, 0.0, -height / 2),
+                      (width / 2, 0.0, -height / 2),
+                      (width / 2, 0.0, height / 2),
+                      (-width / 2, 0.0, height / 2)],
+                     [], [(0, 1, 2, 3)])
+    mesh.update()
+
+    from .rif.texture_library import RIM_PATH_PROP
+
+    material = bpy.data.materials.new("FMV_Screen")
+    material.use_backface_culling = True
+    # The name is set here rather than derived from an image: the texture is
+    # already in the game's library, and `rim_name_for_material` passes a path
+    # without the `graphics\` prefix through unchanged.
+    material[RIM_PATH_PROP] = FMV_TEXTURE
+    mesh.materials.append(material)
+
+    obj = bpy.data.objects.new("FMV Screen", mesh)
+    _add_screen_quarters(context, obj)
+    return obj
+
+
+def _add_screen_quarters(context, parent):
+    """Cut a screen into four quarter children.
+
+    The parent is what the player shoots and these are what is left, which is how
+    the exporter reads fragments: a mesh child of an object with `rif_fragments`
+    set. Quarters rather than shrunk copies, because a broken pane should look
+    like four pieces of one surface -- the built-in `pieces` path copies the
+    whole mesh and scales it down, which reads as four small screens.
+    """
+    corners = [parent.matrix_world @ vertex.co for vertex in parent.data.vertices]
+    low_x = min(c.x for c in corners)
+    high_x = max(c.x for c in corners)
+    low_z = min(c.z for c in corners)
+    high_z = max(c.z for c in corners)
+    mid_x = (low_x + high_x) / 2
+    mid_z = (low_z + high_z) / 2
+    y = corners[0].y
+
+    for index, (x0, x1, z0, z1) in enumerate((
+            (low_x, mid_x, low_z, mid_z),
+            (mid_x, high_x, low_z, mid_z),
+            (low_x, mid_x, mid_z, high_z),
+            (mid_x, high_x, mid_z, high_z))):
+        mesh = bpy.data.meshes.new(f"{parent.name} piece {index + 1}")
+        mesh.from_pydata([(x0, y, z0), (x1, y, z0), (x1, y, z1), (x0, y, z1)],
+                         [], [(0, 1, 2, 3)])
+        mesh.update()
+        for material in parent.data.materials:
+            mesh.materials.append(material)
+        piece = bpy.data.objects.new(f"{parent.name} piece {index + 1}", mesh)
+        piece.parent = parent
+        context.collection.objects.link(piece)
+
+
 def _make_waypoint_material():
     """Return a fully transparent material, reused across waypoints.
 
@@ -1765,13 +1972,31 @@ class RIF_PT_module(bpy.types.Panel):
             box.prop(obj, "rif_module_door")
             if getattr(obj, "rif_module_door", False):
                 inner = box.box()
-                inner.prop(obj, "rif_module_door_locked")
-                inner.prop(obj, "rif_module_door_proximity")
-                inner.prop(obj, "rif_module_door_open")
+                # `add_door` (Objsetup.cpp:1910) has two paths and no third: a
+                # door with neither flag gets no strategy at all and stays plain
+                # geometry. Worse, `add_lift_door` never reads Locked or
+                # Horizontal, and `add_prox_door` never reads Open -- so four of
+                # the flags are dead on the wrong path. The fields below appear
+                # only where the engine reads them, which turns a silent
+                # no-op into a visible absence.
+                lift = getattr(obj, "rif_module_door_lift", False)
+                proximity = getattr(obj, "rif_module_door_proximity", False)
                 inner.prop(obj, "rif_module_door_lift")
-                inner.prop(obj, "rif_module_door_horizontal")
-                inner.prop(obj, "rif_module_door_open_seconds")
-                inner.prop(obj, "rif_module_door_close_seconds")
+                inner.prop(obj, "rif_module_door_proximity")
+                if lift:
+                    inner.prop(obj, "rif_module_door_open")
+                elif proximity:
+                    # Lift wins over proximity, so these two belong to the
+                    # proximity path only.
+                    inner.prop(obj, "rif_module_door_locked")
+                    inner.prop(obj, "rif_module_door_horizontal")
+                if lift or proximity:
+                    inner.prop(obj, "rif_module_door_open_seconds")
+                    inner.prop(obj, "rif_module_door_close_seconds")
+                else:
+                    inner.label(
+                        text="No path chosen: these stay plain geometry",
+                        icon="ERROR")
 
         elif object_type == "SIMPLE_OBJECT":
 
@@ -2903,24 +3128,27 @@ def _make_operator(spec):
                 obj.select_set(True)
                 context.view_layer.objects.active = obj
                 return {"FINISHED"}
-            mesh = bpy.data.meshes.new(spec.label)
-            half = 0.5
-            verts = [(x * half, y * half, z * half)
-                     for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
-            faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
-                     (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
-            mesh.from_pydata(verts, [], faces)
-            mesh.update()
-            obj = bpy.data.objects.new(spec.label, mesh)
-            for index in range(spec.pieces):
-                # Pieces are children, which is how the exporter reads them:
-                # the parent is what the player shoots, they are what is left.
-                piece = bpy.data.objects.new(
-                    f"{spec.label} piece {index + 1}", mesh.copy())
-                piece.parent = obj
-                piece.location = ((index - 1) * 0.6, 0.3, 0.0)
-                piece.scale = (0.35, 0.35, 0.35)
-                context.collection.objects.link(piece)
+            if spec.key == "fmv_screen":
+                obj = _create_fmv_screen(context, spec)
+            else:
+                mesh = bpy.data.meshes.new(spec.label)
+                half = 0.5
+                verts = [(x * half, y * half, z * half)
+                         for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+                faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
+                         (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+                mesh.from_pydata(verts, [], faces)
+                mesh.update()
+                obj = bpy.data.objects.new(spec.label, mesh)
+                for index in range(spec.pieces):
+                    # Pieces are children, which is how the exporter reads them:
+                    # the parent is what the player shoots, they are what is left.
+                    piece = bpy.data.objects.new(
+                        f"{spec.label} piece {index + 1}", mesh.copy())
+                    piece.parent = obj
+                    piece.location = ((index - 1) * 0.6, 0.3, 0.0)
+                    piece.scale = (0.35, 0.35, 0.35)
+                    context.collection.objects.link(piece)
         else:
             obj = bpy.data.objects.new(spec.label.split("  (")[0], None)
             obj.empty_display_type = spec.display
@@ -3374,6 +3602,30 @@ class RIF_PT_placeable(bpy.types.Panel):
             box.label(text="Message", icon="INFO")
             box.prop(settings, "message_string")
             box.prop(settings, "message_shown_at_start")
+            # A film and a text line share one field in the file, so the film
+            # number replaces the text index rather than adding to it.
+            box.prop(settings, "film")
+            # The enum that would have offered these could not register, so the
+            # list is shown as a hint and the number is typed. It is scanned
+            # once per session: the folder is the authority and the artist can
+            # install another copy of the game without reopening Blender.
+            game_directory = _game_directory(context)
+            if _scan_films(game_directory):
+                shown = ", ".join(str(n) for n in _film_numbers_hint())
+                box.label(text=f"Films in the game: {shown}", icon="FILE_MOVIE")
+                # The game's own text table is the only description a film has:
+                # `message25.smk` says nothing, but the line and the level it
+                # belongs to do.
+                name = _scan_film_names(game_directory).get(int(settings.film))
+                if name:
+                    box.label(text=name[:78], icon="TEXT")
+            elif game_directory:
+                box.label(text="No FMVs folder in the Game Directory",
+                          icon="ERROR")
+            if settings.film:
+                box.label(text="The text line goes with the film", icon="INFO")
+                box.label(text="Every FMV screen shows the same film",
+                          icon="INFO")
             # Said in the panel, because the name of the field suggests the
             # opposite and the engine will not show anything on its own.
             box.label(text="A switch shows it, with code 2", icon="ERROR")
@@ -3724,12 +3976,21 @@ def register_placeables():
             "bit as exactly that: state = I_door_open when it is set, I_door "
             "when it is not. Only 6 of the 417 retail doors set it"),
         default=False)
+    # This is `DoorFlag_Lift`. The name is kept in the tooltip because the flag
+    # in the file still says Lift, but the label does not: the flag selects the
+    # path with no proximity test, and a door is a module that only morphs in
+    # place, so nothing rides a car and nothing lifts.
     bpy.types.Object.rif_module_door_lift = bpy.props.BoolProperty(
-        name="Lift door",
+        name="Switch only",
         description=(
-            "Takes the lift path (Objsetup.cpp:1915): the door moves with the "
-            "car rather than on its own. 211 of the 417 retail doors carry "
-            "this, so more than half of them are lift doorways"),
+            "DoorFlag_Lift (Objsetup.cpp:1915). Opened only by RequestState from "
+            "a switch, a trigger or a lift: this path has no proximity test, so "
+            "the player can never open the door by walking up to it. Despite the "
+            "flag's name the door does not ride a car, because a door is a "
+            "module and only morphs in place between its open and closed shapes. "
+            "This is the only path that honours Starts open, and it wins over "
+            "Opens on approach; Locked and Horizontal are ignored here. 215 of "
+            "the 417 retail doors take this path"),
         default=False)
     bpy.types.Object.rif_module_door_horizontal = bpy.props.BoolProperty(
         name="Horizontal",

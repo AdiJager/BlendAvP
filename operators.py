@@ -2044,7 +2044,11 @@ def _collect_messages(context, objs):
         flags = 0 if settings.message_shown_at_start else 1
         messages.append(VirtualObjectChunk(
             obj.name,
-            TextMessageStrategyChunk(index, flags, 0),
+            # One field carries both (`bh_mission.c:119`): setting the film
+            # replaces the text index, because the engine reads one number and
+            # prints the line as it starts the film.
+            TextMessageStrategyChunk(
+                int(settings.film) if settings.film else index, flags, 0),
             location=position,
             size=DEFAULT_MESSAGE_SIZE,
         ))
