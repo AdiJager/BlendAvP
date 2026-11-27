@@ -54,6 +54,7 @@ S6 F9 (ROOT CAUSE — "empty level with Include Prelight on"):
 from math import sqrt
 
 from . import modules
+from .entry_points import EntryModule, compute_entry_point
 from .chunks.environment_settings import AVPEnvironmentChunk
 from .chunks.trigger import DeathVolume
 from .chunks.path import PathChunk, PathPoint
@@ -531,6 +532,7 @@ def build_rif_level(objects, level_name, texture_paths=None, texture_sizes=None,
     # module's box before it can write any module's chunk.
     module_bounds = []
     module_origins = []
+    entry_modules = []
     for obj in objects:
         if obj.type != "MESH":
             raise ValueError(f"Object {obj.name!r} is not a mesh")
@@ -546,6 +548,7 @@ def build_rif_level(objects, level_name, texture_paths=None, texture_sizes=None,
         module_origins.append(world_origin)
         points = []
         matrix = obj.matrix_world
+        matrix_rotation = matrix.to_3x3()
         for vertex in obj.data.vertices:
             world = matrix @ vertex.co
             vx, vy, vz = blender_to_rif_axis(world.x, world.y, world.z)
@@ -553,7 +556,57 @@ def build_rif_level(objects, level_name, texture_paths=None, texture_sizes=None,
                            meters_to_rif(vz)))
         module_bounds.append(modules.box_of(points))
 
+        # The same numbers in the frame the entry point algorithm wants: local
+        # points plus a place, the way the file stores them.
+        local_points = []
+        for world_point in points:
+            local_points.extend((world_point[0] - world_origin[0],
+                                 world_point[1] - world_origin[1],
+                                 world_point[2] - world_origin[2]))
+        corners = []
+        normal_y = []
+        for polygon in obj.data.polygons:
+            indices = list(polygon.vertices)[:4]
+            corners.append(len(indices))
+            corners.extend(indices)
+            corners.extend([-1] * (4 - len(indices)))
+            normal = polygon.normal
+            if matrix_rotation is not None:
+                normal = matrix_rotation @ normal
+            _nx, ny, _nz = blender_to_rif_axis(normal.x, normal.y, normal.z)
+            normal_y.append(ny)
+        bound = module_bounds[-1]
+        entry_modules.append(EntryModule(
+            place=world_origin,
+            min_extent=tuple(bound[0][axis] - world_origin[axis]
+                             for axis in range(3)),
+            max_extent=tuple(bound[1][axis] - world_origin[axis]
+                             for axis in range(3)),
+            points=local_points,
+            polygon_corners=corners,
+            polygon_normal_y=normal_y))
+
     module_neighbours = modules.neighbours(module_bounds, module_origins)
+
+    # Replace each guessed arrival with the one the algorithm finds, keeping the
+    # guess wherever the pair cannot be resolved. A pair that does not touch or
+    # whose point cannot be placed still needs an entry: a missing link strands
+    # NPCs, which is worse than a point in the wrong place.
+    resolved = 0
+    refined = {}
+    for index, pairs in module_neighbours.items():
+        kept = []
+        for peer, arrival in pairs:
+            result = compute_entry_point(entry_modules[index],
+                                         entry_modules[peer], floor_below=0.0)
+            if (not result.failed_to_place and not result.warned_no_touch
+                    and result.axis >= 0):
+                kept.append((peer, result.point))
+                resolved += 1
+            else:
+                kept.append((peer, arrival))
+        refined[index] = kept
+    module_neighbours = refined
 
     # The outliner hierarchy doubles as the visibility graph: a module sees its
     # parent and its children (see `modules.linked_modules`). `hierarchy` maps
@@ -1108,7 +1161,14 @@ def _trigger_strategy(obj):
     on_pickup = bool(getattr(obj, "rif_trigger_on_pickup", False))
     destructible = bool(getattr(obj, "rif_destructible", False))
     explosion = int(getattr(obj, "rif_trigger_explosion", "0"))
-    if not (on_destroy or on_pickup or destructible or explosion):
+    # A video screen needs a strategy even with nothing to trigger: its type is
+    # what makes the engine give it the behaviour that lights the room.
+    video_screen = bool(getattr(obj, "rif_video_screen", False))
+    # A glowing screen spends its video-screen type on a light, because one object
+    # carries one strategy and the video-screen one can never own a light.
+    glow = video_screen and bool(getattr(obj, "rif_screen_glow", True))
+    if not (on_destroy or on_pickup or destructible or explosion
+            or video_screen):
         return None
 
     # A target is only needed to send a message to something else. The
@@ -1117,7 +1177,8 @@ def _trigger_strategy(obj):
     # still needs a strategy, or it cannot blow up at all.
     target = getattr(obj, "rif_trigger_target", None)
 
-    from .chunks.strategy import AVPStrategyChunk, compose_integrity, trigger_flags
+    from .chunks.strategy import (AVPStrategyChunk, IOT_VIDEO_SCREEN,
+                                  compose_integrity, trigger_flags)
     from .chunks.trigger import virtual_object_id
 
     # Integrity 0 means indestructible, so a Destructible object left at the
@@ -1126,8 +1187,12 @@ def _trigger_strategy(obj):
     # the way it does for every other SimpleStrategy this exporter writes.
     integrity = (compose_integrity(max(1, int(getattr(obj, "rif_integrity", 1))))
                  if destructible else 0)
+    from .chunks.strategy import IOT_LIGHT
+
     return AVPStrategyChunk(
-        type_id=0,
+        type_id=(IOT_LIGHT if glow
+                 else IOT_VIDEO_SCREEN if video_screen
+                 else 0),
         integrity=integrity,
         flags=trigger_flags(
             on_destroy if target is not None else False,
@@ -1219,10 +1284,16 @@ def _placed_light_for(obj):
     position is stored here -- the lamp is the object, and moving the object
     moves the light.
     """
-    if not getattr(obj, "rif_placed_light", False):
+    video_screen = bool(getattr(obj, "rif_video_screen", False))
+    if not (getattr(obj, "rif_placed_light", False) or video_screen):
         return None
 
     from .chunks.light import PlacedLightChunk, pack_colour
+
+    if video_screen:
+        # A lamp that glows through a screen: white, one metre of brightness and a
+        # five metre reach, which is what `bh_videoscreen.c:177` would have used.
+        return PlacedLightChunk(brightness=1.0, range_mm=5000)
 
     up = getattr(obj, "rif_light_colour", (1.0, 1.0, 1.0))
     down = getattr(obj, "rif_light_off_colour", (0.0, 0.0, 0.0))
@@ -1846,6 +1917,31 @@ def _resolve_bitmap_indices(mesh, texture_paths=None):
     return result
 
 
+def _planar_loop_uvs(verts, indices, normal, low, high, width, height):
+    """Return pixel UVs for a polygon of a mesh that carries no UV layer.
+
+    A box projection: the coordinate axes least aligned with the face carry u and
+    v, scaled so the shape's bounding box spans the texture once. It is not an
+    unwrap, and a wall seen edge-on will look wrong -- but a single texel is worse,
+    because the engine then stretches one pixel over the whole face.
+    """
+    drop = max(range(3), key=lambda axis: abs(normal[axis]))
+    first, second = [axis for axis in range(3) if axis != drop]
+    span_first = (high[first] - low[first]) or 1
+    span_second = (high[second] - low[second]) or 1
+
+    uvs = []
+    for index in indices:
+        if not 0 <= index < len(verts):
+            uvs.append((0.0, 0.0))
+            continue
+        vertex = verts[index]
+        u = (vertex[first] - low[first]) / span_first
+        v = (vertex[second] - low[second]) / span_second
+        uvs.append((u * width - 0.5, v * height - 0.5))
+    return uvs
+
+
 def _extract_geometry(mesh, slot_bitmaps, matrix=None, slot_flags=None, slot_sizes=None):
     """Return (verts_int, vert_normals, polys, poly_normals, uv_lists).
 
@@ -1877,6 +1973,7 @@ def _extract_geometry(mesh, slot_bitmaps, matrix=None, slot_flags=None, slot_siz
         vert_normals.append(blender_to_rif_axis(n.x, n.y, n.z))
 
     uv_layer = mesh.uv_layers.active
+    shape_bounds = _compute_bounds(verts_int)
     polys = []
     poly_normals = []
     uv_lists = []
@@ -1907,7 +2004,12 @@ def _extract_geometry(mesh, slot_bitmaps, matrix=None, slot_flags=None, slot_siz
                         for (u, v) in (tuple(uv_layer.data[li].uv)
                                        for li in poly.loop_indices)]
         else:
-            loop_uvs = [(0.0, 0.0)] * len(indices)
+            width, height = (slot_sizes[slot]
+                             if slot_sizes and slot < len(slot_sizes)
+                             else (DEFAULT_UV_PIXELS, DEFAULT_UV_PIXELS))
+            loop_uvs = _planar_loop_uvs(verts_int, indices, face_normal,
+                                        shape_bounds["min"], shape_bounds["max"],
+                                        width, height)
 
         bitmap_idx = slot_bitmaps[slot] if slot < len(slot_bitmaps) else 0
 

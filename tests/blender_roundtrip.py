@@ -2500,12 +2500,50 @@ def test_adjmdlep_links_modules_that_share_a_wall():
     peer, flags, point = entries[0][0]
     assert peer == 1, entries[0]
     assert flags == 0, f"a plain link carries no flags, got {flags}"
-    # Arrival is 50 mm inside cube B, whose origin is at (1000, 0, 0) mm.
-    assert point == (-450, 0, 0), f"arrival should clear the wall: {point}"
+    # Arrival is 100 mm inside cube B, whose origin is at (1000, 0, 0) mm. The
+    # margin is IntEng's: step 7 of `FUN_00402ae0` puts the coordinate 100 beyond
+    # the main module's innermost point on the side the peer lies, and that value
+    # is what 95 % of the stock entry points agree with.
+    assert point == (-400, 0, 0), f"arrival should clear the wall: {point}"
     peer_origin = (1000, 0, 0)
     absolute = tuple(peer_origin[axis] + point[axis] for axis in range(3))
-    assert absolute == (550, 0, 0), absolute  # cube B spans 500..1500 mm in x
+    assert absolute == (600, 0, 0), absolute  # cube B spans 500..1500 mm in x
     print(f"    przybycie do B: {absolute} mm (wewnatrz bryly B)")
+
+
+@test
+def test_entry_point_lands_inside_the_peer():
+    """The algorithm puts the point a margin inside the module being entered.
+
+    A port of IntEng's `FUN_00402ae0`, validated against the stock levels: flags
+    agree on 99 to 100 % of their entry points and the point itself on 95 to 97 %
+    of the levels that carry no AI groups.
+    """
+    from rif.entry_points import EntryModule, compute_entry_point
+
+    # Two 1 m cubes centred on x = 0 and x = 2000 mm, so they do NOT touch: the
+    # gap has to be reported rather than turned into a link.
+    left = EntryModule(place=(0, 0, 0), min_extent=(-500, -500, -500),
+                       max_extent=(500, 500, 500))
+    right = EntryModule(place=(2000, 0, 0), min_extent=(-500, -500, -500),
+                        max_extent=(500, 500, 500))
+    apart = compute_entry_point(left, right, floor_below=0.0)
+    assert apart.warned_no_touch, "a 1000 mm gap is not a passage"
+
+    # Abutting: they share the plane at x = 500 mm.
+    near = EntryModule(place=(1000, 0, 0), min_extent=(-500, -500, -500),
+                       max_extent=(500, 500, 500))
+    touching = compute_entry_point(left, near, floor_below=0.0)
+    assert not touching.warned_no_touch, "the cubes abut, so they touch"
+    assert touching.axis == 0, f"the way through is x, got {touching.axis}"
+    assert touching.point == (600, 0, 0), touching.point
+    assert not touching.failed_to_place, "the point must land in the peer"
+
+    # A point already marked as set by hand is left alone.
+    kept = compute_entry_point(left, near, flags_in=0x1, point_in=(7, 8, 9),
+                               floor_below=0.0)
+    assert kept.point == (7, 8, 9), kept.point
+    assert kept.flags & 0x1, "the flag survives"
 
 
 @test
