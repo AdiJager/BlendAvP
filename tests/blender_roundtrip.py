@@ -2461,6 +2461,144 @@ def _adjmdlep_entries(data):
     return result
 
 
+def _ensure_ai_master_property():
+    """Give `bpy.types.Object` the cluster pointer the addon normally registers.
+
+    The tests import the package by path instead of enabling the addon, so none of the
+    `rif_*` properties exist. Production code reads them with `getattr` and a default,
+    which is why that never mattered; a pointer has to be set, so it has to exist.
+    """
+    if not hasattr(bpy.types.Object, "rif_ai_master"):
+        bpy.types.Object.rif_ai_master = bpy.props.PointerProperty(
+            type=bpy.types.Object)
+
+
+def _waypoint_marker(name, location, size=0.4):
+    """Return a mesh object marked as an AvP waypoint marker.
+
+    `_collect_waypoints` reads the box from the mesh and the centre from
+    `matrix_world`, so a plain cube with the placeable property is enough.
+    """
+    placeables = load_package_module("placeables")
+    half = size / 2.0
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(
+        [(-half, -half, -half), (half, -half, -half), (half, half, -half),
+         (-half, half, -half), (-half, -half, half), (half, -half, half),
+         (half, half, half), (-half, half, half)],
+        [], [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4),
+             (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)])
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.location = location
+    obj[placeables.PLACEABLE_PROP] = placeables.KIND_WAYPOINT
+    bpy.context.view_layer.update()
+    return obj
+
+
+@test
+def test_ai_master_chunk_is_a_flag():
+    """The head of a cluster carries a payload-less AIMODMAS.
+
+    `AI_Module_Master_Chunk::size_chunk()` returns 12 -- the header alone
+    (`wpchunk.cpp:398-410`) -- so anything in the payload would be a made-up field.
+    """
+    member, head = _cubes_at([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)])
+    member.rif_ai_master = head
+    data = build_rif_level([member, head], "lvl")
+    masters = _all_chunk_payloads(data, "AIMODMAS")
+    assert len(masters) == 1, masters
+    assert masters[0] == b"", f"AIMODMAS payload should be empty: {masters[0]!r}"
+    print("    AIMODMAS: 12 B, pusty payload")
+
+
+@test
+def test_ai_slave_names_the_master_index():
+    """AIMODSLA holds the master's `index_num`, which is its place in the module list.
+
+    The slave is first here, so an implementation that wrote its own index -- or the
+    slave's position -- would write 0 and be caught.
+    """
+    member, head = _cubes_at([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)])
+    member.rif_ai_master = head
+    data = build_rif_level([member, head], "lvl")
+    slaves = _all_chunk_payloads(data, "AIMODSLA")
+    assert len(slaves) == 1, slaves
+    assert len(slaves[0]) == 4, f"AIMODSLA payload is one int: {slaves[0]!r}"
+    index = struct.unpack_from("<i", slaves[0], 0)[0]
+    # The head was exported second, so its index_num is 1.
+    assert index == 1, f"AIMODSLA should name the head at index 1, got {index}"
+    print(f"    AIMODSLA nazywa mastera o indeksie {index}")
+
+
+@test
+def test_ai_cluster_drops_entry_points_inside_it():
+    """Two modules of one cluster get no entry point between them.
+
+    The loader throws such an entry away (`Projload.cpp:2431`), so writing it would be
+    bytes that can never be read. A third module outside the cluster must still be
+    linked, or the filter would have been too eager.
+    """
+    # `outside` sits on the head's other face, so it touches the head and not the
+    # member: a side-facing pair would touch neither, and an edge-on one may not
+    # count as shared volume at all.
+    first, second, outside = _cubes_at(
+        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)])
+    _ensure_ai_master_property()
+    second.rif_ai_master = first
+    data = build_rif_level([first, second, outside], "lvl")
+    entries = _adjmdlep_entries(data)
+    assert len(entries) == 3, entries
+    by_module = {index: [peer for peer, _f, _p in listed]
+                 for index, listed in enumerate(entries)}
+    # 0 and 1 are one node: neither names the other, and the head still names 2.
+    assert 1 not in by_module[0], f"entry point inside the cluster: {by_module}"
+    assert 0 not in by_module[1], f"entry point inside the cluster: {by_module}"
+    assert 2 in by_module[0], by_module
+    print(f"    wpisy: {by_module}")
+
+
+@test
+def test_ai_cluster_merges_waypoints_on_the_master():
+    """The waypoints of both members end up in the master's chunk, and only there.
+
+    A slave's own `WAYPOINT` is read and discarded (`Projload.cpp:2410`), which is how
+    navigation disappears without a trace. Retail agrees: none of its 1711 slaves
+    carries one, and 279 of its 285 masters do.
+    """
+    first, second = _cubes_at([(0.0, 0.0, 0.0), (1.2, 0.0, 0.0)])
+    second.rif_ai_master = first
+    _waypoint_marker("WP_A", (0.0, 0.0, 0.0))
+    _waypoint_marker("WP_B", (1.2, 0.0, 0.0))
+    operators = load_operators()
+    specs, _orphaned, _rotated = operators._collect_waypoints(
+        bpy.context, [first, second])
+    assert set(specs) == {0}, f"only the head should own a chunk: {set(specs)}"
+    assert len(specs[0]) == 2, f"both waypoints belong to the head: {specs[0]}"
+    # The graph is rebuilt over the merged boxes, so both records exist and no link
+    # points outside the list.
+    for low, high, centre, flags, links in specs[0]:
+        assert len(low) == 3 and len(high) == 3 and len(centre) == 3
+        assert flags & 0x80000000, "the centre comes from the author"
+        for index, _link_flags in links:
+            assert 0 <= index < 2, f"link points outside the merged list: {index}"
+    print(f"    master ma {len(specs[0])} waypointy, slav nie ma chunka")
+
+
+@test
+def test_ai_cluster_refuses_a_slave_as_master():
+    """A chain is reported, because the engine would drop the second link silently."""
+    first, second, third = _cubes_at(
+        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 0.0, 0.0)])
+    second.rif_ai_master = first
+    third.rif_ai_master = second          # second is already a slave
+    operators = load_operators()
+    problems = operators._ai_cluster_problems(bpy.context, [first, second, third])
+    assert any("itself a slave" in problem for problem in problems), problems
+    print(f"    zgloszono: {problems[0][:60]}...")
+
+
 def _cubes_at(locations):
     """Create one unit cube per location; return them in order.
 
@@ -2864,6 +3002,11 @@ def run_all():
     if not HAS_BPY:
         print("bpy not importable — run this script inside Blender.")
         return False
+
+    # The tests import the package by path rather than enabling the addon, so the
+    # object properties the addon registers do not exist. Production code reads them
+    # defensively; a pointer has to be set, so it has to be registered.
+    _ensure_ai_master_property()
 
     saved_shading = _suspend_viewport_shading()
 
