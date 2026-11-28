@@ -99,11 +99,12 @@ from .chunks.lighting import (
     StandardLightChunk, ShapeVertexIntensitiesChunk,
     IDENTITY_MATRIX_16_16, ONE_FIXED,
 )
-from .chunks.module import (
-    ModuleFlagChunk, ObjectModuleDataChunk, module_flags, AdjacentModuleEntryPointsChunk,
-    ModuleAcousticsChunk, VModuleArrayChunk,
-    VModuleArrayChunk, ModuleAcousticsChunk,
-)
+from .ai_clusters import (cluster_kind, master_map,
+                          slaves_of, without_internal_edges)
+from .chunks.module import (AIModuleMasterChunk, AIModuleSlaveChunk,
+                            ModuleFlagChunk, ObjectModuleDataChunk, module_flags,
+                            AdjacentModuleEntryPointsChunk, VModuleArrayChunk,
+                            ModuleAcousticsChunk,)
 
 
 # ------------------------------------------------------------------ constants
@@ -608,6 +609,13 @@ def build_rif_level(objects, level_name, texture_paths=None, texture_sizes=None,
         refined[index] = kept
     module_neighbours = refined
 
+    # An AI cluster is several modules the engine treats as one node. Its members
+    # need no entry points between them -- the loader drops such an entry
+    # (`Projload.cpp:2431`) -- so the pairs inside a cluster leave the graph here,
+    # where the entry points have just been resolved.
+    master_of = master_map(objects)
+    module_neighbours = without_internal_edges(module_neighbours, master_of)
+
     # The outliner hierarchy doubles as the visibility graph: a module sees its
     # parent and its children (see `modules.linked_modules`). `hierarchy` maps
     # object NAME to parent NAME because that is what the writer needs for
@@ -704,6 +712,9 @@ def build_rif_level(objects, level_name, texture_paths=None, texture_sizes=None,
                 "adjmdlep": modules.build_adjmdlep(
                     module_neighbours.get(i, []), module_origins),
                 "modacous": (-1, -1.0, 0),
+                # AIMODMAS on a head, AIMODSLA on a member, nothing for a module
+                # that is its own AI node.
+                "ai_cluster": cluster_kind(master_of, i),
                 "waypoints": (waypoints or {}).get(i),
                 # MODFLAGS, read off the object. Zero means no chunk: 12335 of
                 # retail's 12813 modules carry none.
@@ -1164,9 +1175,6 @@ def _trigger_strategy(obj):
     # A video screen needs a strategy even with nothing to trigger: its type is
     # what makes the engine give it the behaviour that lights the room.
     video_screen = bool(getattr(obj, "rif_video_screen", False))
-    # A glowing screen spends its video-screen type on a light, because one object
-    # carries one strategy and the video-screen one can never own a light.
-    glow = video_screen and bool(getattr(obj, "rif_screen_glow", True))
     if not (on_destroy or on_pickup or destructible or explosion
             or video_screen):
         return None
@@ -1187,12 +1195,8 @@ def _trigger_strategy(obj):
     # the way it does for every other SimpleStrategy this exporter writes.
     integrity = (compose_integrity(max(1, int(getattr(obj, "rif_integrity", 1))))
                  if destructible else 0)
-    from .chunks.strategy import IOT_LIGHT
-
     return AVPStrategyChunk(
-        type_id=(IOT_LIGHT if glow
-                 else IOT_VIDEO_SCREEN if video_screen
-                 else 0),
+        type_id=IOT_VIDEO_SCREEN if video_screen else 0,
         integrity=integrity,
         flags=trigger_flags(
             on_destroy if target is not None else False,
@@ -1284,20 +1288,10 @@ def _placed_light_for(obj):
     position is stored here -- the lamp is the object, and moving the object
     moves the light.
     """
-    video_screen = bool(getattr(obj, "rif_video_screen", False))
-    # A light only when the screen took the glow, which is the same trade that
-    # makes it a placed light: with glow off it stays a video screen, and retail's
-    # 36 screens carry no PLOBJLIT at all.
-    glow = video_screen and bool(getattr(obj, "rif_screen_glow", False))
-    if not (getattr(obj, "rif_placed_light", False) or glow):
+    if not getattr(obj, "rif_placed_light", False):
         return None
 
     from .chunks.light import PlacedLightChunk, pack_colour
-
-    if glow:
-        # A lamp that glows through a screen: white, one metre of brightness and a
-        # five metre reach, which is what `bh_videoscreen.c:177` would have used.
-        return PlacedLightChunk(brightness=1.0, range_mm=5000)
 
     up = getattr(obj, "rif_light_colour", (1.0, 1.0, 1.0))
     down = getattr(obj, "rif_light_off_colour", (0.0, 0.0, 0.0))
@@ -1638,6 +1632,11 @@ def _build_module_data(spec):
         ModuleAcousticsChunk(*spec.get("modacous", (-1, -1.0, 0))),
         VModuleArrayChunk(spec.get("vmdarray", [])),
     ]
+    cluster = spec.get("ai_cluster")
+    if cluster == "master":
+        children.append(AIModuleMasterChunk())
+    elif cluster:
+        children.append(AIModuleSlaveChunk(cluster["master"]))
     waypoints = spec.get("waypoints")
     if waypoints:
         children.append(WaypointChunk(waypoints))

@@ -7,6 +7,8 @@ Verified against Obchunk.cpp:
       ├─ MODACOUS  Module_Acoustics_Chunk
       ├─ VMDARRAY  VModule_Array_Chunk
       ├─ MODFLAGS  Module_Flag_Chunk           (optional)
+      ├─ AIMODMAS  AI_Module_Master_Chunk      (optional, a cluster head)
+      ├─ AIMODSLA  AI_Module_Slave_Chunk       (optional, one of its members)
       └─ MODZONE   Module_Zone_Chunk           (optional)
 
 In AvP the physics engine operates on **modules**, not on shapes. A
@@ -92,6 +94,39 @@ class VModuleArrayChunk(Chunk):
             idx, branch, flags, spare = item
             buf += struct.pack("<4i", idx, branch, flags, spare)
         return bytes(buf)
+
+
+class AIModuleMasterChunk(Chunk):
+    """AIMODMAS — this module is the head of an AI cluster.
+
+    The payload is empty: the chunk exists only to say that the module may be named
+    as a master by `AIMODSLA`. Its slaves make one `AIMODULE`, so the AI sees one
+    node instead of one per box (`Projload.cpp:2169-2198`).
+    """
+
+    identifier = "AIMODMAS"
+
+    def payload(self) -> bytes:
+        """Serialise the empty payload: the chunk is a flag."""
+        return b""
+
+
+class AIModuleSlaveChunk(Chunk):
+    """AIMODSLA — this module belongs to the AI cluster of another module.
+
+    The payload is the master's `index_num`. The loader turns it into
+    `AI_Module_Master_Chunk::ModuleList`, and a number that names something which is
+    not a master is dropped without a word (`wpchunk.cpp:540-570`).
+    """
+
+    identifier = "AIMODSLA"
+
+    def __init__(self, master_index: int):
+        self.master_index = int(master_index)
+
+    def payload(self) -> bytes:
+        """Serialise the master's object index."""
+        return struct.pack("<i", self.master_index)
 
 
 class ModuleAcousticsChunk(Chunk):

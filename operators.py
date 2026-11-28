@@ -1377,28 +1377,6 @@ def _sub_type_for(settings, kind):
     return int(settings.sub_type)
 
 
-def _silent_screen_problems(context):
-    """Return a problem for a screen that traded its sound for a light.
-
-    The film's volume is scaled by the nearest `I_BehaviourVideoScreen`
-    (`FmvCutscenes.cpp:98`), so a screen exported as a placed light plays its film
-    with no sound at all -- and quietly, since nothing else marks the change.
-    """
-    from . import placeables
-
-    problems = []
-    for obj in context.scene.objects:
-        if not getattr(obj, "rif_video_screen", False):
-            continue
-        if getattr(obj, "rif_screen_glow", False):
-            problems.append(
-                f"Screen {obj.name!r} has Glow on, so it is exported as a placed "
-                f"light and not as a video screen. The film's volume comes from "
-                f"the nearest video screen, so it will play in silence. Turn Glow "
-                f"off to hear it")
-    return problems
-
-
 def _message_trigger_problems(context):
     """Return problems for messages that nothing can ever make appear.
 
@@ -1887,10 +1865,21 @@ def _collect_waypoints(context, objs):
     from .rif import waypoints as rif_waypoints
     from .rif.chunks.waypoint import WAYPOINT_FLAG_CENTRE_DEFINED_BY_USER
 
-    bounds = [(obj.name, _world_box(obj)) for obj in objs]
-    bounds = [(name, box) for name, box in bounds if box is not None]
+    # The module's own index is carried along: a list filtered of modules without a
+    # box would renumber everything after them, and the specs below are keyed by the
+    # index the builder writes into `index_num`.
+    bounds = []
+    for index, obj in enumerate(objs):
+        box = _world_box(obj)
+        if box is not None:
+            bounds.append((index, obj.name, box))
     if not bounds:
         return {}, [], []
+
+    from .rif.ai_clusters import master_map, node_of
+
+    # A cluster is one AI node, so its members share one waypoint list.
+    master_of = master_map(objs)
 
     placed = [obj for obj in context.scene.objects
               if obj.get(PLACEABLE_PROP) == KIND_WAYPOINT]
@@ -1908,7 +1897,7 @@ def _collect_waypoints(context, objs):
         low, high = box
         origin = obj.matrix_world.translation
         owner = None
-        for index, (_name, (m_low, m_high)) in enumerate(bounds):
+        for index, _name, (m_low, m_high) in bounds:
             if all(m_low[k] <= origin[k] <= m_high[k] for k in range(3)):
                 owner = index
                 break
@@ -1918,7 +1907,9 @@ def _collect_waypoints(context, objs):
         # Stored in millimetres, absolute, matching the file format. The crawl
         # setting rides along, because the box alone cannot say whether the node
         # is meant for a wall.
-        grouped.setdefault(owner, []).append((
+        # The node, not the module: a slave's waypoints belong to its master's
+        # chunk, and a slave's own WAYPOINT would never be read.
+        grouped.setdefault(node_of(master_of, owner), []).append((
             tuple(int(round(v * 1000.0)) for v in low),
             tuple(int(round(v * 1000.0)) for v in high),
             # The centre is the object's origin: the artist moves it inside a
@@ -2597,6 +2588,45 @@ def _has_generators():
     return False
 
 
+def _ai_cluster_problems(context, objs):
+    """Return what is wrong with the scene's AI clusters, worst first.
+
+    Every mistake here is silent in the game: the loader drops a slave it cannot
+    resolve (`wpchunk.cpp:540-570`), so the level loads and behaves as if no cluster
+    had been asked for at all.
+    """
+    from .placeables import PLACEABLE_PROP
+
+    index_of = {obj.name: position for position, obj in enumerate(objs)}
+    problems = []
+    for obj in objs:
+        master = getattr(obj, "rif_ai_master", None)
+        if master is None:
+            continue
+        if master is obj:
+            problems.append(
+                f"{obj.name!r} is its own AI cluster master, which the loader "
+                f"refuses")
+        elif master.name not in index_of:
+            problems.append(
+                f"{obj.name!r} names {master.name!r} as its AI cluster master, but "
+                f"that object is not exported as a module: the engine would drop the "
+                f"link without a word")
+        elif master.get(PLACEABLE_PROP) is not None:
+            problems.append(
+                f"{obj.name!r} names {master.name!r} as its AI cluster master, but "
+                f"that object is a placeable and not a module")
+        elif getattr(master, "rif_ai_master", None) is not None:
+            head = master.rif_ai_master
+            problems.append(
+                f"{obj.name!r} names {master.name!r} as its AI cluster master, but "
+                f"{master.name!r} is itself a slave"
+                + (f" of {head.name!r}" if head is not None else "")
+                + f". A cluster head cannot be a member, and the engine would drop "
+                  f"the link")
+    return problems
+
+
 def _module_layout_problems(objs, hierarchy, visibility=None):
     """Return a list of things wrong with the level's modules, worst first.
 
@@ -3107,12 +3137,12 @@ class RIF_OT_validate_level(bpy.types.Operator):
         visibility = _visibility_links(objs, "LIST")
         problems.extend(_module_layout_problems(objs, hierarchy,
                                               visibility))
+        problems.extend(_ai_cluster_problems(context, objs))
         problems.extend(_sound_layout_problems(context))
         problems.extend(_waypoint_layout_problems(context))
         problems.extend(_fmv_screen_problems(objs))
         problems.extend(_fmv_case_problems(context))
         problems.extend(_film_number_problems(context))
-        problems.extend(_silent_screen_problems(context))
         problems.extend(_message_trigger_problems(context))
         problems.extend(_path_layout_problems(context, objs))
 

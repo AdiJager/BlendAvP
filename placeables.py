@@ -1527,8 +1527,7 @@ PLACEABLES = (
                       "rif_fragments": True,
                       "rif_destructible": True,
                       "rif_integrity": 3,
-                      "rif_video_screen": True,
-                      "rif_screen_glow": False}),
+                      "rif_video_screen": True}),
 
     _PlaceableSpec(
         "particle_generator", "Particle Generator", (
@@ -2000,6 +1999,23 @@ class RIF_PT_module(bpy.types.Panel):
             box.label(text="AI navigation", icon="OUTLINER_OB_ARMATURE")
             box.prop(obj, "rif_module_airduct")
             box.prop(obj, "rif_module_stairs")
+
+            master = obj.rif_ai_master
+            if master is not None:
+                box.label(text=f"AI cluster: slave of {master.name}", icon="LINKED")
+                box.label(text="Its waypoints are written on the master",
+                          icon="INFO")
+            else:
+                members = sum(1 for other in context.scene.objects
+                              if getattr(other, "rif_ai_master", None) is obj)
+                if members:
+                    box.label(text=f"AI cluster: head of {members} module(s)",
+                              icon="LINKED")
+                else:
+                    box.label(text="AI cluster: none (its own AI node)",
+                              icon="INFO")
+            box.prop(obj, "rif_ai_master")
+
             box.label(text="These change how bots move, not how it looks",
                       icon="INFO")
 
@@ -3997,6 +4013,18 @@ def register_placeables():
         name="Fog",
         description="Fog fills this module",
         default=False)
+    bpy.types.Object.rif_ai_master = bpy.props.PointerProperty(
+        name="AI cluster master",
+        description=(
+            "The module whose AI cluster this one belongs to. A cluster is several "
+            "modules the engine treats as ONE AI node: one entry in its navigation "
+            "graph, one waypoint list, one set of entry points to its neighbours. "
+            "Leave it empty and this module is its own node, which is what 92% of "
+            "retail objects are. The waypoints of every member are written into the "
+            "master's chunk, because the engine reads a slave's own WAYPOINT and "
+            "then discards it. The airduct flag is read from the master only, so a "
+            "slave's flag does nothing"),
+        type=bpy.types.Object)
     bpy.types.Object.rif_module_airduct = bpy.props.BoolProperty(
         name="Air duct",
         description=(
@@ -4012,28 +4040,16 @@ def register_placeables():
             "polygons of a staircase. The engine's own comment calls this a "
             "hack, so mark only actual staircases"),
         default=False)
-    bpy.types.Object.rif_screen_glow = bpy.props.BoolProperty(
-        name="Glow",
-        description=(
-            "Trade the film's sound for a light. The engine cannot do both: a "
-            "video screen's light never exists (PLOBJLIT is read only by "
-            "add_placed_light, which add_newsimpleobject never reaches for "
-            "IOT_ReservedForJohn, Objsetup.cpp:2092), and a placed light is not a "
-            "video screen -- so the film's volume, which is scaled by the "
-            "nearest video screen (FmvCutscenes.cpp:98 and :529-580), drops to "
-            "zero and the film plays silent. Leave this off for a screen that "
-            "should be heard, which is what retail does"),
-        default=False)
     bpy.types.Object.rif_video_screen = bpy.props.BoolProperty(
         name="Video screen",
         description=(
-            "Makes this object an I_BehaviourVideoScreen. The strategy's Type "
-            "becomes IOT_ReservedForJohn, which is the only branch that reaches "
-            "`add_videoscreen` (Objsetup.cpp:2092), and the object is given one "
-            "placed light: the behaviour tints that light with the colour of the "
-            "film it is playing, which is what makes the screen glow. Without "
-            "this a screen still snows and plays films, it just never lights the "
-            "room"),
+            "Makes this object an I_BehaviourVideoScreen, the only type that "
+            "reaches `add_videoscreen` (Objsetup.cpp:2092). That is what lets the "
+            "film be heard as well as seen: its volume comes from the nearest "
+            "video screen (FmvCutscenes.cpp:98), so an object of any other type "
+            "plays the film in silence. A screen cannot also light the room -- the "
+            "engine gives an object one strategy, and the video screen's light "
+            "code is unreachable -- so put a placed light beside it for light"),
         default=False)
     bpy.types.Object.rif_module_door = bpy.props.BoolProperty(
         name="Door",
@@ -4111,9 +4127,9 @@ def unregister_placeables():
     # The module flags, in the reverse order to their creation.
     del bpy.types.Object.rif_module_sky
     del bpy.types.Object.rif_module_fog
+    del bpy.types.Object.rif_ai_master
     del bpy.types.Object.rif_module_airduct
     del bpy.types.Object.rif_module_stairs
-    del bpy.types.Object.rif_screen_glow
     del bpy.types.Object.rif_video_screen
     del bpy.types.Object.rif_module_door
     del bpy.types.Object.rif_module_door_locked
